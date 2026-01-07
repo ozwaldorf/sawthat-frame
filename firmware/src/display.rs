@@ -23,12 +23,12 @@ use reqwless::request::Method;
 
 use crate::epd::{Color, Epd7in3e};
 use crate::framebuffer::Framebuffer;
-use crate::widget::{WidgetData, parse_widget_data};
+use crate::widget::{Orientation, WidgetData, parse_widget_data};
 
-/// Size of PNG receive buffer (128KB - enough for processed e-paper images)
-const PNG_BUF_SIZE: usize = 128 * 1024;
-/// Size of decoded pixel buffer (400x480 * 4 bytes for RGBA)
-const DECODE_BUF_SIZE: usize = 400 * 480 * 4;
+/// Size of PNG receive buffer (256KB - enough for 480x800 processed e-paper images)
+const PNG_BUF_SIZE: usize = 256 * 1024;
+/// Size of decoded pixel buffer (480x800 * 4 bytes for RGBA - covers both orientations)
+const DECODE_BUF_SIZE: usize = 480 * 800 * 4;
 
 /// TLS buffer sizes
 pub const TLS_READ_BUF_SIZE: usize = 16640;
@@ -65,6 +65,7 @@ pub async fn fetch_and_display<SPI, BUSY, DC, RST, DELAY, T, D>(
     framebuffer: &mut Framebuffer,
     edge_url: &str,
     widget_name: &str,
+    orientation: Orientation,
     items: &WidgetData,
     start_index: usize,
 ) -> Result<(), DisplayError>
@@ -101,22 +102,29 @@ where
     let mut decode_buf: Box<[u8; DECODE_BUF_SIZE]> = Box::new([0u8; DECODE_BUF_SIZE]);
     let mut rx_buf = [0u8; 2048];
 
-    // Display 2 items starting from start_index (wrapping around)
-    let items_to_display = total_items.min(2);
+    // In horizontal mode, display 2 items side by side (400px each)
+    // In vertical mode, display 1 fullscreen item (480x800)
+    let items_per_screen = match orientation {
+        Orientation::Horizontal => 2,
+        Orientation::Vertical => 1,
+    };
+    let items_to_display = total_items.min(items_per_screen);
 
     for display_slot in 0..items_to_display {
         let item_idx = (start_index + display_slot) % total_items;
         let item = &items[item_idx];
-        let x_offset = if display_slot == 0 { 0 } else { 400 };
+        // In vertical mode, always use x_offset 0 (single fullscreen image)
+        let x_offset = if orientation == Orientation::Vertical || display_slot == 0 { 0 } else { 400 };
 
         println!("Fetching image {}: {}", item_idx, item.path.as_str());
 
-        // Build relative path for image
+        // Build relative path for image (includes orientation)
         let mut path: String<256> = String::new();
         if write!(
             &mut path,
-            "/api/widget/{}/{}",
+            "/api/widget/{}/{}/{}",
             widget_name,
+            orientation.as_str(),
             item.path.as_str()
         )
         .is_err()
@@ -162,6 +170,7 @@ where
                     framebuffer,
                     x_offset,
                     &mut *decode_buf,
+                    orientation,
                 ) {
                     println!("Error decoding PNG: {:?}", e);
                     fill_half(framebuffer, x_offset);
@@ -174,8 +183,8 @@ where
         }
     }
 
-    // If only one item, fill right half with white
-    if items_to_display == 1 {
+    // In horizontal mode with only one item, fill right half with white
+    if orientation == Orientation::Horizontal && items_to_display == 1 {
         framebuffer.fill_right_half(Color::White);
     }
 
@@ -287,12 +296,15 @@ fn fill_half(framebuffer: &mut Framebuffer, x_offset: u32) {
     }
 }
 
-/// Decode a PNG image into the framebuffer at the given x offset
+/// Decode a PNG image into the framebuffer
+/// For horizontal: image is 400x480, written directly with flip
+/// For vertical: image is 480x800, rotated 90° CCW to fit 800x480 framebuffer
 fn decode_png_to_framebuffer(
     png_data: &[u8],
     framebuffer: &mut Framebuffer,
     x_offset: u32,
     decode_buf: &mut [u8],
+    orientation: Orientation,
 ) -> Result<(), DisplayError> {
     let header = minipng::decode_png_header(png_data)
         .map_err(|_| DisplayError::Png("invalid PNG header"))?;
@@ -313,25 +325,45 @@ fn decode_png_to_framebuffer(
     let height = image.height() as usize;
     let pixels = image.pixels();
 
-    let mut row_buf = [0u8; 400];
-
-    for y in 0..height {
-        let row_start = y * width;
-        let row_end = row_start + width;
-        if row_end <= pixels.len() {
-            let row = &pixels[row_start..row_end];
-            for (i, &px) in row.iter().enumerate() {
-                if i < row_buf.len() {
-                    row_buf[width - 1 - i] = px;
+    match orientation {
+        Orientation::Horizontal => {
+            // Horizontal: 400x480 image, flip and write rows directly
+            let mut row_buf = [0u8; 480];
+            for y in 0..height {
+                let row_start = y * width;
+                let row_end = row_start + width;
+                if row_end <= pixels.len() {
+                    let row = &pixels[row_start..row_end];
+                    for (i, &px) in row.iter().enumerate() {
+                        if i < row_buf.len() {
+                            row_buf[width - 1 - i] = px;
+                        }
+                    }
+                    let flipped_y = (height - 1 - y) as u32;
+                    framebuffer.write_row(x_offset, flipped_y, &row_buf[..width]);
                 }
             }
-
-            let flipped_y = (height - 1 - y) as u32;
-            framebuffer.write_row(x_offset, flipped_y, &row_buf[..width]);
+        }
+        Orientation::Vertical => {
+            // Vertical: 480x800 image, rotate 90° CCW to fit 800x480 framebuffer
+            // After rotation: x_new = y_old, y_new = (width - 1 - x_old)
+            // This maps 480x800 -> 800x480
+            for y in 0..height {
+                for x in 0..width {
+                    let src_idx = y * width + x;
+                    if src_idx < pixels.len() {
+                        let px = pixels[src_idx];
+                        // Rotate 90° CCW: new_x = y, new_y = (width - 1 - x)
+                        let new_x = y as u32;
+                        let new_y = (width - 1 - x) as u32;
+                        framebuffer.set_pixel_indexed(new_x, new_y, px);
+                    }
+                }
+            }
         }
     }
 
-    println!("PNG decode complete, {} rows processed", height);
+    println!("PNG decode complete, {}x{} processed", width, height);
 
     Ok(())
 }

@@ -73,6 +73,24 @@ impl Framebuffer {
         }
     }
 
+    /// Write a single pixel at (x, y) with a PNG palette index (0-5)
+    #[inline]
+    pub fn set_pixel_indexed(&mut self, x: u32, y: u32, palette_idx: u8) {
+        if x >= WIDTH || y >= HEIGHT {
+            return;
+        }
+
+        let color = remap_color(palette_idx);
+        let byte_idx = (y as usize * (WIDTH as usize / 2)) + (x as usize / 2);
+        let is_high_nibble = (x % 2) == 0;
+
+        if is_high_nibble {
+            self.buffer[byte_idx] = (self.buffer[byte_idx] & 0x0F) | (color << 4);
+        } else {
+            self.buffer[byte_idx] = (self.buffer[byte_idx] & 0xF0) | color;
+        }
+    }
+
     /// Write a row of pixels from PNG palette indices
     ///
     /// - `x_offset`: Starting x position (0 for left half, 400 for right half)

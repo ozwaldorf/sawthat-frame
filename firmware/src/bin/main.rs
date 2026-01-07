@@ -46,7 +46,7 @@ use esp_radio::{
 use photopainter::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use photopainter::epd::{Epd7in3e, RefreshMode};
 use photopainter::framebuffer::Framebuffer;
-use photopainter::widget::{WidgetData, MAX_ITEMS};
+use photopainter::widget::{Orientation, WidgetData, MAX_ITEMS};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -81,6 +81,8 @@ struct SleepState {
     total_items: usize,
     /// Shuffle seed used (to reproduce ordering)
     shuffle_seed: u64,
+    /// Display orientation (0 = horizontal, 1 = vertical)
+    orientation: u8,
     /// Cache keys of items (to detect data changes)
     cache_keys: [u32; MAX_ITEMS],
 }
@@ -92,6 +94,7 @@ impl SleepState {
             index: 0,
             total_items: 0,
             shuffle_seed: 0,
+            orientation: 0,
             cache_keys: [0; MAX_ITEMS],
         }
     }
@@ -105,14 +108,19 @@ impl SleepState {
         self.magic = 0;
     }
 
-    fn save(&mut self, index: usize, total_items: usize, shuffle_seed: u64, items: &WidgetData) {
+    fn save(&mut self, index: usize, total_items: usize, shuffle_seed: u64, orientation: Orientation, items: &WidgetData) {
         self.magic = SLEEP_STATE_MAGIC;
         self.index = index;
         self.total_items = total_items;
         self.shuffle_seed = shuffle_seed;
+        self.orientation = orientation as u8;
         for (i, item) in items.iter().enumerate() {
             self.cache_keys[i] = item.cache_key;
         }
+    }
+
+    fn get_orientation(&self) -> Orientation {
+        Orientation::from_u8(self.orientation)
     }
 
     fn matches_data(&self, items: &WidgetData) -> bool {
@@ -257,8 +265,11 @@ async fn main(spawner: Spawner) -> ! {
     println!("EPD initialized!");
 
     // ==================== Button Setup (GPIO4 = KEY button) ====================
-    // Keep GPIO4 as raw pin for deep sleep wake source
-    let key_pin = peripherals.GPIO4;
+    // Create input to check button state, will convert back to raw pin for deep sleep
+    let key_input = Input::new(
+        peripherals.GPIO4,
+        InputConfig::default().with_pull(Pull::Up),
+    );
 
     // ==================== WiFi Setup ====================
     let esp_radio_ctrl = &*mk_static!(Controller<'static>, esp_radio::init().unwrap());
@@ -298,14 +309,51 @@ async fn main(spawner: Spawner) -> ! {
 
     // Check if we're resuming from deep sleep
     let resuming = unsafe { (*(&raw const SLEEP_STATE)).is_valid() };
-    if resuming {
-        let (index, total) = unsafe {
+    let mut orientation = if resuming {
+        let (index, total, orient) = unsafe {
             let state = &raw const SLEEP_STATE;
-            ((*state).index, (*state).total_items)
+            ((*state).index, (*state).total_items, (*state).get_orientation())
         };
-        println!("Resuming from deep sleep: index={}, total={}", index, total);
+        println!("Resuming from deep sleep: index={}, total={}, orientation={:?}", index, total, orient);
+        orient
     } else {
         println!("Fresh boot (no valid sleep state)");
+        Orientation::default()
+    };
+
+    // LED2 (GPIO42) for orientation toggle feedback (active-low: HIGH=off, LOW=on)
+    let mut led2 = Output::new(peripherals.GPIO42, Level::High, OutputConfig::default());
+
+    // Check if KEY button is pressed to toggle orientation
+    // Button is active low (pressed = LOW)
+    println!("Checking KEY button for orientation toggle (press within 2s to switch)...");
+    let mut toggle_detected = false;
+    for _ in 0..20 {
+        // Check for 2 seconds (20 x 100ms)
+        if key_input.is_low() {
+            toggle_detected = true;
+            println!("KEY pressed! Toggling orientation...");
+            orientation = orientation.toggle();
+            println!("New orientation: {:?}", orientation);
+
+            // Flash LED2 to confirm orientation switch (active-low)
+            for _ in 0..3 {
+                led2.set_low();  // ON
+                delay.delay_ms(100);
+                led2.set_high(); // OFF
+                delay.delay_ms(100);
+            }
+
+            // Wait for button release
+            while key_input.is_low() {
+                delay.delay_ms(50);
+            }
+            break;
+        }
+        delay.delay_ms(100);
+    }
+    if !toggle_detected {
+        println!("No button press detected, keeping orientation: {:?}", orientation);
     }
 
     // Allocate framebuffer (uses PSRAM for the 192KB buffer)
@@ -368,59 +416,104 @@ async fn main(spawner: Spawner) -> ! {
     let total_items = items.len();
     println!("Displaying {} items in shuffled order", total_items);
 
-    // If we've shown all items, start over
-    if index >= total_items {
-        println!("All items shown, starting over");
-        index = 0;
+    // Display loop - allows re-display on orientation change
+    loop {
+        // If we've shown all items, start over
+        if index >= total_items {
+            println!("All items shown, starting over");
+            index = 0;
+        }
+
+        // Wake up display
+        println!("Waking up display...");
+        epd.wake_up(&mut delay).expect("Failed to wake display");
+
+        // Display current item(s)
+        println!(
+            "Displaying items {} and {} of {}",
+            index,
+            (index + 1).min(total_items - 1),
+            total_items
+        );
+        match display::fetch_and_display(
+            &tcp_client,
+            &dns_socket,
+            &mut tls_read_buf,
+            &mut tls_write_buf,
+            &mut epd,
+            &mut delay,
+            &mut framebuffer,
+            EDGE_URL,
+            "concerts",
+            orientation,
+            &items,
+            index,
+        )
+        .await
+        {
+            Ok(()) => println!("Display refresh successful!"),
+            Err(e) => println!("Display refresh failed: {:?}", e),
+        }
+
+        // Put display to sleep
+        println!("Putting display to sleep...");
+        epd.sleep(&mut delay).expect("Failed to sleep display");
+
+        // Wait 30s for orientation switch before deep sleep
+        println!("Press KEY within 30s to switch orientation...");
+        let mut orientation_changed = false;
+        for _ in 0..300 {
+            if key_input.is_low() {
+                println!("KEY pressed! Toggling orientation...");
+                orientation = orientation.toggle();
+
+                // Flash LED2 to confirm
+                for _ in 0..3 {
+                    led2.set_low();  // ON
+                    delay.delay_ms(100);
+                    led2.set_high(); // OFF
+                    delay.delay_ms(100);
+                }
+
+                // Wait for button release
+                while key_input.is_low() {
+                    delay.delay_ms(50);
+                }
+
+                orientation_changed = true;
+                println!("Re-displaying with orientation: {:?}", orientation);
+                break;
+            }
+            delay.delay_ms(100);
+        }
+
+        if !orientation_changed {
+            // No change, exit loop and go to sleep
+            break;
+        }
+        // Loop back to re-display with new orientation
     }
 
-    // Wake up display
-    println!("Waking up display...");
-    epd.wake_up(&mut delay).expect("Failed to wake display");
-
-    // Display current pair
-    println!(
-        "Displaying items {} and {} of {}",
-        index,
-        (index + 1).min(total_items - 1),
-        total_items
-    );
-    match display::fetch_and_display(
-        &tcp_client,
-        &dns_socket,
-        &mut tls_read_buf,
-        &mut tls_write_buf,
-        &mut epd,
-        &mut delay,
-        &mut framebuffer,
-        EDGE_URL,
-        "concerts",
-        &items,
-        index,
-    )
-    .await
-    {
-        Ok(()) => println!("Display refresh successful!"),
-        Err(e) => println!("Display refresh failed: {:?}", e),
-    }
-
-    // Put display to sleep
-    println!("Putting display to sleep...");
-    epd.sleep(&mut delay).expect("Failed to sleep display");
-
-    // Advance index for next wake
-    index += 2;
+    // Advance index for next wake (2 items in horizontal, 1 in vertical)
+    index += match orientation {
+        Orientation::Horizontal => 2,
+        Orientation::Vertical => 1,
+    };
 
     // Save state for next wake
     unsafe {
         let state = &raw mut SLEEP_STATE;
-        (*state).save(index, total_items, shuffle_seed, &items);
+        (*state).save(index, total_items, shuffle_seed, orientation, &items);
     }
-    println!("Saved state: index={}, total={}", index, total_items);
+    println!("Saved state: index={}, total={}, orientation={:?}", index, total_items, orientation);
 
     // Disconnect WiFi before deep sleep
     println!("Disconnecting WiFi for deep sleep...");
     wifi_disconnect(&mut controller).await;
+
+    // Drop the Input and reclaim GPIO4 for deep sleep wake source
+    drop(key_input);
+    let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
 
     // Enter deep sleep
     println!(
