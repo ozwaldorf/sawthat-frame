@@ -23,7 +23,7 @@ use reqwless::request::Method;
 
 use crate::epd::{Color, Epd7in3e};
 use crate::framebuffer::Framebuffer;
-use crate::widget::{parse_widget_data, WidgetData};
+use crate::widget::{WidgetData, parse_widget_data};
 
 /// Size of PNG receive buffer (128KB - enough for processed e-paper images)
 const PNG_BUF_SIZE: usize = 128 * 1024;
@@ -81,7 +81,10 @@ where
     framebuffer.clear(Color::White);
 
     let total_items = items.len();
-    println!("Displaying items starting at index {} (connection reuse enabled)", start_index);
+    println!(
+        "Displaying items starting at index {} (connection reuse enabled)",
+        start_index
+    );
 
     // Create HTTP client with TLS - single connection for all requests
     let tls_config = TlsConfig::new(TLS_SEED, tls_read_buf, tls_write_buf, TlsVerify::None);
@@ -110,7 +113,14 @@ where
 
         // Build relative path for image
         let mut path: String<256> = String::new();
-        if write!(&mut path, "/api/widget/{}/{}", widget_name, item.path.as_str()).is_err() {
+        if write!(
+            &mut path,
+            "/api/widget/{}/{}",
+            widget_name,
+            item.path.as_str()
+        )
+        .is_err()
+        {
             println!("Path too long, skipping image");
             fill_half(framebuffer, x_offset);
             continue;
@@ -141,12 +151,18 @@ where
             }
 
             Ok(png_len)
-        }.await;
+        }
+        .await;
 
         match result {
             Ok(png_len) => {
                 println!("Received {} bytes of PNG data", png_len);
-                if let Err(e) = decode_png_to_framebuffer(&png_buf[..png_len], framebuffer, x_offset, &mut *decode_buf) {
+                if let Err(e) = decode_png_to_framebuffer(
+                    &png_buf[..png_len],
+                    framebuffer,
+                    x_offset,
+                    &mut *decode_buf,
+                ) {
                     println!("Error decoding PNG: {:?}", e);
                     fill_half(framebuffer, x_offset);
                 }
@@ -227,8 +243,8 @@ where
         }
     }
 
-    let json_str =
-        core::str::from_utf8(&json_buf[..json_len]).map_err(|_| DisplayError::Json("invalid utf8"))?;
+    let json_str = core::str::from_utf8(&json_buf[..json_len])
+        .map_err(|_| DisplayError::Json("invalid utf8"))?;
     println!("Received {} bytes of JSON", json_len);
 
     let items = parse_widget_data(json_str).map_err(DisplayError::Json)?;
@@ -248,11 +264,7 @@ pub fn shuffle_items(items: &mut WidgetData, seed: u64) {
         return;
     }
 
-    let mut state = if seed == 0 {
-        0x853c49e6748fea9b
-    } else {
-        seed
-    };
+    let mut state = if seed == 0 { 0x853c49e6748fea9b } else { seed };
 
     // Fisher-Yates shuffle
     for i in (1..len).rev() {
@@ -282,8 +294,8 @@ fn decode_png_to_framebuffer(
     x_offset: u32,
     decode_buf: &mut [u8],
 ) -> Result<(), DisplayError> {
-    let header =
-        minipng::decode_png_header(png_data).map_err(|_| DisplayError::Png("invalid PNG header"))?;
+    let header = minipng::decode_png_header(png_data)
+        .map_err(|_| DisplayError::Png("invalid PNG header"))?;
 
     println!(
         "PNG: {}x{} {:?}",

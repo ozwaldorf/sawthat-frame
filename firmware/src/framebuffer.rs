@@ -5,7 +5,7 @@
 //!
 //! The framebuffer is allocated dynamically from PSRAM to avoid exhausting internal SRAM.
 
-use crate::epd::{Color, HEIGHT, WIDTH, BUFFER_SIZE};
+use crate::epd::{BUFFER_SIZE, Color, HEIGHT, WIDTH};
 use alloc::boxed::Box;
 
 extern crate alloc;

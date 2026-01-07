@@ -9,7 +9,11 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources, dns::DnsSocket, tcp::client::{TcpClient, TcpClientState}};
+use embassy_net::{
+    Runner, StackResources,
+    dns::DnsSocket,
+    tcp::client::{TcpClient, TcpClientState},
+};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -170,10 +174,10 @@ async fn main(spawner: Spawner) -> ! {
         .expect("EPD init failed");
     println!("EPD initialized!");
 
-    // Start clearing display (non-blocking - continues during WiFi init)
-    println!("Starting display clear...");
-    epd.clear_start(photopainter::epd::Color::White, &mut delay)
-        .expect("Failed to start display clear");
+    //     // Start clearing display (non-blocking - continues during WiFi init)
+    //     println!("Starting display clear...");
+    //     epd.clear_start(photopainter::epd::Color::White, &mut delay)
+    //         .expect("Failed to start display clear");
 
     // ==================== WiFi Setup (runs while display clears) ====================
     let esp_radio_ctrl = &*mk_static!(Controller<'static>, esp_radio::init().unwrap());
@@ -229,11 +233,11 @@ async fn main(spawner: Spawner) -> ! {
     let mut framebuffer = Framebuffer::new();
     println!("Framebuffer allocated!");
 
-    // Wait for display clear to finish (if still running)
-    println!("Waiting for display clear to complete...");
-    epd.refresh_wait(&mut delay)
-        .expect("Failed to complete display clear");
-    println!("Display cleared!");
+    // // Wait for display clear to finish (if still running)
+    // println!("Waiting for display clear to complete...");
+    // epd.refresh_wait(&mut delay)
+    //     .expect("Failed to complete display clear");
+    // println!("Display cleared!");
 
     // Use RNG for shuffle seed
     let rng = Rng::new();
@@ -257,7 +261,9 @@ async fn main(spawner: Spawner) -> ! {
             &mut tls_write_buf,
             EDGE_URL,
             "concerts",
-        ).await {
+        )
+        .await
+        {
             Ok(data) => data,
             Err(e) => {
                 println!("Failed to fetch widget data: {:?}", e);
@@ -282,7 +288,12 @@ async fn main(spawner: Spawner) -> ! {
             epd.wake_up(&mut delay).expect("Failed to wake display");
 
             // Display current pair
-            println!("Displaying items {} and {} of {}", index, (index + 1).min(total_items - 1), total_items);
+            println!(
+                "Displaying items {} and {} of {}",
+                index,
+                (index + 1).min(total_items - 1),
+                total_items
+            );
             match display::fetch_and_display(
                 &tcp_client,
                 &dns_socket,
@@ -321,7 +332,10 @@ async fn main(spawner: Spawner) -> ! {
         }
 
         // All items shown, wait before refetching
-        println!("All items displayed. Sleeping {} seconds before refetch...", REFRESH_INTERVAL_SECS);
+        println!(
+            "All items displayed. Sleeping {} seconds before refetch...",
+            REFRESH_INTERVAL_SECS
+        );
         Timer::after(Duration::from_secs(REFRESH_INTERVAL_SECS)).await;
     }
 }
@@ -353,7 +367,10 @@ async fn connection(mut controller: WifiController<'static>) {
                 .await
                 .unwrap();
             if let Some(ap) = result.iter().find(|ap| ap.ssid.as_str() == SSID) {
-                println!("Found {} (ch{}, {}dBm)", ap.ssid, ap.channel, ap.signal_strength);
+                println!(
+                    "Found {} (ch{}, {}dBm)",
+                    ap.ssid, ap.channel, ap.signal_strength
+                );
             } else {
                 println!("SSID '{}' not found in {} APs", SSID, result.len());
             }

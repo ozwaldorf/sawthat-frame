@@ -77,11 +77,7 @@ impl Color {
         } else if r < 3 && g > 4 && b < 2 {
             Color::Green
         } else if r > g && r > (b * 2) {
-            if g > 3 {
-                Color::Yellow
-            } else {
-                Color::Red
-            }
+            if g > 3 { Color::Yellow } else { Color::Red }
         } else if g > r && g > (b * 2) {
             Color::Green
         } else if (b * 2) > r && (b * 2) > g {
