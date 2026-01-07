@@ -235,6 +235,17 @@ where
         color: Color,
         delay: &mut DELAY,
     ) -> Result<(), SPI::Error> {
+        self.clear_start(color, delay)?;
+        self.refresh_wait(delay)
+    }
+
+    /// Start clearing the display (non-blocking after refresh starts)
+    /// Call `refresh_wait()` before the next display operation.
+    pub fn clear_start<DELAY: DelayNs>(
+        &mut self,
+        color: Color,
+        delay: &mut DELAY,
+    ) -> Result<(), SPI::Error> {
         let color_byte = color.to_dual_pixel();
 
         self.send_command(Command::DTM)?;
@@ -251,7 +262,7 @@ where
             self.spi.write(&chunk[..remainder])?;
         }
 
-        self.refresh(delay)
+        self.refresh_start(delay)
     }
 
     /// Display a raw buffer (must be BUFFER_SIZE bytes, 4bpp packed)
@@ -265,8 +276,15 @@ where
         self.refresh(delay)
     }
 
-    /// Trigger display refresh
+    /// Trigger display refresh (blocking)
     fn refresh<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<(), SPI::Error> {
+        self.refresh_start(delay)?;
+        self.refresh_wait(delay)
+    }
+
+    /// Start display refresh (non-blocking)
+    /// Call `refresh_wait()` to complete the refresh before the next operation.
+    fn refresh_start<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<(), SPI::Error> {
         // Power on (required before refresh - display may be off from previous operation)
         self.send_command(Command::PON)?;
         self.wait_until_idle(delay);
@@ -282,6 +300,14 @@ where
         // Display refresh
         self.cmd_with_data(Command::DRF, &[0x00])?;
         delay.delay_ms(1); // Required delay (min 200us)
+
+        // Returns immediately - display is now refreshing
+        Ok(())
+    }
+
+    /// Wait for refresh to complete and power off
+    /// Must be called after `refresh_start()` or `clear_start()` before the next display operation.
+    pub fn refresh_wait<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<(), SPI::Error> {
         self.wait_until_idle(delay);
 
         // Power off

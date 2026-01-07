@@ -1,14 +1,15 @@
 //! PhotoPainter - ESP32-S3 E-Paper Photo Frame
 //!
-//! Set SSID and PASSWORD env variable before running this example.
+//! Environment variables required:
+//! - WIFI_SSID: WiFi network name
+//! - WIFI_PASS: WiFi password
+//! - EDGE_URL: Edge service URL (e.g., http://192.168.1.100:7676)
 
 #![no_std]
 #![no_main]
 
-use core::net::Ipv4Addr;
-
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources, tcp::TcpSocket};
+use embassy_net::{Runner, StackResources};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -34,7 +35,9 @@ use esp_radio::{
         ClientConfig, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
     },
 };
+use photopainter::display;
 use photopainter::epd::{Epd7in3e, RefreshMode};
+use photopainter::framebuffer::Framebuffer;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -50,6 +53,10 @@ macro_rules! mk_static {
 
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASS");
+const EDGE_URL: &str = env!("EDGE_URL");
+
+/// Refresh interval between display updates (15 minutes)
+const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -57,8 +64,13 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
+    // Initialize internal RAM heap (for smaller allocations)
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 36 * 1024);
+
+    // Initialize PSRAM for large allocations (framebuffer, PNG buffer)
+    esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
+    println!("PSRAM initialized and added to heap");
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(
@@ -157,19 +169,12 @@ async fn main(spawner: Spawner) -> ! {
         .expect("EPD init failed");
     println!("EPD initialized!");
 
-    // Show 6-color test pattern
-    println!("Showing 6-color test pattern...");
-    println!("  | Black  | White  | Yellow |");
-    println!("  | Red    | Blue   | Green  |");
-    epd.show_6block(&mut delay)
-        .expect("failed to show 6block test");
-    println!("Display updated!");
+    // Start clearing display (non-blocking - continues during WiFi init)
+    println!("Starting display clear...");
+    epd.clear_start(photopainter::epd::Color::White, &mut delay)
+        .expect("Failed to start display clear");
 
-    // Put display to sleep to save power
-    epd.sleep(&mut delay).expect("Sleep failed");
-    println!("Display sleeping.");
-
-    // ==================== WiFi Setup ====================
+    // ==================== WiFi Setup (runs while display clears) ====================
     let esp_radio_ctrl = &*mk_static!(Controller<'static>, esp_radio::init().unwrap());
 
     let (controller, interfaces) =
@@ -193,17 +198,18 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(connection(controller)).ok();
     spawner.spawn(net_task(runner)).ok();
 
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
-
+    // Wait for WiFi link
+    println!("Waiting for WiFi link...");
     loop {
         if stack.is_link_up() {
             break;
         }
         Timer::after(Duration::from_millis(500)).await;
     }
+    println!("WiFi link up!");
 
-    println!("Waiting to get IP address...");
+    // Wait for IP address
+    println!("Waiting for IP address...");
     loop {
         if let Some(config) = stack.config_v4() {
             println!("Got IP: {}", config.address);
@@ -212,47 +218,61 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after(Duration::from_millis(500)).await;
     }
 
+    // ==================== Main Display Loop ====================
+    println!("Starting display refresh loop...");
+    println!("Edge URL: {}", EDGE_URL);
+    println!("Refresh interval: {} seconds", REFRESH_INTERVAL_SECS);
+
+    // Allocate framebuffer (uses PSRAM for the 192KB buffer)
+    println!("Allocating framebuffer...");
+    let mut framebuffer = Framebuffer::new();
+    println!("Framebuffer allocated!");
+
+    // Wait for display clear to finish (if still running)
+    println!("Waiting for display clear to complete...");
+    epd.refresh_wait(&mut delay)
+        .expect("Failed to complete display clear");
+    println!("Display cleared!");
+
+    let mut rotation_index: usize = 0;
+    let mut total_items: usize = 0;
+
     loop {
-        Timer::after(Duration::from_millis(1_000)).await;
+        // Wake up display if sleeping
+        println!("Waking up display...");
+        epd.wake_up(&mut delay).expect("Failed to wake display");
 
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-
-        socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-
-        let remote_endpoint = (Ipv4Addr::new(142, 250, 185, 115), 80);
-        println!("connecting...");
-        let r = socket.connect(remote_endpoint).await;
-        if let Err(e) = r {
-            println!("connect error: {:?}", e);
-            continue;
-        }
-        println!("connected!");
-        let mut buf = [0; 1024];
-        loop {
-            use embedded_io_async::Write;
-            let r = Write::write_all(
-                &mut socket,
-                b"GET / HTTP/1.0\r\nHost: www.mobile-j.de\r\n\r\n",
-            )
-            .await;
-            if let Err(e) = r {
-                println!("write error: {:?}", e);
-                break;
+        // Refresh display from edge service
+        println!("Fetching and displaying content from edge service...");
+        match display::refresh_from_edge(
+            stack,
+            &mut epd,
+            &mut delay,
+            &mut framebuffer,
+            EDGE_URL,
+            "concerts",
+            rotation_index,
+        )
+        .await
+        {
+            Ok(count) => {
+                println!("Display refresh successful!");
+                total_items = count;
+                // Advance by 2 (showing 2 images at a time)
+                rotation_index = (rotation_index + 2) % total_items.max(1);
             }
-            let n = match socket.read(&mut buf).await {
-                Ok(0) => {
-                    println!("read EOF");
-                    break;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    println!("read error: {:?}", e);
-                    break;
-                }
-            };
-            println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
+            Err(e) => {
+                println!("Display refresh failed: {:?}", e);
+            }
         }
-        Timer::after(Duration::from_millis(3000)).await;
+
+        // Put display to sleep
+        println!("Putting display to sleep...");
+        epd.sleep(&mut delay).expect("Failed to sleep display");
+
+        // Wait for next refresh
+        println!("Sleeping for {} seconds...", REFRESH_INTERVAL_SECS);
+        Timer::after(Duration::from_secs(REFRESH_INTERVAL_SECS)).await;
     }
 }
 
@@ -277,17 +297,18 @@ async fn connection(mut controller: WifiController<'static>) {
             controller.start_async().await.unwrap();
             println!("Wifi started!");
 
-            println!("Scan");
             let scan_config = ScanConfig::default().with_max(10);
             let result = controller
                 .scan_with_config_async(scan_config)
                 .await
                 .unwrap();
-            for ap in result {
-                println!("{:?}", ap);
+            if let Some(ap) = result.iter().find(|ap| ap.ssid.as_str() == SSID) {
+                println!("Found {} (ch{}, {}dBm)", ap.ssid, ap.channel, ap.signal_strength);
+            } else {
+                println!("SSID '{}' not found in {} APs", SSID, result.len());
             }
         }
-        println!("About to connect...");
+        println!("Connecting to {}...", SSID);
 
         match controller.connect_async().await {
             Ok(_) => println!("Wifi connected!"),

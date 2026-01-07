@@ -9,7 +9,7 @@ name = "photopainter"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "~1.0", features = ["esp32s3", "log-04", "unstable"] }
+esp-hal = { version = "~1.0", features = ["esp32s3", "log-04", "unstable", "psram"] }
 
 esp-rtos = { version = "0.2.0", features = [
   "embassy",
@@ -24,6 +24,7 @@ log                    = "0.4.27"
 
 embassy-net = { version = "0.8.0", features = [
   "dhcpv4",
+  "dns",
   "log",
   "medium-ethernet",
   "tcp",
@@ -70,6 +71,18 @@ static_cell      = "2.1.1"
 embedded-hal = "1.0"
 embedded-hal-bus = "0.2"
 embedded-graphics-core = "0.4"
+
+# JSON parsing (no_std)
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde-json-core = "0.6"
+heapless = "0.8"
+
+# PNG decoding (no_std, no alloc)
+minipng = "0.1"
+
+# TLS support (using git for embedded-io-async 0.7 compatibility)
+embedded-tls = { git = "https://github.com/drogue-iot/embedded-tls", default-features = false, features = ["alloc"] }
+rand_core = "0.6"
 
 
 
