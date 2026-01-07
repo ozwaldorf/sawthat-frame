@@ -127,7 +127,7 @@ where
         }
 
         // Fetch PNG using existing connection
-        let result = async {
+        let result: Result<usize, DisplayError> = async {
             let response = resource
                 .request(Method::GET, path.as_str())
                 .send(&mut rx_buf)

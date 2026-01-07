@@ -8,9 +8,11 @@
 #![no_std]
 #![no_main]
 
+use core::time::Duration as CoreDuration;
+
 use embassy_executor::Spawner;
 use embassy_net::{
-    Runner, StackResources,
+    Runner, Stack, StackResources,
     dns::DnsSocket,
     tcp::client::{TcpClient, TcpClientState},
 };
@@ -25,6 +27,10 @@ use esp_hal::{
     i2c::master::{Config as I2cConfig, I2c},
     ram,
     rng::Rng,
+    rtc_cntl::{
+        Rtc,
+        sleep::{Ext0WakeupSource, TimerWakeupSource, WakeupLevel},
+    },
     spi::{
         Mode,
         master::{Config as SpiConfig, Spi},
@@ -35,14 +41,12 @@ use esp_hal::{
 use esp_println::println;
 use esp_radio::{
     Controller,
-    wifi::{
-        ClientConfig, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
-    },
+    wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice},
 };
 use photopainter::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use photopainter::epd::{Epd7in3e, RefreshMode};
 use photopainter::framebuffer::Framebuffer;
-use photopainter::widget::WidgetData;
+use photopainter::widget::{WidgetData, MAX_ITEMS};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -63,20 +67,97 @@ const EDGE_URL: &str = env!("EDGE_URL");
 /// Refresh interval between display updates (15 minutes)
 const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
 
+/// Magic number to validate RTC memory state
+const SLEEP_STATE_MAGIC: u32 = 0xCAFE_F00D;
+
+/// State persisted in RTC memory across deep sleep
+#[repr(C)]
+struct SleepState {
+    /// Magic number to validate state
+    magic: u32,
+    /// Current index into widget items
+    index: usize,
+    /// Total number of items
+    total_items: usize,
+    /// Shuffle seed used (to reproduce ordering)
+    shuffle_seed: u64,
+    /// Cache keys of items (to detect data changes)
+    cache_keys: [u32; MAX_ITEMS],
+}
+
+impl SleepState {
+    const fn new() -> Self {
+        Self {
+            magic: 0,
+            index: 0,
+            total_items: 0,
+            shuffle_seed: 0,
+            cache_keys: [0; MAX_ITEMS],
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.magic == SLEEP_STATE_MAGIC
+    }
+
+    #[allow(dead_code)]
+    fn invalidate(&mut self) {
+        self.magic = 0;
+    }
+
+    fn save(&mut self, index: usize, total_items: usize, shuffle_seed: u64, items: &WidgetData) {
+        self.magic = SLEEP_STATE_MAGIC;
+        self.index = index;
+        self.total_items = total_items;
+        self.shuffle_seed = shuffle_seed;
+        for (i, item) in items.iter().enumerate() {
+            self.cache_keys[i] = item.cache_key;
+        }
+    }
+
+    fn matches_data(&self, items: &WidgetData) -> bool {
+        if items.len() != self.total_items {
+            return false;
+        }
+        for (i, item) in items.iter().enumerate() {
+            if self.cache_keys[i] != item.cache_key {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// RTC fast memory state - persists across deep sleep
+#[esp_hal::ram(unstable(rtc_fast))]
+static mut SLEEP_STATE: SleepState = SleepState::new();
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
+    // Init logger first so we can see any early crashes
     esp_println::logger::init_logger_from_env();
+
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
+    // Check wake reason
+    let wake_reason = esp_hal::rtc_cntl::wakeup_cause();
+    println!("Boot! Wake reason: {:?}", wake_reason);
+
+    // Wait for USB serial to reconnect after deep sleep wake
+    esp_hal::delay::Delay::new().delay_millis(500);
+
     // Initialize internal RAM heap (for smaller allocations)
+    println!("Initializing heap...");
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 36 * 1024);
 
     // Initialize PSRAM for large allocations (framebuffer, PNG buffer)
+    println!("Initializing PSRAM...");
     esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
-    println!("PSRAM initialized and added to heap");
+    println!("PSRAM initialized");
 
+    println!("Starting RTOS...");
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(
         timg0.timer0,
@@ -84,6 +165,7 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT)
             .software_interrupt0,
     );
+    println!("RTOS started");
 
     // ==================== Power Management (AXP2101) ====================
     // PhotoPainter uses AXP2101 PMIC to control display power
@@ -174,20 +256,19 @@ async fn main(spawner: Spawner) -> ! {
         .expect("EPD init failed");
     println!("EPD initialized!");
 
-    //     // Start clearing display (non-blocking - continues during WiFi init)
-    //     println!("Starting display clear...");
-    //     epd.clear_start(photopainter::epd::Color::White, &mut delay)
-    //         .expect("Failed to start display clear");
+    // ==================== Button Setup (GPIO4 = KEY button) ====================
+    // Keep GPIO4 as raw pin for deep sleep wake source
+    let key_pin = peripherals.GPIO4;
 
-    // ==================== WiFi Setup (runs while display clears) ====================
+    // ==================== WiFi Setup ====================
     let esp_radio_ctrl = &*mk_static!(Controller<'static>, esp_radio::init().unwrap());
 
-    let (controller, interfaces) =
+    let (mut controller, interfaces) =
         esp_radio::wifi::new(esp_radio_ctrl, peripherals.WIFI, Default::default()).unwrap();
 
     let wifi_interface = interfaces.sta;
 
-    let config = embassy_net::Config::dhcpv4(Default::default());
+    let net_config = embassy_net::Config::dhcpv4(Default::default());
 
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
@@ -195,49 +276,42 @@ async fn main(spawner: Spawner) -> ! {
     // Init network stack
     let (stack, runner) = embassy_net::new(
         wifi_interface,
-        config,
+        net_config,
         mk_static!(StackResources<3>, StackResources::<3>::new()),
         seed,
     );
 
-    spawner.spawn(connection(controller)).ok();
+    // Start network task (runs continuously)
     spawner.spawn(net_task(runner)).ok();
 
-    // Wait for WiFi link
-    println!("Waiting for WiFi link...");
-    loop {
-        if stack.is_link_up() {
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
-    println!("WiFi link up!");
+    // Initial WiFi connection
+    wifi_connect(&mut controller).await;
+    wait_for_ip(stack).await;
 
-    // Wait for IP address
-    println!("Waiting for IP address...");
-    loop {
-        if let Some(config) = stack.config_v4() {
-            println!("Got IP: {}", config.address);
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
+    // ==================== RTC for Deep Sleep ====================
+    let mut rtc = Rtc::new(peripherals.LPWR);
 
-    // ==================== Main Display Loop ====================
-    println!("Starting display refresh loop...");
+    // ==================== Main Display Logic ====================
+    println!("Starting display update...");
     println!("Edge URL: {}", EDGE_URL);
     println!("Refresh interval: {} seconds", REFRESH_INTERVAL_SECS);
+
+    // Check if we're resuming from deep sleep
+    let resuming = unsafe { (*(&raw const SLEEP_STATE)).is_valid() };
+    if resuming {
+        let (index, total) = unsafe {
+            let state = &raw const SLEEP_STATE;
+            ((*state).index, (*state).total_items)
+        };
+        println!("Resuming from deep sleep: index={}, total={}", index, total);
+    } else {
+        println!("Fresh boot (no valid sleep state)");
+    }
 
     // Allocate framebuffer (uses PSRAM for the 192KB buffer)
     println!("Allocating framebuffer...");
     let mut framebuffer = Framebuffer::new();
     println!("Framebuffer allocated!");
-
-    // // Wait for display clear to finish (if still running)
-    // println!("Waiting for display clear to complete...");
-    // epd.refresh_wait(&mut delay)
-    //     .expect("Failed to complete display clear");
-    // println!("Display cleared!");
 
     // Use RNG for shuffle seed
     let rng = Rng::new();
@@ -251,10 +325,10 @@ async fn main(spawner: Spawner) -> ! {
     let tcp_client = TcpClient::new(stack, tcp_state);
     let dns_socket = DnsSocket::new(stack);
 
-    loop {
-        // Fetch widget data
-        println!("Fetching widget data...");
-        let mut items: WidgetData = match display::fetch_widget_data(
+    // Fetch widget data (with retries)
+    println!("Fetching widget data...");
+    let mut items: WidgetData = loop {
+        match display::fetch_widget_data(
             &tcp_client,
             &dns_socket,
             &mut tls_read_buf,
@@ -264,126 +338,182 @@ async fn main(spawner: Spawner) -> ! {
         )
         .await
         {
-            Ok(data) => data,
+            Ok(data) => break data,
             Err(e) => {
-                println!("Failed to fetch widget data: {:?}", e);
-                // Wait and retry
-                Timer::after(Duration::from_secs(60)).await;
-                continue;
-            }
-        };
-
-        // Shuffle items
-        let shuffle_seed = (rng.random() as u64) << 32 | rng.random() as u64;
-        display::shuffle_items(&mut items, shuffle_seed);
-
-        let total_items = items.len();
-        println!("Displaying {} items in shuffled order", total_items);
-
-        // Display all items (2 at a time)
-        let mut index: usize = 0;
-        while index < total_items {
-            // Wake up display if sleeping
-            println!("Waking up display...");
-            epd.wake_up(&mut delay).expect("Failed to wake display");
-
-            // Display current pair
-            println!(
-                "Displaying items {} and {} of {}",
-                index,
-                (index + 1).min(total_items - 1),
-                total_items
-            );
-            match display::fetch_and_display(
-                &tcp_client,
-                &dns_socket,
-                &mut tls_read_buf,
-                &mut tls_write_buf,
-                &mut epd,
-                &mut delay,
-                &mut framebuffer,
-                EDGE_URL,
-                "concerts",
-                &items,
-                index,
-            )
-            .await
-            {
-                Ok(()) => {
-                    println!("Display refresh successful!");
-                }
-                Err(e) => {
-                    println!("Display refresh failed: {:?}", e);
-                }
-            }
-
-            // Put display to sleep
-            println!("Putting display to sleep...");
-            epd.sleep(&mut delay).expect("Failed to sleep display");
-
-            // Advance by 2 (showing 2 images at a time)
-            index += 2;
-
-            // If more items to show, wait for next refresh
-            if index < total_items {
-                println!("Sleeping for {} seconds...", REFRESH_INTERVAL_SECS);
-                Timer::after(Duration::from_secs(REFRESH_INTERVAL_SECS)).await;
+                println!("Failed to fetch widget data: {:?}, retrying in 30s...", e);
+                Timer::after(Duration::from_secs(30)).await;
             }
         }
+    };
 
-        // All items shown, wait before refetching
-        println!(
-            "All items displayed. Sleeping {} seconds before refetch...",
-            REFRESH_INTERVAL_SECS
+    // Determine shuffle seed and starting index
+    let (shuffle_seed, mut index) = if resuming && unsafe { (*(&raw const SLEEP_STATE)).matches_data(&items) } {
+        // Resume from saved state
+        let (seed, idx) = unsafe {
+            let state = &raw const SLEEP_STATE;
+            ((*state).shuffle_seed, (*state).index)
+        };
+        println!("Data unchanged, resuming from index {}", idx);
+        (seed, idx)
+    } else {
+        // Fresh start with new shuffle
+        let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+        println!("Starting fresh with new shuffle seed");
+        (seed, 0)
+    };
+
+    // Shuffle items (same seed = same order)
+    display::shuffle_items(&mut items, shuffle_seed);
+
+    let total_items = items.len();
+    println!("Displaying {} items in shuffled order", total_items);
+
+    // If we've shown all items, start over
+    if index >= total_items {
+        println!("All items shown, starting over");
+        index = 0;
+    }
+
+    // Wake up display
+    println!("Waking up display...");
+    epd.wake_up(&mut delay).expect("Failed to wake display");
+
+    // Display current pair
+    println!(
+        "Displaying items {} and {} of {}",
+        index,
+        (index + 1).min(total_items - 1),
+        total_items
+    );
+    match display::fetch_and_display(
+        &tcp_client,
+        &dns_socket,
+        &mut tls_read_buf,
+        &mut tls_write_buf,
+        &mut epd,
+        &mut delay,
+        &mut framebuffer,
+        EDGE_URL,
+        "concerts",
+        &items,
+        index,
+    )
+    .await
+    {
+        Ok(()) => println!("Display refresh successful!"),
+        Err(e) => println!("Display refresh failed: {:?}", e),
+    }
+
+    // Put display to sleep
+    println!("Putting display to sleep...");
+    epd.sleep(&mut delay).expect("Failed to sleep display");
+
+    // Advance index for next wake
+    index += 2;
+
+    // Save state for next wake
+    unsafe {
+        let state = &raw mut SLEEP_STATE;
+        (*state).save(index, total_items, shuffle_seed, &items);
+    }
+    println!("Saved state: index={}, total={}", index, total_items);
+
+    // Disconnect WiFi before deep sleep
+    println!("Disconnecting WiFi for deep sleep...");
+    wifi_disconnect(&mut controller).await;
+
+    // Enter deep sleep
+    println!(
+        "Entering deep sleep for {} seconds (press button to wake early)...",
+        REFRESH_INTERVAL_SECS
+    );
+    enter_deep_sleep(&mut rtc, key_pin, &mut delay, REFRESH_INTERVAL_SECS);
+}
+
+/// Enter deep sleep with timer and KEY button (GPIO4) wake sources
+fn enter_deep_sleep<P: esp_hal::gpio::RtcPinWithResistors>(
+    rtc: &mut Rtc,
+    key_pin: P,
+    delay: &mut Delay,
+    seconds: u64,
+) -> ! {
+    // Configure wake sources
+    let timer = TimerWakeupSource::new(CoreDuration::from_secs(seconds));
+
+    // Enable internal pull-up on GPIO4 so it doesn't float and trigger spurious wakes
+    key_pin.rtcio_pullup(true);
+    key_pin.rtcio_pulldown(false);
+
+    // GPIO4 KEY button is active low (button pulls to ground when pressed)
+    let ext0 = Ext0WakeupSource::new(key_pin, WakeupLevel::Low);
+
+    // Small delay to let serial output flush
+    delay.delay_ms(100);
+
+    // Enter deep sleep (never returns - device reboots on wake)
+    rtc.sleep_deep(&[&timer, &ext0])
+}
+
+/// Connect to WiFi network
+async fn wifi_connect(controller: &mut WifiController<'static>) {
+    println!("Device capabilities: {:?}", controller.capabilities());
+
+    if !matches!(controller.is_started(), Ok(true)) {
+        let client_config = ModeConfig::Client(
+            ClientConfig::default()
+                .with_ssid(SSID.into())
+                .with_password(PASSWORD.into()),
         );
-        Timer::after(Duration::from_secs(REFRESH_INTERVAL_SECS)).await;
+        controller.set_config(&client_config).unwrap();
+        println!("Starting WiFi...");
+        controller.start_async().await.unwrap();
+        println!("WiFi started!");
+    }
+
+    println!("Connecting to {}...", SSID);
+    loop {
+        match controller.connect_async().await {
+            Ok(_) => {
+                println!("WiFi connected!");
+                break;
+            }
+            Err(e) => {
+                println!("Failed to connect: {e:?}, retrying...");
+                Timer::after(Duration::from_secs(5)).await;
+            }
+        }
     }
 }
 
-#[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) {
-    println!("start connection task");
-    println!("Device capabilities: {:?}", controller.capabilities());
+/// Disconnect and stop WiFi to save power
+async fn wifi_disconnect(controller: &mut WifiController<'static>) {
+    if let Err(e) = controller.disconnect_async().await {
+        println!("Disconnect error (may already be disconnected): {:?}", e);
+    }
+    if let Err(e) = controller.stop_async().await {
+        println!("Stop error: {:?}", e);
+    }
+    println!("WiFi stopped");
+}
+
+/// Wait for network stack to get an IP address
+async fn wait_for_ip(stack: Stack<'static>) {
+    println!("Waiting for link...");
     loop {
-        if esp_radio::wifi::sta_state() == WifiStaState::Connected {
-            // wait until we're no longer connected
-            controller.wait_for_event(WifiEvent::StaDisconnected).await;
-            Timer::after(Duration::from_millis(5000)).await
+        if stack.is_link_up() {
+            break;
         }
-        if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = ModeConfig::Client(
-                ClientConfig::default()
-                    .with_ssid(SSID.into())
-                    .with_password(PASSWORD.into()),
-            );
-            controller.set_config(&client_config).unwrap();
-            println!("Starting wifi");
-            controller.start_async().await.unwrap();
-            println!("Wifi started!");
+        Timer::after(Duration::from_millis(500)).await;
+    }
+    println!("Link up!");
 
-            let scan_config = ScanConfig::default().with_max(10);
-            let result = controller
-                .scan_with_config_async(scan_config)
-                .await
-                .unwrap();
-            if let Some(ap) = result.iter().find(|ap| ap.ssid.as_str() == SSID) {
-                println!(
-                    "Found {} (ch{}, {}dBm)",
-                    ap.ssid, ap.channel, ap.signal_strength
-                );
-            } else {
-                println!("SSID '{}' not found in {} APs", SSID, result.len());
-            }
+    println!("Waiting for IP...");
+    loop {
+        if let Some(config) = stack.config_v4() {
+            println!("Got IP: {}", config.address);
+            break;
         }
-        println!("Connecting to {}...", SSID);
-
-        match controller.connect_async().await {
-            Ok(_) => println!("Wifi connected!"),
-            Err(e) => {
-                println!("Failed to connect to wifi: {e:?}");
-                Timer::after(Duration::from_millis(5000)).await
-            }
-        }
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
