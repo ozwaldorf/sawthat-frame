@@ -66,11 +66,10 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 
-# E-paper display
-epd-waveshare = { git = "https://github.com/RitwikSaikia/epd-waveshare", branch = "feat/epd7in3e_impl", default-features = false, features = ["graphics", "epd2in13_v3"] }
+# E-paper display (using local epd module)
 embedded-hal = "1.0"
 embedded-hal-bus = "0.2"
-embedded-graphics = "0.8"
+embedded-graphics-core = "0.4"
 
 
 

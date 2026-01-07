@@ -12,11 +12,8 @@ use embassy_net::{Runner, StackResources, tcp::TcpSocket};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
-use epd_waveshare::{epd7in3e::*, prelude::*};
 use esp_alloc as _;
 use esp_backtrace as _;
-#[cfg(target_arch = "riscv32")]
-use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
@@ -37,6 +34,7 @@ use esp_radio::{
         ClientConfig, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
     },
 };
+use photopainter::epd::{Epd7in3e, RefreshMode};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -63,12 +61,11 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(size: 36 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    #[cfg(target_arch = "riscv32")]
-    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(
         timg0.timer0,
         #[cfg(target_arch = "riscv32")]
-        sw_int.software_interrupt0,
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT)
+            .software_interrupt0,
     );
 
     // ==================== Power Management (AXP2101) ====================
@@ -124,7 +121,7 @@ async fn main(spawner: Spawner) -> ! {
     .with_mosi(peripherals.GPIO11);
 
     let cs = Output::new(peripherals.GPIO9, Level::High, OutputConfig::default());
-    let mut spi_device = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
+    let spi_device = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
 
     let busy = Input::new(
         peripherals.GPIO13,
@@ -155,27 +152,21 @@ async fn main(spawner: Spawner) -> ! {
         if busy.is_high() { "HIGH" } else { "LOW" }
     );
 
-    println!("Initializing e-paper display...");
-    // delay_us between busy checks - 10ms = 10_000us (display refresh takes 20-40 seconds!)
-    let mut epd = Epd7in3e::new(&mut spi_device, busy, dc, rst, &mut delay, Some(10_000))
+    println!("Initializing e-paper display (fast mode)...");
+    let mut epd = Epd7in3e::new(spi_device, busy, dc, rst, &mut delay, RefreshMode::Fast)
         .expect("EPD init failed");
     println!("EPD initialized!");
 
-    // Clear display first
-    println!("Clearing display...");
-    epd.clear_frame(&mut spi_device, &mut delay)
-        .expect("Clear failed");
-    println!("Display cleared!");
-
-    // Show 6-color test pattern (takes 20-40 seconds to refresh!)
-    println!("Showing 6-block test pattern... (this takes 20-40 seconds)");
-    epd.show_6block(&mut spi_device, &mut delay)
-        .expect("failed to do 6block test");
-    println!("Display refresh complete!");
+    // Show 6-color test pattern
+    println!("Showing 6-color test pattern...");
+    println!("  | Black  | White  | Yellow |");
+    println!("  | Red    | Blue   | Green  |");
+    epd.show_6block(&mut delay)
+        .expect("failed to show 6block test");
+    println!("Display updated!");
 
     // Put display to sleep to save power
-    epd.sleep(&mut spi_device, &mut delay)
-        .expect("Sleep failed");
+    epd.sleep(&mut delay).expect("Sleep failed");
     println!("Display sleeping.");
 
     // ==================== WiFi Setup ====================
