@@ -30,8 +30,8 @@ embassy-net = { version = "0.8.0", features = [
   "tcp",
   "udp",
 ] }
-embedded-io = "0.7.1"
-embedded-io-async = "0.7.0"
+embedded-io = "0.7"
+embedded-io-async = "0.7"
 esp-alloc = "0.9.0"
 esp-backtrace = { version = "0.18.1", features = [
   "esp32s3",
@@ -80,9 +80,9 @@ heapless = "0.8"
 # PNG decoding (no_std, no alloc)
 minipng = "0.1"
 
-# TLS support (using git for embedded-io-async 0.7 compatibility)
-embedded-tls = { git = "https://github.com/drogue-iot/embedded-tls", default-features = false, features = ["alloc"] }
-rand_core = "0.6"
+# HTTP client with TLS support (use git for embedded-nal-async 0.9 compatibility)
+reqwless = { git = "https://github.com/drogue-iot/reqwless", default-features = false, features = ["embedded-tls", "alloc"] }
+embedded-nal-async = "0.9"
 
 
 

@@ -9,7 +9,7 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources};
+use embassy_net::{Runner, StackResources, dns::DnsSocket, tcp::client::{TcpClient, TcpClientState}};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -35,9 +35,10 @@ use esp_radio::{
         ClientConfig, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
     },
 };
-use photopainter::display;
+use photopainter::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use photopainter::epd::{Epd7in3e, RefreshMode};
 use photopainter::framebuffer::Framebuffer;
+use photopainter::widget::WidgetData;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -234,44 +235,93 @@ async fn main(spawner: Spawner) -> ! {
         .expect("Failed to complete display clear");
     println!("Display cleared!");
 
-    let mut rotation_index: usize = 0;
-    let mut total_items: usize = 0;
+    // Use RNG for shuffle seed
+    let rng = Rng::new();
+
+    // Allocate TLS buffers for HTTPS support
+    let mut tls_read_buf = [0u8; TLS_READ_BUF_SIZE];
+    let mut tls_write_buf = [0u8; TLS_WRITE_BUF_SIZE];
+
+    // Create TCP client and DNS socket for HTTP requests
+    let tcp_state = mk_static!(TcpClientState<1, 1024, 1024>, TcpClientState::new());
+    let tcp_client = TcpClient::new(stack, tcp_state);
+    let dns_socket = DnsSocket::new(stack);
 
     loop {
-        // Wake up display if sleeping
-        println!("Waking up display...");
-        epd.wake_up(&mut delay).expect("Failed to wake display");
-
-        // Refresh display from edge service
-        println!("Fetching and displaying content from edge service...");
-        match display::refresh_from_edge(
-            stack,
-            &mut epd,
-            &mut delay,
-            &mut framebuffer,
+        // Fetch widget data
+        println!("Fetching widget data...");
+        let mut items: WidgetData = match display::fetch_widget_data(
+            &tcp_client,
+            &dns_socket,
+            &mut tls_read_buf,
+            &mut tls_write_buf,
             EDGE_URL,
             "concerts",
-            rotation_index,
-        )
-        .await
-        {
-            Ok(count) => {
-                println!("Display refresh successful!");
-                total_items = count;
-                // Advance by 2 (showing 2 images at a time)
-                rotation_index = (rotation_index + 2) % total_items.max(1);
-            }
+        ).await {
+            Ok(data) => data,
             Err(e) => {
-                println!("Display refresh failed: {:?}", e);
+                println!("Failed to fetch widget data: {:?}", e);
+                // Wait and retry
+                Timer::after(Duration::from_secs(60)).await;
+                continue;
+            }
+        };
+
+        // Shuffle items
+        let shuffle_seed = (rng.random() as u64) << 32 | rng.random() as u64;
+        display::shuffle_items(&mut items, shuffle_seed);
+
+        let total_items = items.len();
+        println!("Displaying {} items in shuffled order", total_items);
+
+        // Display all items (2 at a time)
+        let mut index: usize = 0;
+        while index < total_items {
+            // Wake up display if sleeping
+            println!("Waking up display...");
+            epd.wake_up(&mut delay).expect("Failed to wake display");
+
+            // Display current pair
+            println!("Displaying items {} and {} of {}", index, (index + 1).min(total_items - 1), total_items);
+            match display::fetch_and_display(
+                &tcp_client,
+                &dns_socket,
+                &mut tls_read_buf,
+                &mut tls_write_buf,
+                &mut epd,
+                &mut delay,
+                &mut framebuffer,
+                EDGE_URL,
+                "concerts",
+                &items,
+                index,
+            )
+            .await
+            {
+                Ok(()) => {
+                    println!("Display refresh successful!");
+                }
+                Err(e) => {
+                    println!("Display refresh failed: {:?}", e);
+                }
+            }
+
+            // Put display to sleep
+            println!("Putting display to sleep...");
+            epd.sleep(&mut delay).expect("Failed to sleep display");
+
+            // Advance by 2 (showing 2 images at a time)
+            index += 2;
+
+            // If more items to show, wait for next refresh
+            if index < total_items {
+                println!("Sleeping for {} seconds...", REFRESH_INTERVAL_SECS);
+                Timer::after(Duration::from_secs(REFRESH_INTERVAL_SECS)).await;
             }
         }
 
-        // Put display to sleep
-        println!("Putting display to sleep...");
-        epd.sleep(&mut delay).expect("Failed to sleep display");
-
-        // Wait for next refresh
-        println!("Sleeping for {} seconds...", REFRESH_INTERVAL_SECS);
+        // All items shown, wait before refetching
+        println!("All items displayed. Sleeping {} seconds before refetch...", REFRESH_INTERVAL_SECS);
         Timer::after(Duration::from_secs(REFRESH_INTERVAL_SECS)).await;
     }
 }
