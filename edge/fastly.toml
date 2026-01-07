@@ -1,0 +1,54 @@
+# This file describes a Fastly Compute package. To learn more visit:
+# https://www.fastly.com/documentation/reference/compute/fastly-toml
+
+authors = ["concert-display"]
+description = "Widget API and image processing for concert display e-paper frame"
+language = "rust"
+manifest_version = 3
+name = "concert-display-edge"
+service_id = "TvQJBJmtyGImzDCi3R1FHb"
+
+[local_server]
+
+  [local_server.backends]
+
+    [local_server.backends.sawthat]
+      url = "https://server.sawthat.band"
+
+    [local_server.backends.spotify_images]
+      url = "https://i.scdn.co"
+
+  [local_server.kv_stores]
+
+    [local_server.kv_stores.image_cache]
+      file = "kv-store-image-cache.json"
+      format = "json"
+
+    [local_server.kv_stores.widget_data]
+      file = "kv-store-widget-data.json"
+      format = "json"
+
+[scripts]
+  build = "cargo build --release --target wasm32-wasip1 && mkdir -p bin && cp target/wasm32-wasip1/release/concert-display-edge.wasm bin/main.wasm"
+
+[setup]
+
+  [setup.backends]
+
+    [setup.backends.sawthat]
+      address = "server.sawthat.band"
+      description = "SawThat.band API for concert history"
+      port = 443
+
+    [setup.backends.spotify_images]
+      address = "i.scdn.co"
+      description = "Spotify CDN for artist images"
+      port = 443
+
+  [setup.kv_stores]
+
+    [setup.kv_stores.image_cache]
+      description = "Cache for processed widget images"
+
+    [setup.kv_stores.widget_data]
+      description = "Cache for widget data responses"

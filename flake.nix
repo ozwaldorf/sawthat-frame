@@ -17,6 +17,7 @@
             rustup
             espup
             espflash
+            fastly
           ];
         };
       }

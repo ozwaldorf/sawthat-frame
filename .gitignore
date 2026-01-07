@@ -1,0 +1,8 @@
+# will have compiled files and executables
+debug/
+target/
+bin/
+pkg/
+kv-store-*.json
+**/*.rs.bk
+*.pdb
