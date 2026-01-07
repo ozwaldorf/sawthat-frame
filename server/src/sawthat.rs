@@ -1,20 +1,19 @@
 //! SawThat.band API integration
 //!
 //! Fetches concert history from sawthat.band API and generates widget items.
+//! Uses Deezer API to find album art matching each concert date.
 
-use fastly::http::StatusCode;
-use fastly::{Error, Request};
+use reqwest::Client;
 use serde::Deserialize;
 
+use crate::deezer;
+use crate::error::AppError;
 use crate::image_processing;
 use crate::text::ConcertInfo;
-use crate::widget::{CachePolicy, Orientation, WidgetData, WidgetItem, WidgetWidth};
+use crate::widget::{Orientation, WidgetData, WidgetItem, WidgetWidth};
 
 /// SawThat API base URL
 const SAWTHAT_API_URL: &str = "https://server.sawthat.band/api/bands";
-
-/// Backend name for SawThat API requests
-const SAWTHAT_BACKEND: &str = "sawthat";
 
 /// A band from the SawThat API
 #[derive(Debug, Clone, Deserialize)]
@@ -23,14 +22,11 @@ pub struct SawThatBand {
     pub band: String,
     /// Spotify image URL
     pub picture: String,
-    /// Genre tags
-    pub genre: Vec<String>,
     /// Concert history
     pub concerts: Vec<SawThatConcert>,
     /// Band UUID
     pub id: String,
-    /// User UUID
-    pub user_id: String,
+    // Note: genre and user_id fields exist in API but are ignored
 }
 
 /// A concert from the SawThat API
@@ -43,27 +39,27 @@ pub struct SawThatConcert {
 }
 
 /// Fetch bands from SawThat API
-pub fn fetch_bands(user_id: &str) -> Result<Vec<SawThatBand>, Error> {
+pub async fn fetch_bands(client: &Client, user_id: &str) -> Result<Vec<SawThatBand>, AppError> {
     let url = format!("{}?id={}", SAWTHAT_API_URL, user_id);
 
-    log::info!("Fetching SawThat bands from: {}", url);
+    tracing::info!("Fetching SawThat bands from: {}", url);
 
-    let response = Request::get(&url)
-        .with_header("Accept", "application/json")
-        .send(SAWTHAT_BACKEND)?;
+    let response = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
 
-    if response.get_status() != StatusCode::OK {
-        return Err(Error::msg(format!(
+    if !response.status().is_success() {
+        return Err(AppError::ExternalApi(format!(
             "SawThat API returned status: {}",
-            response.get_status()
+            response.status()
         )));
     }
 
-    let body = response.into_body_str();
-    let bands: Vec<SawThatBand> = serde_json::from_str(&body)
-        .map_err(|e| Error::msg(format!("Failed to parse SawThat response: {}", e)))?;
+    let bands: Vec<SawThatBand> = response.json().await?;
 
-    log::info!("Fetched {} bands from SawThat", bands.len());
+    tracing::info!("Fetched {} bands from SawThat", bands.len());
 
     Ok(bands)
 }
@@ -108,7 +104,6 @@ pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData 
 
             WidgetItem {
                 width: WidgetWidth::Full,
-                cache_policy: CachePolicy::Max, // Concert images don't change
                 cache_key,
                 path,
             }
@@ -117,33 +112,36 @@ pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData 
 }
 
 /// Fetch and process an image for a band
-pub fn fetch_band_image(
+pub async fn fetch_band_image(
+    client: &Client,
     bands: &[SawThatBand],
     band_id: &str,
     date: Option<&str>,
     orientation: Orientation,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Vec<u8>, AppError> {
     // Find the band
     let band = bands
         .iter()
         .find(|b| b.id == band_id)
-        .ok_or_else(|| Error::msg(format!("Band not found: {}", band_id)))?;
+        .ok_or_else(|| AppError::BandNotFound(band_id.to_string()))?;
 
-    log::info!("Fetching image for band: {} from {}", band.band, band.picture);
+    tracing::info!("Fetching image for band: {} from {}", band.band, band.picture);
 
     // Fetch the Spotify image
-    let response = Request::get(&band.picture)
-        .with_header("Accept", "image/*")
-        .send("spotify_images")?;
+    let response = client
+        .get(&band.picture)
+        .header("Accept", "image/*")
+        .send()
+        .await?;
 
-    if response.get_status() != StatusCode::OK {
-        return Err(Error::msg(format!(
+    if !response.status().is_success() {
+        return Err(AppError::ExternalApi(format!(
             "Failed to fetch image: {}",
-            response.get_status()
+            response.status()
         )));
     }
 
-    let image_data = response.into_body_bytes();
+    let image_data = response.bytes().await?;
 
     // Build concert info for text rendering
     let concert_info = date.and_then(|d| {
@@ -220,19 +218,15 @@ mod tests {
 
     #[test]
     fn test_bands_to_widget_items() {
-        let bands = vec![
-            SawThatBand {
-                band: "Test Band".to_string(),
-                picture: "https://example.com/image.jpg".to_string(),
-                genre: vec!["rock".to_string()],
-                concerts: vec![SawThatConcert {
-                    date: "15-06-2024".to_string(),
-                    location: "Test Venue".to_string(),
-                }],
-                id: "test-id".to_string(),
-                user_id: "user-id".to_string(),
-            },
-        ];
+        let bands = vec![SawThatBand {
+            band: "Test Band".to_string(),
+            picture: "https://example.com/image.jpg".to_string(),
+            concerts: vec![SawThatConcert {
+                date: "15-06-2024".to_string(),
+                location: "Test Venue".to_string(),
+            }],
+            id: "test-id".to_string(),
+        }];
 
         let items = bands_to_widget_items(&bands, 10);
         assert_eq!(items.len(), 1);
