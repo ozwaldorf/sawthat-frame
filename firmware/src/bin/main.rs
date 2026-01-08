@@ -3,7 +3,7 @@
 //! Environment variables required:
 //! - WIFI_SSID: WiFi network name
 //! - WIFI_PASS: WiFi password
-//! - EDGE_URL: Edge service URL (e.g., http://192.168.1.100:7676)
+//! - SERVER_URL: Edge service URL (e.g., http://192.168.1.100:7676)
 
 #![no_std]
 #![no_main]
@@ -64,7 +64,7 @@ macro_rules! mk_static {
 
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASS");
-const EDGE_URL: &str = env!("EDGE_URL");
+const SERVER_URL: &str = env!("SERVER_URL");
 
 /// Refresh interval between display updates (15 minutes)
 const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
@@ -419,7 +419,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // ==================== Main Display Logic ====================
     println!("Starting display update...");
-    println!("Edge URL: {}", EDGE_URL);
+    println!("Edge URL: {}", SERVER_URL);
     println!("Refresh interval: {} seconds", REFRESH_INTERVAL_SECS);
 
     if button_wake {
@@ -464,7 +464,7 @@ async fn main(spawner: Spawner) -> ! {
             &dns_socket,
             &mut tls_read_buf,
             &mut tls_write_buf,
-            EDGE_URL,
+            SERVER_URL,
             "concerts",
         )
         .await;
@@ -579,7 +579,7 @@ async fn main(spawner: Spawner) -> ! {
                 &mut tls_read_buf,
                 &mut tls_write_buf,
                 &mut framebuffer,
-                EDGE_URL,
+                SERVER_URL,
                 "concerts",
                 &items,
                 item_idx,
@@ -654,7 +654,7 @@ async fn main(spawner: Spawner) -> ! {
                 &mut tls_read_buf,
                 &mut tls_write_buf,
                 &mut framebuffer,
-                EDGE_URL,
+                SERVER_URL,
                 "concerts",
                 orientation,
                 &items,

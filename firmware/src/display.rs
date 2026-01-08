@@ -62,7 +62,7 @@ pub async fn fetch_to_framebuffer<T, D>(
     tls_read_buf: &mut [u8],
     tls_write_buf: &mut [u8],
     framebuffer: &mut Framebuffer,
-    edge_url: &str,
+    server_url: &str,
     widget_name: &str,
     orientation: Orientation,
     items: &WidgetData,
@@ -87,7 +87,7 @@ where
 
     // Establish persistent connection to edge server
     let mut resource = client
-        .resource(edge_url)
+        .resource(server_url)
         .await
         .map_err(|_| DisplayError::Network)?;
 
@@ -200,7 +200,7 @@ pub async fn fetch_single_to_framebuffer<T, D>(
     tls_read_buf: &mut [u8],
     tls_write_buf: &mut [u8],
     framebuffer: &mut Framebuffer,
-    edge_url: &str,
+    server_url: &str,
     widget_name: &str,
     items: &WidgetData,
     item_idx: usize,
@@ -229,7 +229,7 @@ where
 
     // Establish connection to edge server
     let mut resource = client
-        .resource(edge_url)
+        .resource(server_url)
         .await
         .map_err(|_| DisplayError::Network)?;
 
@@ -332,7 +332,7 @@ pub async fn fetch_widget_data<T, D>(
     dns: &D,
     tls_read_buf: &mut [u8],
     tls_write_buf: &mut [u8],
-    edge_url: &str,
+    server_url: &str,
     widget_name: &str,
 ) -> Result<WidgetData, DisplayError>
 where
@@ -347,11 +347,11 @@ where
     let mut path: String<256> = String::new();
     write!(&mut path, "/{}", widget_name).map_err(|_| DisplayError::Network)?;
 
-    println!("Fetching widget data from {}{}", edge_url, path.as_str());
+    println!("Fetching widget data from {}{}", server_url, path.as_str());
 
     // Establish connection and make request
     let mut resource = client
-        .resource(edge_url)
+        .resource(server_url)
         .await
         .map_err(|_| DisplayError::Network)?;
 
