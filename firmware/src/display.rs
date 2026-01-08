@@ -115,7 +115,7 @@ where
         let mut path: String<256> = String::new();
         if write!(
             &mut path,
-            "/api/widget/{}/{}/{}",
+            "/{}/{}/{}",
             widget_name,
             orientation.as_str(),
             item.path.as_str()
@@ -224,7 +224,7 @@ where
 
     // Build path
     let mut path: String<256> = String::new();
-    write!(&mut path, "/api/widget/{}", widget_name).map_err(|_| DisplayError::Network)?;
+    write!(&mut path, "/{}", widget_name).map_err(|_| DisplayError::Network)?;
 
     println!("Fetching widget data from {}{}", edge_url, path.as_str());
 

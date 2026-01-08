@@ -170,7 +170,7 @@ The display is driven by **widgets** - generic data sources produced by edge fun
 ### Widget endpoint response
 
 ```
-GET /api/widget/{widget_name}
+GET /{widget_name}
 
 Response headers:
   X-Cache-Policy: <max|ttl_seconds|0>
@@ -182,7 +182,7 @@ Response body (JSON array):
     "width": 1,              // 1 = 400×480 (half), 2 = 800×480 (full)
     "cache_policy": "max",   // "max" | seconds | "0"
     "cache_key": 12345678,   // u32 key for image cache
-    "path": "/concerts/abc123"
+    "path": "abc123"
   },
   ...
 ]
@@ -199,7 +199,7 @@ Response body (JSON array):
 ### Image endpoint
 
 ```
-GET /api/widget/{widget_name}/{path}
+GET /{widget_name}/{orientation}/{path}
 
 Response: PNG with 6-color indexed palette
 ```
