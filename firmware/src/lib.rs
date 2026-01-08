@@ -2,8 +2,8 @@
 
 extern crate alloc;
 
-pub mod epd;
-
+pub mod battery;
 pub mod display;
+pub mod epd;
 pub mod framebuffer;
 pub mod widget;

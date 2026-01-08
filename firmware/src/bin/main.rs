@@ -44,8 +44,9 @@ use esp_radio::{
     Controller,
     wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice},
 };
+use photopainter::battery;
 use photopainter::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
-use photopainter::epd::{Epd7in3e, RefreshMode};
+use photopainter::epd::{Epd7in3e, RefreshMode, HEIGHT, WIDTH};
 use photopainter::framebuffer::Framebuffer;
 use photopainter::widget::{Orientation, WidgetData, MAX_ITEMS};
 
@@ -289,6 +290,7 @@ async fn main(spawner: Spawner) -> ! {
     const LDO_ONOFF_CTRL0: u8 = 0x90; // ALDO enable bits
     const LDO_VOL2_CTRL: u8 = 0x94; // ALDO3 voltage
     const LDO_VOL3_CTRL: u8 = 0x95; // ALDO4 voltage
+    const BAT_PERCENT_REG: u8 = 0xA4; // Battery percentage (0-100)
 
     // Try to configure PMIC - may already be set by bootloader
     let pmic_ok = (|| -> Result<(), esp_hal::i2c::master::Error> {
@@ -503,6 +505,21 @@ async fn main(spawner: Spawner) -> ! {
             (index + 1).min(total_items - 1),
             total_items
         );
+        // Read battery percentage
+        let battery_percent = {
+            let mut buf = [0u8; 1];
+            match i2c.write_read(AXP2101_ADDR, &[BAT_PERCENT_REG], &mut buf) {
+                Ok(()) => {
+                    println!("Battery: {}%", buf[0]);
+                    buf[0]
+                }
+                Err(e) => {
+                    println!("Failed to read battery: {:?}", e);
+                    50 // Default to 50% on error
+                }
+            }
+        };
+
         // Fetch images and update display with blinking LED
         start_blink();
         let fetch_result = display::fetch_to_framebuffer(
@@ -518,6 +535,21 @@ async fn main(spawner: Spawner) -> ! {
             index,
         )
         .await;
+
+        // Draw battery indicator into framebuffer
+        if fetch_result.is_ok() {
+            let vertical = orientation == Orientation::Vertical;
+            let (bat_w, bat_h) = battery::battery_dimensions(vertical);
+            let battery_x = WIDTH as u16 - bat_w - 8; // right side
+            let battery_y = 8; // top
+            battery::draw_battery(
+                framebuffer.as_mut_slice(),
+                battery_x,
+                battery_y,
+                battery_percent,
+                vertical,
+            );
+        }
 
         // Update display with non-blocking refresh (allows blink task to run)
         let display_result = match fetch_result {
