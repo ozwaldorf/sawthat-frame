@@ -203,28 +203,34 @@ pub async fn fetch_band_image(
     Ok(processed)
 }
 
-/// Format date from DD-MM-YYYY to a more readable format (e.g., "15 Jun 2024")
+/// Format date from DD-MM-YYYY to "Month DDth, YYYY" (e.g., "July 17th, 2025")
 fn format_date(date: &str) -> String {
     let parts: Vec<&str> = date.split('-').collect();
     if parts.len() == 3 {
-        let day = parts[0];
+        let day: u32 = parts[0].parse().unwrap_or(0);
         let month = match parts[1] {
-            "01" => "Jan",
-            "02" => "Feb",
-            "03" => "Mar",
-            "04" => "Apr",
+            "01" => "January",
+            "02" => "February",
+            "03" => "March",
+            "04" => "April",
             "05" => "May",
-            "06" => "Jun",
-            "07" => "Jul",
-            "08" => "Aug",
-            "09" => "Sep",
-            "10" => "Oct",
-            "11" => "Nov",
-            "12" => "Dec",
-            _ => parts[1],
+            "06" => "June",
+            "07" => "July",
+            "08" => "August",
+            "09" => "September",
+            "10" => "October",
+            "11" => "November",
+            "12" => "December",
+            _ => return date.to_string(),
+        };
+        let suffix = match day {
+            1 | 21 | 31 => "st",
+            2 | 22 => "nd",
+            3 | 23 => "rd",
+            _ => "th",
         };
         let year = parts[2];
-        format!("{} {} {}", day, month, year)
+        format!("{} {}{}, {}", month, day, suffix, year)
     } else {
         date.to_string()
     }
