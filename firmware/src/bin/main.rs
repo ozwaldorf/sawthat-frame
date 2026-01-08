@@ -587,10 +587,10 @@ async fn main(spawner: Spawner) -> ! {
             )
             .await;
 
-            // Draw battery indicator in the slot being updated (if right side)
-            if fetch_result.is_ok() && next_slot == 1 {
+            // Draw battery indicator centered horizontally
+            if fetch_result.is_ok() {
                 let (bat_w, _bat_h) = battery::battery_dimensions(false);
-                let battery_x = WIDTH as u16 - bat_w - 8;
+                let battery_x = (WIDTH as u16 - bat_w) / 2;
                 let battery_y = 8;
                 battery::draw_battery(
                     framebuffer.as_mut_slice(),
@@ -666,7 +666,12 @@ async fn main(spawner: Spawner) -> ! {
             if fetch_result.is_ok() {
                 let vertical = orientation == Orientation::Vertical;
                 let (bat_w, _bat_h) = battery::battery_dimensions(vertical);
-                let battery_x = WIDTH as u16 - bat_w - 8;
+                // Centered horizontally in horizontal mode, right-aligned in vertical
+                let battery_x = if vertical {
+                    WIDTH as u16 - bat_w - 8
+                } else {
+                    (WIDTH as u16 - bat_w) / 2
+                };
                 let battery_y = 8;
                 battery::draw_battery(
                     framebuffer.as_mut_slice(),
