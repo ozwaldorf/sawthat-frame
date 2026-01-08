@@ -352,3 +352,143 @@ fn decode_to_framebuffer(png: &[u8], fb: &mut [u8], x_offset: u16, width: u16) {
 ```
 
 Decode time is mostly negligible compared to the 12-second e-paper refresh.
+
+## Server
+
+The server is a Rust web service that provides the widget API and image processing for the e-paper display.
+
+### Development
+
+```bash
+cd server
+cargo run
+```
+
+The server listens on port 3000 by default. Configure via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3000` | HTTP port |
+| `RUST_LOG` | `info` | Log filter |
+
+### API endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health check |
+| `GET /concerts` | Concert widget data |
+| `GET /concerts/{orientation}/{image_path}` | Processed image (orientation: `horiz` or `vert`) |
+| `GET /docs` | Interactive API documentation |
+| `GET /openapi.json` | OpenAPI specification |
+
+### Building with Nix
+
+```bash
+# Build the server
+nix build .#server
+
+# Run directly
+nix run .#server
+```
+
+### NixOS module
+
+Add to your flake inputs and NixOS configuration:
+
+```nix
+{
+  inputs.concert-display.url = "github:ozwaldorf/concert-display";
+
+  outputs = { nixpkgs, concert-display, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        concert-display.nixosModules.default
+        {
+          services.concert-display-server = {
+            enable = true;
+            port = 3000;
+            openFirewall = true;
+            # logLevel = "concert_display_server=debug";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enable` | `false` | Enable the service |
+| `port` | `3000` | HTTP port |
+| `openFirewall` | `false` | Open port in firewall |
+| `logLevel` | `info` | RUST_LOG filter |
+| `package` | flake default | Package override |
+
+## Firmware
+
+The firmware runs on the ESP32-S3 and drives the e-paper display.
+
+### Prerequisites
+
+Install the ESP Rust toolchain using [espup](https://github.com/esp-rs/espup):
+
+```bash
+# Install espup
+cargo install espup
+
+# Install the ESP toolchain
+espup install
+
+# Source the environment (add to your shell rc)
+source ~/export-esp.sh
+```
+
+Or using Nix:
+
+```bash
+cd firmware
+nix develop
+espup install
+source ~/export-esp.sh
+```
+
+### Configuration
+
+Set WiFi credentials and server URL via environment variables:
+
+```bash
+export WIFI_SSID="your-ssid"
+export WIFI_PASS="your-password"
+```
+
+### Building
+
+```bash
+cd firmware
+cargo build --release
+```
+
+### Flashing
+
+Connect the ESP32-S3 via USB and flash:
+
+```bash
+cd firmware
+cargo run --release
+```
+
+This uses `espflash` to flash and open a serial monitor. To flash without monitoring:
+
+```bash
+espflash flash --chip esp32s3 target/xtensa-esp32s3-none-elf/release/concert-display-firmware
+```
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Permission denied on `/dev/ttyUSB0` | Add user to `dialout` group: `sudo usermod -aG dialout $USER` |
+| Device not found | Check USB connection, try different cable |
+| Build fails with linker errors | Ensure `source ~/export-esp.sh` was run |
+| WiFi connection fails | Verify credentials, check 2.4 GHz network availability |
