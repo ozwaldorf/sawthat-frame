@@ -90,8 +90,12 @@ impl DataSource for ConcertDataSource {
     async fn fetch_image(&self, path: &str, orientation: Orientation) -> Result<Vec<u8>, AppError> {
         // Path format: {band_id}/{date}
         let parts: Vec<&str> = path.splitn(2, '/').collect();
-        let band_id = parts.first().ok_or_else(|| AppError::InvalidPath("missing band_id".to_string()))?;
-        let date = parts.get(1).map(|d| urlencoding::decode(d).unwrap_or_default().into_owned());
+        let band_id = parts
+            .first()
+            .ok_or_else(|| AppError::InvalidPath("missing band_id".to_string()))?;
+        let date = parts
+            .get(1)
+            .map(|d| urlencoding::decode(d).unwrap_or_default().into_owned());
 
         tracing::info!("Fetching image for band_id: {}, date: {:?}", band_id, date);
 

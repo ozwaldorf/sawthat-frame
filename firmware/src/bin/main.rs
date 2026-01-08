@@ -252,7 +252,7 @@ async fn main(spawner: Spawner) -> ! {
 
             // Flash LED 3 times for rotation
             for _ in 0..3 {
-                led_green.set_low();  // ON
+                led_green.set_low(); // ON
                 delay.delay_ms(100);
                 led_green.set_high(); // OFF
                 delay.delay_ms(100);
@@ -267,7 +267,7 @@ async fn main(spawner: Spawner) -> ! {
             advance_item = true;
 
             // Flash LED 1 time for next item
-            led_green.set_low();  // ON
+            led_green.set_low(); // ON
             delay.delay_ms(100);
             led_green.set_high(); // OFF
         }
@@ -435,7 +435,10 @@ async fn main(spawner: Spawner) -> ! {
             let state = &raw const SLEEP_STATE;
             ((*state).index, (*state).total_items)
         };
-        println!("Resuming from deep sleep: index={}, total={}, orientation={:?}", index, total, orientation);
+        println!(
+            "Resuming from deep sleep: index={}, total={}, orientation={:?}",
+            index, total, orientation
+        );
     } else {
         println!("Fresh boot (no valid sleep state)");
     }
@@ -621,7 +624,8 @@ async fn main(spawner: Spawner) -> ! {
                             while epd.is_busy() {
                                 Timer::after(Duration::from_millis(50)).await;
                             }
-                            epd.refresh_wait(&mut delay).map_err(|_| display::DisplayError::Network)
+                            epd.refresh_wait(&mut delay)
+                                .map_err(|_| display::DisplayError::Network)
                         }
                         Err(_) => Err(display::DisplayError::Network),
                     }
@@ -692,7 +696,8 @@ async fn main(spawner: Spawner) -> ! {
                             while epd.is_busy() {
                                 Timer::after(Duration::from_millis(50)).await;
                             }
-                            epd.finish_display(&mut delay).map_err(|_| display::DisplayError::Network)
+                            epd.finish_display(&mut delay)
+                                .map_err(|_| display::DisplayError::Network)
                         }
                         Err(_) => Err(display::DisplayError::Network),
                     }
@@ -745,7 +750,7 @@ async fn main(spawner: Spawner) -> ! {
 
                     // Flash LED2 3 times to confirm rotation
                     for _ in 0..3 {
-                        led_green.set_low();  // ON
+                        led_green.set_low(); // ON
                         delay.delay_ms(100);
                         led_green.set_high(); // OFF
                         delay.delay_ms(100);
@@ -763,7 +768,7 @@ async fn main(spawner: Spawner) -> ! {
                     println!("Button tap, next item (index={})", index);
 
                     // Flash LED2 1 time to confirm next item
-                    led_green.set_low();  // ON
+                    led_green.set_low(); // ON
                     delay.delay_ms(100);
                     led_green.set_high(); // OFF
                 }
@@ -784,7 +789,15 @@ async fn main(spawner: Spawner) -> ! {
     // Save state for next wake (index already advanced in the loop)
     unsafe {
         let state = &raw mut SLEEP_STATE;
-        (*state).save(index, total_items, shuffle_seed, orientation, next_slot, slot_items, &items);
+        (*state).save(
+            index,
+            total_items,
+            shuffle_seed,
+            orientation,
+            next_slot,
+            slot_items,
+            &items,
+        );
     }
     println!(
         "Saved state: index={}, total={}, orientation={:?}, next_slot={}, slot_items=[{}, {}]",

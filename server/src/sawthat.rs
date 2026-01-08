@@ -97,9 +97,7 @@ pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData 
     all_concerts
         .into_iter()
         .take(limit)
-        .map(|(band, concert, _)| {
-            format!("{}/{}", band.id, urlencoding::encode(&concert.date))
-        })
+        .map(|(band, concert, _)| format!("{}/{}", band.id, urlencoding::encode(&concert.date)))
         .collect()
 }
 
@@ -190,7 +188,12 @@ pub async fn fetch_band_image(
     // Get dimensions based on orientation (using Half width as default)
     let (target_width, target_height) = orientation.dimensions(WidgetWidth::Half);
 
-    let processed = image_processing::process_image(&image_data, target_width, target_height, concert_info.as_ref())?;
+    let processed = image_processing::process_image(
+        &image_data,
+        target_width,
+        target_height,
+        concert_info.as_ref(),
+    )?;
 
     Ok(processed)
 }

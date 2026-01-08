@@ -52,8 +52,7 @@ async fn main() {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -70,7 +69,10 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/concerts", get(get_concerts_data))
-        .route("/concerts/{orientation}/{*image_path}", get(get_concerts_image))
+        .route(
+            "/concerts/{orientation}/{*image_path}",
+            get(get_concerts_image),
+        )
         .merge(Scalar::with_url("/docs", ApiDoc::openapi()))
         .route("/openapi.json", get(openapi_json))
         .layer(CorsLayer::permissive())
@@ -125,7 +127,10 @@ async fn get_concerts_data(State(state): State<AppState>) -> impl IntoResponse {
 
     match items {
         Ok(items) => Ok((
-            [(header::HeaderName::from_static("x-cache-policy"), cache_policy.to_string())],
+            [(
+                header::HeaderName::from_static("x-cache-policy"),
+                cache_policy.to_string(),
+            )],
             Json(items),
         )),
         Err(e) => Err(e),
@@ -166,10 +171,7 @@ async fn get_concerts_image(
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "image/png"),
-            (
-                header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
-            ),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
         png_data,
     )

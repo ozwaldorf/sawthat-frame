@@ -35,7 +35,11 @@ pub fn render_concert_info_indexed(
     is_light_bg: bool,
 ) {
     let font = FontRef::try_from_slice(FONT_DATA).expect("Failed to load font");
-    let text_color = if is_light_bg { BLACK_INDEX } else { WHITE_INDEX };
+    let text_color = if is_light_bg {
+        BLACK_INDEX
+    } else {
+        WHITE_INDEX
+    };
 
     // Leave some horizontal padding (8px each side)
     let max_width = width.saturating_sub(16) as f32;
@@ -43,7 +47,15 @@ pub fn render_concert_info_indexed(
     // Band name - find largest font size that fits
     let (band_scale, band_y_offset) = fit_text_size(&font, &info.band_name, max_width, BAND_SIZES);
     let band_y = text_area_top + band_y_offset;
-    draw_text_indexed_centered(indexed, width, &font, &info.band_name, band_scale, band_y, text_color);
+    draw_text_indexed_centered(
+        indexed,
+        width,
+        &font,
+        &info.band_name,
+        band_scale,
+        band_y,
+        text_color,
+    );
 
     // Calculate remaining space and position date/venue accordingly
     let band_height = (band_scale.y * 1.1) as u32;
@@ -51,12 +63,22 @@ pub fn render_concert_info_indexed(
     // Date - fixed size (24px)
     let date_scale = PxScale::from(24.0);
     let date_y = band_y + band_height;
-    draw_text_indexed_centered(indexed, width, &font, &info.date, date_scale, date_y, text_color);
+    draw_text_indexed_centered(
+        indexed, width, &font, &info.date, date_scale, date_y, text_color,
+    );
 
     // Venue - scale to fit if needed
     let (venue_scale, _) = fit_text_size(&font, &info.venue, max_width, VENUE_SIZES);
     let venue_y = date_y + 28;
-    draw_text_indexed_centered(indexed, width, &font, &info.venue, venue_scale, venue_y, text_color);
+    draw_text_indexed_centered(
+        indexed,
+        width,
+        &font,
+        &info.venue,
+        venue_scale,
+        venue_y,
+        text_color,
+    );
 }
 
 /// Find the largest font size that fits the text within max_width
@@ -136,7 +158,8 @@ fn draw_text_indexed(
 
     for c in text.chars() {
         let glyph_id = font.glyph_id(c);
-        let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(cursor_x, y as f32 + scale.y * 0.8));
+        let glyph = glyph_id
+            .with_scale_and_position(scale, ab_glyph::point(cursor_x, y as f32 + scale.y * 0.8));
 
         if let Some(outlined) = font.outline_glyph(glyph) {
             let bounds = outlined.px_bounds();

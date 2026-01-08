@@ -108,7 +108,11 @@ where
         let item_idx = (start_index + display_slot) % total_items;
         let item = &items[item_idx];
         // In vertical mode, always use x_offset 0 (single fullscreen image)
-        let x_offset = if orientation == Orientation::Vertical || display_slot == 0 { 0 } else { 400 };
+        let x_offset = if orientation == Orientation::Vertical || display_slot == 0 {
+            0
+        } else {
+            400
+        };
 
         println!("Fetching image {}: {}", item_idx, item.as_str());
 

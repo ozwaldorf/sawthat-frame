@@ -39,7 +39,7 @@ impl Rect {
     /// `x` and `width` will be adjusted to even values for byte alignment.
     pub const fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
         Self {
-            x: x & !1,           // Round down to even
+            x: x & !1, // Round down to even
             y,
             width: (width + 1) & !1, // Round up to even
             height,

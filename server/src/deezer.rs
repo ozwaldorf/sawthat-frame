@@ -39,9 +39,7 @@ pub struct DeezerAlbum {
 impl DeezerAlbum {
     /// Get the best available cover URL
     pub fn cover_url(&self) -> Option<&str> {
-        self.cover_xl
-            .as_deref()
-            .or(self.cover_big.as_deref())
+        self.cover_xl.as_deref().or(self.cover_big.as_deref())
     }
 }
 
@@ -53,12 +51,7 @@ pub async fn search_artist(client: &Client, name: &str) -> Result<Option<u64>, A
         urlencoding::encode(name)
     );
 
-    let response: ArtistSearchResponse = client
-        .get(&url)
-        .send()
-        .await?
-        .json()
-        .await?;
+    let response: ArtistSearchResponse = client.get(&url).send().await?.json().await?;
 
     Ok(response.data.first().map(|a| a.id))
 }
@@ -67,12 +60,7 @@ pub async fn search_artist(client: &Client, name: &str) -> Result<Option<u64>, A
 pub async fn fetch_albums(client: &Client, artist_id: u64) -> Result<Vec<DeezerAlbum>, AppError> {
     let url = format!("{}/artist/{}/albums?limit=100", DEEZER_BASE, artist_id);
 
-    let response: AlbumsResponse = client
-        .get(&url)
-        .send()
-        .await?
-        .json()
-        .await?;
+    let response: AlbumsResponse = client.get(&url).send().await?.json().await?;
 
     Ok(response.data.unwrap_or_default())
 }
@@ -104,7 +92,10 @@ fn parse_release_date(date: &str) -> Option<u32> {
 }
 
 /// Find the album released closest to (but before) the concert date
-pub fn find_closest_album<'a>(albums: &'a [DeezerAlbum], concert_date: &str) -> Option<&'a DeezerAlbum> {
+pub fn find_closest_album<'a>(
+    albums: &'a [DeezerAlbum],
+    concert_date: &str,
+) -> Option<&'a DeezerAlbum> {
     let target = parse_concert_date(concert_date)?;
 
     let mut best_match: Option<&DeezerAlbum> = None;
@@ -151,7 +142,11 @@ pub async fn fetch_album_art_for_concert(
     let album = match find_closest_album(&albums, concert_date) {
         Some(a) => a,
         None => {
-            tracing::debug!("No matching album found for {} at {}", band_name, concert_date);
+            tracing::debug!(
+                "No matching album found for {} at {}",
+                band_name,
+                concert_date
+            );
             return Ok(None);
         }
     };

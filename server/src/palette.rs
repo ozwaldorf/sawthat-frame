@@ -130,22 +130,22 @@ impl PaletteIndex {
 /// Measured Spectra 6 palette (from aitjcize/esp32-photoframe)
 /// These values are actual measured e-paper display colors
 pub const PALETTE: [Rgb; 6] = [
-    Rgb::new(2, 2, 2),        // Black
-    Rgb::new(232, 232, 232),  // White
-    Rgb::new(135, 19, 0),     // Red
-    Rgb::new(205, 202, 0),    // Yellow
-    Rgb::new(5, 64, 158),     // Blue
-    Rgb::new(39, 102, 60),    // Green
+    Rgb::new(2, 2, 2),       // Black
+    Rgb::new(232, 232, 232), // White
+    Rgb::new(135, 19, 0),    // Red
+    Rgb::new(205, 202, 0),   // Yellow
+    Rgb::new(5, 64, 158),    // Blue
+    Rgb::new(39, 102, 60),   // Green
 ];
 
 /// PNG palette bytes (RGB triplets) - same measured values
 pub const PNG_PALETTE: [u8; 18] = [
-    2, 2, 2,         // Black
-    232, 232, 232,   // White
-    135, 19, 0,      // Red
-    205, 202, 0,     // Yellow
-    5, 64, 158,      // Blue
-    39, 102, 60,     // Green
+    2, 2, 2, // Black
+    232, 232, 232, // White
+    135, 19, 0, // Red
+    205, 202, 0, // Yellow
+    5, 64, 158, // Blue
+    39, 102, 60, // Green
 ];
 
 /// Palette matcher using OKLab perceptual distance

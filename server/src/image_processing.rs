@@ -400,8 +400,17 @@ mod tests {
     #[test]
     fn test_nearest_color() {
         let palette = OklabPalette::new();
-        assert_eq!(palette.nearest(&Oklab::from_rgb(0, 0, 0)), PaletteIndex::Black);
-        assert_eq!(palette.nearest(&Oklab::from_rgb(255, 255, 255)), PaletteIndex::White);
-        assert_eq!(palette.nearest(&Oklab::from_rgb(200, 50, 50)), PaletteIndex::Red);
+        assert_eq!(
+            palette.nearest(&Oklab::from_rgb(0, 0, 0)),
+            PaletteIndex::Black
+        );
+        assert_eq!(
+            palette.nearest(&Oklab::from_rgb(255, 255, 255)),
+            PaletteIndex::White
+        );
+        assert_eq!(
+            palette.nearest(&Oklab::from_rgb(200, 50, 50)),
+            PaletteIndex::Red
+        );
     }
 }

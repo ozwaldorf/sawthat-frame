@@ -41,13 +41,7 @@ pub fn percentage_color(percentage: u8) -> Color {
 /// - `fb_x`, `fb_y`: Position in framebuffer where icon will be drawn
 /// - `percentage`: Battery level 0-100
 /// - `vertical`: If true, draw vertical battery (tip on top), else horizontal (tip on right)
-pub fn draw_battery(
-    framebuffer: &mut [u8],
-    fb_x: u16,
-    fb_y: u16,
-    percentage: u8,
-    vertical: bool,
-) {
+pub fn draw_battery(framebuffer: &mut [u8], fb_x: u16, fb_y: u16, percentage: u8, vertical: bool) {
     let (buf_width, buf_height) = battery_dimensions(vertical);
     let fill_color = percentage_color(percentage);
 
@@ -70,14 +64,34 @@ pub fn draw_battery(
     };
 
     if vertical {
-        draw_battery_vertical(framebuffer, &set_pixel, buf_width, buf_height, fill_color, percentage);
+        draw_battery_vertical(
+            framebuffer,
+            &set_pixel,
+            buf_width,
+            buf_height,
+            fill_color,
+            percentage,
+        );
     } else {
-        draw_battery_horizontal(framebuffer, &set_pixel, buf_width, buf_height, fill_color, percentage);
+        draw_battery_horizontal(
+            framebuffer,
+            &set_pixel,
+            buf_width,
+            buf_height,
+            fill_color,
+            percentage,
+        );
     }
 }
 
-fn draw_battery_vertical<F>(fb: &mut [u8], set_pixel: &F, _buf_width: u16, _buf_height: u16, fill_color: Color, percentage: u8)
-where
+fn draw_battery_vertical<F>(
+    fb: &mut [u8],
+    set_pixel: &F,
+    _buf_width: u16,
+    _buf_height: u16,
+    fill_color: Color,
+    percentage: u8,
+) where
     F: Fn(&mut [u8], u16, u16, Color),
 {
     // Vertical battery: tip on top, fill goes bottom to top
@@ -92,7 +106,16 @@ where
                 || y >= body_y_start + body_height - 2
                 || x < 2
                 || x >= body_width - 2;
-            set_pixel(fb, x, y, if is_border { Color::Black } else { Color::White });
+            set_pixel(
+                fb,
+                x,
+                y,
+                if is_border {
+                    Color::Black
+                } else {
+                    Color::White
+                },
+            );
         }
     }
 
@@ -104,7 +127,16 @@ where
     for x in tip_x_start..(tip_x_start + tip_width) {
         for y in 0..tip_height {
             let is_border = x < tip_x_start + 2 || x >= tip_x_start + tip_width - 2 || y < 2;
-            set_pixel(fb, x, y, if is_border { Color::Black } else { Color::White });
+            set_pixel(
+                fb,
+                x,
+                y,
+                if is_border {
+                    Color::Black
+                } else {
+                    Color::White
+                },
+            );
         }
     }
 
@@ -123,8 +155,14 @@ where
     }
 }
 
-fn draw_battery_horizontal<F>(fb: &mut [u8], set_pixel: &F, _buf_width: u16, _buf_height: u16, fill_color: Color, percentage: u8)
-where
+fn draw_battery_horizontal<F>(
+    fb: &mut [u8],
+    set_pixel: &F,
+    _buf_width: u16,
+    _buf_height: u16,
+    fill_color: Color,
+    percentage: u8,
+) where
     F: Fn(&mut [u8], u16, u16, Color),
 {
     // Horizontal battery: tip on right, fill goes left to right
@@ -135,7 +173,16 @@ where
     for x in 0..body_width {
         for y in 0..body_height {
             let is_border = y < 2 || y >= body_height - 2 || x < 2 || x >= body_width - 2;
-            set_pixel(fb, x, y, if is_border { Color::Black } else { Color::White });
+            set_pixel(
+                fb,
+                x,
+                y,
+                if is_border {
+                    Color::Black
+                } else {
+                    Color::White
+                },
+            );
         }
     }
 
@@ -147,9 +194,19 @@ where
 
     for x in tip_x..(tip_x + tip_width) {
         for y in tip_y_start..(tip_y_start + tip_height) {
-            let is_border =
-                y < tip_y_start + 2 || y >= tip_y_start + tip_height - 2 || x >= tip_x + tip_width - 2;
-            set_pixel(fb, x, y, if is_border { Color::Black } else { Color::White });
+            let is_border = y < tip_y_start + 2
+                || y >= tip_y_start + tip_height - 2
+                || x >= tip_x + tip_width - 2;
+            set_pixel(
+                fb,
+                x,
+                y,
+                if is_border {
+                    Color::Black
+                } else {
+                    Color::White
+                },
+            );
         }
     }
 
@@ -231,7 +288,16 @@ pub fn draw_battery_icon(
                     || y >= body_y_start + body_height - 2
                     || x < 2
                     || x >= body_width - 2;
-                set_pixel(&mut buffer, x, y, if is_border { Color::Black } else { Color::White });
+                set_pixel(
+                    &mut buffer,
+                    x,
+                    y,
+                    if is_border {
+                        Color::Black
+                    } else {
+                        Color::White
+                    },
+                );
             }
         }
 
@@ -243,7 +309,16 @@ pub fn draw_battery_icon(
         for x in tip_x_start..(tip_x_start + tip_width) {
             for y in 0..tip_height {
                 let is_border = x < tip_x_start + 2 || x >= tip_x_start + tip_width - 2 || y < 2;
-                set_pixel(&mut buffer, x, y, if is_border { Color::Black } else { Color::White });
+                set_pixel(
+                    &mut buffer,
+                    x,
+                    y,
+                    if is_border {
+                        Color::Black
+                    } else {
+                        Color::White
+                    },
+                );
             }
         }
 
@@ -269,7 +344,16 @@ pub fn draw_battery_icon(
         for x in 0..body_width {
             for y in 0..body_height {
                 let is_border = y < 2 || y >= body_height - 2 || x < 2 || x >= body_width - 2;
-                set_pixel(&mut buffer, x, y, if is_border { Color::Black } else { Color::White });
+                set_pixel(
+                    &mut buffer,
+                    x,
+                    y,
+                    if is_border {
+                        Color::Black
+                    } else {
+                        Color::White
+                    },
+                );
             }
         }
 
@@ -281,9 +365,19 @@ pub fn draw_battery_icon(
 
         for x in tip_x..(tip_x + tip_width) {
             for y in tip_y_start..(tip_y_start + tip_height) {
-                let is_border =
-                    y < tip_y_start + 2 || y >= tip_y_start + tip_height - 2 || x >= tip_x + tip_width - 2;
-                set_pixel(&mut buffer, x, y, if is_border { Color::Black } else { Color::White });
+                let is_border = y < tip_y_start + 2
+                    || y >= tip_y_start + tip_height - 2
+                    || x >= tip_x + tip_width - 2;
+                set_pixel(
+                    &mut buffer,
+                    x,
+                    y,
+                    if is_border {
+                        Color::Black
+                    } else {
+                        Color::White
+                    },
+                );
             }
         }
 
