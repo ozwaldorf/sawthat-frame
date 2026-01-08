@@ -112,6 +112,9 @@ pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData 
 }
 
 /// Fetch and process an image for a band
+///
+/// Tries to find album art from Deezer matching the concert date,
+/// falls back to the band's Spotify picture if not found.
 pub async fn fetch_band_image(
     client: &Client,
     bands: &[SawThatBand],
@@ -125,11 +128,46 @@ pub async fn fetch_band_image(
         .find(|b| b.id == band_id)
         .ok_or_else(|| AppError::BandNotFound(band_id.to_string()))?;
 
-    tracing::info!("Fetching image for band: {} from {}", band.band, band.picture);
+    // Try to get album art from Deezer if we have a date
+    let image_url = if let Some(concert_date) = date {
+        match deezer::fetch_album_art_for_concert(client, &band.band, concert_date).await {
+            Ok(Some(url)) => {
+                tracing::info!(
+                    "Using Deezer album art for {} at {}: {}",
+                    band.band,
+                    concert_date,
+                    url
+                );
+                url
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "No Deezer album found for {} at {}, using Spotify picture",
+                    band.band,
+                    concert_date
+                );
+                band.picture.clone()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Deezer API error for {} at {}: {}, using Spotify picture",
+                    band.band,
+                    concert_date,
+                    e
+                );
+                band.picture.clone()
+            }
+        }
+    } else {
+        tracing::info!("No date provided for {}, using Spotify picture", band.band);
+        band.picture.clone()
+    };
 
-    // Fetch the Spotify image
+    tracing::info!("Fetching image for band: {} from {}", band.band, image_url);
+
+    // Fetch the image
     let response = client
-        .get(&band.picture)
+        .get(&image_url)
         .header("Accept", "image/*")
         .send()
         .await?;

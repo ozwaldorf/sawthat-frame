@@ -1,8 +1,8 @@
 //! Image processing for 6-color E Ink display
 //!
 //! - Resize to target dimensions
-//! - Render concert info text
 //! - Sierra-3 dithering to 6-color palette (entirely in OKLab color space)
+//! - Render concert info text
 //! - Encode as indexed PNG
 
 use crate::error::AppError;
