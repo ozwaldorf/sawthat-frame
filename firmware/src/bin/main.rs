@@ -46,7 +46,7 @@ use esp_radio::{
 };
 use photopainter::battery;
 use photopainter::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
-use photopainter::epd::{Epd7in3e, RefreshMode, HEIGHT, WIDTH};
+use photopainter::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use photopainter::framebuffer::Framebuffer;
 use photopainter::widget::{Orientation, WidgetData, MAX_ITEMS};
 
@@ -77,7 +77,7 @@ const SLEEP_STATE_MAGIC: u32 = 0xCAFE_F00D;
 struct SleepState {
     /// Magic number to validate state
     magic: u32,
-    /// Current index into widget items
+    /// Current index into widget items (next item to fetch)
     index: usize,
     /// Total number of items
     total_items: usize,
@@ -85,6 +85,10 @@ struct SleepState {
     shuffle_seed: u64,
     /// Display orientation (0 = horizontal, 1 = vertical)
     orientation: u8,
+    /// Next slot to update in horizontal mode (0 = left, 1 = right)
+    next_slot: u8,
+    /// Item indices currently displayed in each slot [left, right]
+    slot_items: [usize; 2],
     /// Cache keys of items (to detect data changes)
     cache_keys: [u32; MAX_ITEMS],
 }
@@ -97,6 +101,8 @@ impl SleepState {
             total_items: 0,
             shuffle_seed: 0,
             orientation: 0,
+            next_slot: 0,
+            slot_items: [0, 0],
             cache_keys: [0; MAX_ITEMS],
         }
     }
@@ -110,12 +116,23 @@ impl SleepState {
         self.magic = 0;
     }
 
-    fn save(&mut self, index: usize, total_items: usize, shuffle_seed: u64, orientation: Orientation, items: &WidgetData) {
+    fn save(
+        &mut self,
+        index: usize,
+        total_items: usize,
+        shuffle_seed: u64,
+        orientation: Orientation,
+        next_slot: u8,
+        slot_items: [usize; 2],
+        items: &WidgetData,
+    ) {
         self.magic = SLEEP_STATE_MAGIC;
         self.index = index;
         self.total_items = total_items;
         self.shuffle_seed = shuffle_seed;
         self.orientation = orientation as u8;
+        self.next_slot = next_slot;
+        self.slot_items = slot_items;
         for (i, item) in items.iter().enumerate() {
             self.cache_keys[i] = item.cache_key;
         }
@@ -123,6 +140,14 @@ impl SleepState {
 
     fn get_orientation(&self) -> Orientation {
         Orientation::from_u8(self.orientation)
+    }
+
+    fn get_next_slot(&self) -> u8 {
+        self.next_slot
+    }
+
+    fn get_slot_items(&self) -> [usize; 2] {
+        self.slot_items
     }
 
     fn matches_data(&self, items: &WidgetData) -> bool {
@@ -251,7 +276,7 @@ async fn main(spawner: Spawner) -> ! {
     println!("Boot! Wake reason: {:?}", wake_reason);
 
     // Wait for USB serial to reconnect after deep sleep wake
-    esp_hal::delay::Delay::new().delay_millis(500);
+    esp_hal::delay::Delay::new().delay_millis(2000);
 
     // Initialize internal RAM heap (for smaller allocations)
     println!("Initializing heap...");
@@ -454,37 +479,60 @@ async fn main(spawner: Spawner) -> ! {
         }
     };
 
-    // Determine shuffle seed and starting index
-    let (shuffle_seed, mut index) = if resuming && unsafe { (*(&raw const SLEEP_STATE)).matches_data(&items) } {
-        // Resume from saved state
-        let (seed, mut idx) = unsafe {
+    // Get saved state if resuming
+    let (shuffle_seed, saved_index, saved_next_slot, saved_slot_items) = if resuming {
+        unsafe {
             let state = &raw const SLEEP_STATE;
-            ((*state).shuffle_seed, (*state).index)
-        };
-
-        // If button tap detected, advance to next item(s)
-        if advance_item {
-            idx += match orientation {
-                Orientation::Horizontal => 2,
-                Orientation::Vertical => 1,
-            };
-            println!("Button tap: advancing from saved index to {}", idx);
-        } else {
-            println!("Data unchanged, resuming from index {}", idx);
+            (
+                (*state).shuffle_seed,
+                (*state).index,
+                (*state).get_next_slot(),
+                (*state).get_slot_items(),
+            )
         }
-        (seed, idx)
     } else {
-        // Fresh start with new shuffle
+        // Fresh start with new shuffle seed
         let seed = (rng.random() as u64) << 32 | rng.random() as u64;
-        println!("Starting fresh with new shuffle seed");
-        (seed, 0)
+        (seed, 0, 0u8, [0usize, 0usize])
     };
 
     // Shuffle items (same seed = same order)
     display::shuffle_items(&mut items, shuffle_seed);
 
+    // Now check if data matches (after shuffling, so cache_keys are in same order)
+    let data_matches = resuming && unsafe { (*(&raw const SLEEP_STATE)).matches_data(&items) };
+
+    // Determine if we can use partial refresh
+    let saved_orientation = if resuming {
+        unsafe { (*(&raw const SLEEP_STATE)).get_orientation() }
+    } else {
+        Orientation::Horizontal
+    };
+
+    let can_partial = data_matches
+        && orientation == Orientation::Horizontal
+        && saved_orientation == Orientation::Horizontal
+        && saved_index >= 2; // At least one full refresh has happened
+
+    let (mut index, mut next_slot, mut slot_items, mut use_partial) = if can_partial {
+        println!(
+            "Resuming with partial update: slot={}, slot_items=[{}, {}], index={}",
+            saved_next_slot, saved_slot_items[0], saved_slot_items[1], saved_index
+        );
+        (saved_index, saved_next_slot, saved_slot_items, true)
+    } else if data_matches {
+        println!("Resuming from index {} (full refresh)", saved_index);
+        (saved_index, 0u8, [0usize, 0usize], false)
+    } else {
+        println!("Fresh start or data changed");
+        (0, 0u8, [0usize, 0usize], false)
+    };
+
     let total_items = items.len();
     println!("Displaying {} items in shuffled order", total_items);
+
+    // Buffer for partial updates (400x480 = 96000 bytes)
+    const HALF_BUFFER_SIZE: usize = 400 * 480 / 2;
 
     // Display loop - allows re-display on orientation change
     loop {
@@ -498,13 +546,6 @@ async fn main(spawner: Spawner) -> ! {
         println!("Waking up display...");
         epd.wake_up(&mut delay).expect("Failed to wake display");
 
-        // Display current item(s)
-        println!(
-            "Displaying items {} and {} of {}",
-            index,
-            (index + 1).min(total_items - 1),
-            total_items
-        );
         // Read battery percentage
         let battery_percent = {
             let mut buf = [0u8; 1];
@@ -520,56 +561,153 @@ async fn main(spawner: Spawner) -> ! {
             }
         };
 
-        // Fetch images and update display with blinking LED
-        start_blink();
-        let fetch_result = display::fetch_to_framebuffer(
-            &tcp_client,
-            &dns_socket,
-            &mut tls_read_buf,
-            &mut tls_write_buf,
-            &mut framebuffer,
-            EDGE_URL,
-            "concerts",
-            orientation,
-            &items,
-            index,
-        )
-        .await;
-
-        // Draw battery indicator into framebuffer
-        if fetch_result.is_ok() {
-            let vertical = orientation == Orientation::Vertical;
-            let (bat_w, bat_h) = battery::battery_dimensions(vertical);
-            let battery_x = WIDTH as u16 - bat_w - 8; // right side
-            let battery_y = 8; // top
-            battery::draw_battery(
-                framebuffer.as_mut_slice(),
-                battery_x,
-                battery_y,
-                battery_percent,
-                vertical,
+        let display_result = if use_partial && orientation == Orientation::Horizontal {
+            // ==================== Partial Refresh Mode ====================
+            // Only update one half of the display with a single new item
+            let item_idx = index % total_items;
+            println!(
+                "Partial update: slot={}, item={} of {}",
+                next_slot, item_idx, total_items
             );
-        }
 
-        // Update display with non-blocking refresh (allows blink task to run)
-        let display_result = match fetch_result {
-            Ok(()) => {
-                println!("Updating display...");
-                match epd.display_start(framebuffer.as_slice(), &mut delay) {
-                    Ok(()) => {
-                        // Poll busy with async delays (yields to executor for blink task)
-                        while epd.is_busy() {
-                            Timer::after(Duration::from_millis(50)).await;
-                        }
-                        epd.finish_display(&mut delay).map_err(|_| display::DisplayError::Network)
-                    }
-                    Err(_) => Err(display::DisplayError::Network),
-                }
+            start_blink();
+
+            // Fetch single image to the target slot
+            let fetch_result = display::fetch_single_to_framebuffer(
+                &tcp_client,
+                &dns_socket,
+                &mut tls_read_buf,
+                &mut tls_write_buf,
+                &mut framebuffer,
+                EDGE_URL,
+                "concerts",
+                &items,
+                item_idx,
+                next_slot,
+            )
+            .await;
+
+            // Draw battery indicator in the slot being updated (if right side)
+            if fetch_result.is_ok() && next_slot == 1 {
+                let (bat_w, _bat_h) = battery::battery_dimensions(false);
+                let battery_x = WIDTH as u16 - bat_w - 8;
+                let battery_y = 8;
+                battery::draw_battery(
+                    framebuffer.as_mut_slice(),
+                    battery_x,
+                    battery_y,
+                    battery_percent,
+                    false,
+                );
             }
-            Err(e) => Err(e),
+
+            let result = match fetch_result {
+                Ok(()) => {
+                    // Extract the half we need to update
+                    let mut half_buffer = [0u8; HALF_BUFFER_SIZE];
+                    framebuffer.extract_half(next_slot, &mut half_buffer);
+
+                    // Create rect for the half (left: x=0, right: x=400)
+                    let x_offset = if next_slot == 0 { 0 } else { 400 };
+                    let rect = Rect::new(x_offset, 0, 400, 480);
+
+                    println!("Partial refresh: x={}, w={}, h={}", x_offset, 400, 480);
+
+                    // Do partial update
+                    match epd.partial_update_start(&rect, &half_buffer, &mut delay) {
+                        Ok(()) => {
+                            while epd.is_busy() {
+                                Timer::after(Duration::from_millis(50)).await;
+                            }
+                            epd.refresh_wait(&mut delay).map_err(|_| display::DisplayError::Network)
+                        }
+                        Err(_) => Err(display::DisplayError::Network),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            stop_blink();
+            embassy_futures::yield_now().await;
+
+            // Update slot tracking
+            if result.is_ok() {
+                slot_items[next_slot as usize] = item_idx;
+                next_slot = (next_slot + 1) % 2;
+                index += 1; // Advance by 1 for partial updates
+            }
+
+            result
+        } else {
+            // ==================== Full Refresh Mode ====================
+            // Update entire display with 2 items (horizontal) or 1 item (vertical)
+            println!(
+                "Full refresh: items {} and {} of {}",
+                index,
+                (index + 1).min(total_items - 1),
+                total_items
+            );
+
+            start_blink();
+            let fetch_result = display::fetch_to_framebuffer(
+                &tcp_client,
+                &dns_socket,
+                &mut tls_read_buf,
+                &mut tls_write_buf,
+                &mut framebuffer,
+                EDGE_URL,
+                "concerts",
+                orientation,
+                &items,
+                index,
+            )
+            .await;
+
+            // Draw battery indicator into framebuffer
+            if fetch_result.is_ok() {
+                let vertical = orientation == Orientation::Vertical;
+                let (bat_w, _bat_h) = battery::battery_dimensions(vertical);
+                let battery_x = WIDTH as u16 - bat_w - 8;
+                let battery_y = 8;
+                battery::draw_battery(
+                    framebuffer.as_mut_slice(),
+                    battery_x,
+                    battery_y,
+                    battery_percent,
+                    vertical,
+                );
+            }
+
+            let result = match fetch_result {
+                Ok(()) => {
+                    println!("Updating display (full refresh)...");
+                    match epd.display_start(framebuffer.as_slice(), &mut delay) {
+                        Ok(()) => {
+                            while epd.is_busy() {
+                                Timer::after(Duration::from_millis(50)).await;
+                            }
+                            epd.finish_display(&mut delay).map_err(|_| display::DisplayError::Network)
+                        }
+                        Err(_) => Err(display::DisplayError::Network),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            stop_blink();
+            embassy_futures::yield_now().await;
+
+            // Update slot tracking for horizontal mode (enables partial updates next time)
+            if result.is_ok() && orientation == Orientation::Horizontal {
+                slot_items[0] = index % total_items;
+                slot_items[1] = (index + 1) % total_items;
+                next_slot = 0;
+                index += 2;
+                use_partial = true; // Enable partial updates for subsequent refreshes
+            } else if result.is_ok() {
+                index += 1; // Vertical mode: advance by 1
+            }
+
+            result
         };
-        stop_blink();
-        embassy_futures::yield_now().await; // Let blink task set LED on
 
         match display_result {
             Ok(()) => println!("Display refresh successful!"),
@@ -593,6 +731,10 @@ async fn main(spawner: Spawner) -> ! {
                     // Button held - toggle orientation
                     println!("Button held! Toggling orientation...");
                     orientation = orientation.toggle();
+                    // Reset partial mode on orientation change
+                    use_partial = false;
+                    slot_items = [0, 0];
+                    next_slot = 0;
 
                     // Flash LED2 3 times to confirm rotation
                     for _ in 0..3 {
@@ -609,12 +751,9 @@ async fn main(spawner: Spawner) -> ! {
 
                     println!("Re-displaying with orientation: {:?}", orientation);
                 } else {
-                    // Button released - advance to next item
-                    index += match orientation {
-                        Orientation::Horizontal => 2,
-                        Orientation::Vertical => 1,
-                    };
-                    println!("Button tap, advancing to index {}", index);
+                    // Button released - show next item
+                    // Index already incremented by previous display, just trigger redisplay
+                    println!("Button tap, next item (index={})", index);
 
                     // Flash LED2 1 time to confirm next item
                     led_green.set_low();  // ON
@@ -635,18 +774,15 @@ async fn main(spawner: Spawner) -> ! {
         // Loop back to re-display
     }
 
-    // Advance index for next wake (2 items in horizontal, 1 in vertical)
-    index += match orientation {
-        Orientation::Horizontal => 2,
-        Orientation::Vertical => 1,
-    };
-
-    // Save state for next wake
+    // Save state for next wake (index already advanced in the loop)
     unsafe {
         let state = &raw mut SLEEP_STATE;
-        (*state).save(index, total_items, shuffle_seed, orientation, &items);
+        (*state).save(index, total_items, shuffle_seed, orientation, next_slot, slot_items, &items);
     }
-    println!("Saved state: index={}, total={}, orientation={:?}", index, total_items, orientation);
+    println!(
+        "Saved state: index={}, total={}, orientation={:?}, next_slot={}, slot_items=[{}, {}]",
+        index, total_items, orientation, next_slot, slot_items[0], slot_items[1]
+    );
 
     // Disconnect WiFi before deep sleep
     println!("Disconnecting WiFi for deep sleep...");

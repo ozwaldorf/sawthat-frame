@@ -186,6 +186,126 @@ where
     Ok(())
 }
 
+/// Fetch a single image and render to one half of the framebuffer.
+///
+/// This is used for partial refresh in horizontal mode where we only
+/// update one side of the display at a time.
+///
+/// - `slot`: 0 for left half (x_offset=0), 1 for right half (x_offset=400)
+/// - `item_idx`: Index of the item in the items array to fetch
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_single_to_framebuffer<T, D>(
+    tcp: &T,
+    dns: &D,
+    tls_read_buf: &mut [u8],
+    tls_write_buf: &mut [u8],
+    framebuffer: &mut Framebuffer,
+    edge_url: &str,
+    widget_name: &str,
+    items: &WidgetData,
+    item_idx: usize,
+    slot: u8,
+) -> Result<(), DisplayError>
+where
+    T: TcpConnect,
+    D: Dns,
+{
+    let total_items = items.len();
+    if item_idx >= total_items {
+        return Err(DisplayError::NoItems);
+    }
+
+    let x_offset = if slot == 0 { 0 } else { 400 };
+    let item = &items[item_idx];
+
+    println!(
+        "Fetching single image {} for slot {} (x_offset={})",
+        item_idx, slot, x_offset
+    );
+
+    // Create HTTP client with TLS - single connection
+    let tls_config = TlsConfig::new(TLS_SEED, tls_read_buf, tls_write_buf, TlsVerify::None);
+    let mut client = HttpClient::new_with_tls(tcp, dns, tls_config);
+
+    // Establish connection to edge server
+    let mut resource = client
+        .resource(edge_url)
+        .await
+        .map_err(|_| DisplayError::Network)?;
+
+    // Allocate buffers from PSRAM heap
+    let mut png_buf: Box<[u8; PNG_BUF_SIZE]> = Box::new([0u8; PNG_BUF_SIZE]);
+    let mut decode_buf: Box<[u8; DECODE_BUF_SIZE]> = Box::new([0u8; DECODE_BUF_SIZE]);
+    let mut rx_buf = [0u8; 2048];
+
+    // Build relative path for image (horizontal orientation)
+    let mut path: String<256> = String::new();
+    if write!(
+        &mut path,
+        "/{}/{}/{}",
+        widget_name,
+        Orientation::Horizontal.as_str(),
+        item.path.as_str()
+    )
+    .is_err()
+    {
+        println!("Path too long, filling with white");
+        fill_half(framebuffer, x_offset);
+        return Ok(());
+    }
+
+    // Fetch PNG
+    let result: Result<usize, DisplayError> = async {
+        let response = resource
+            .request(Method::GET, path.as_str())
+            .send(&mut rx_buf)
+            .await
+            .map_err(|_| DisplayError::Network)?;
+
+        let status = response.status.0;
+        if status >= 400 {
+            return Err(DisplayError::Http(status));
+        }
+
+        // Read PNG body
+        let mut png_len = 0;
+        let mut body_reader = response.body().reader();
+        loop {
+            match body_reader.read(&mut png_buf[png_len..]).await {
+                Ok(0) => break,
+                Ok(n) => png_len += n,
+                Err(_) => break,
+            }
+        }
+
+        Ok(png_len)
+    }
+    .await;
+
+    match result {
+        Ok(png_len) => {
+            println!("Received {} bytes of PNG data", png_len);
+            if let Err(e) = decode_png_to_framebuffer(
+                &png_buf[..png_len],
+                framebuffer,
+                x_offset,
+                &mut *decode_buf,
+                Orientation::Horizontal,
+            ) {
+                println!("Error decoding PNG: {:?}", e);
+                fill_half(framebuffer, x_offset);
+            }
+        }
+        Err(e) => {
+            println!("Error fetching image {}: {:?}", item_idx, e);
+            fill_half(framebuffer, x_offset);
+        }
+    }
+
+    println!("Single image fetch complete for slot {}", slot);
+    Ok(())
+}
+
 /// Update the e-paper display with the framebuffer contents.
 pub fn update_display<SPI, BUSY, DC, RST, DELAY>(
     epd: &mut Epd7in3e<SPI, BUSY, DC, RST>,

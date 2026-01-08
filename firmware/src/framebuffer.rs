@@ -148,6 +148,29 @@ impl Framebuffer {
     pub fn fill_right_half(&mut self, color: Color) {
         self.fill_rect(400, 0, 400, HEIGHT, color);
     }
+
+    /// Extract half of the framebuffer for partial update.
+    ///
+    /// The display is 800x480 with 4bpp (2 pixels per byte).
+    /// Each half is 400x480 = 96000 bytes.
+    ///
+    /// - `slot`: 0 for left half (x 0-399), 1 for right half (x 400-799)
+    /// - `output`: Buffer to write the half-framebuffer data into (must be 96000 bytes)
+    pub fn extract_half(&self, slot: u8, output: &mut [u8]) {
+        const HALF_WIDTH_BYTES: usize = 200; // 400 pixels / 2 pixels per byte
+        const ROW_BYTES: usize = 400; // 800 pixels / 2 pixels per byte
+
+        debug_assert!(output.len() >= HALF_WIDTH_BYTES * HEIGHT as usize);
+
+        let x_byte_offset = if slot == 0 { 0 } else { HALF_WIDTH_BYTES };
+
+        for y in 0..HEIGHT as usize {
+            let src_start = y * ROW_BYTES + x_byte_offset;
+            let dst_start = y * HALF_WIDTH_BYTES;
+            output[dst_start..dst_start + HALF_WIDTH_BYTES]
+                .copy_from_slice(&self.buffer[src_start..src_start + HALF_WIDTH_BYTES]);
+        }
+    }
 }
 
 impl Default for Framebuffer {
