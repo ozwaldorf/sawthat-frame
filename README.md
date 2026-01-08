@@ -119,4 +119,48 @@ cd firmware
 cargo run --release
 ```
 
+## Project Lifecycle
 
+```mermaid
+flowchart TD
+    subgraph Firmware["ESP32-S3-PhotoPainter"]
+        Power(Power On) ==> Boot
+        style Power fill:green
+        Boot[Device Boot] ==> Init
+        Init[Initialize Components] ==> Wifi 
+        Wifi[Connect to WIFI] ==> Orient 
+
+        subgraph Runtime
+            Orient{Next image or<br>flip orientation} ==> Fetch
+            Fetch[Fetch Widget Data] ==> Update
+            Update[Display Update] ==> Input
+            Input{Sleep Timer} -.->|button pressed/held| Orient
+        end
+
+        Sleep[Deep Sleep] ==>|15 minute timer or<br>button pressed/held| Boot
+        style Sleep fill:#555
+        Input ==>|30 second timeout| Sleep
+    end
+
+
+    subgraph Server["Server API"]
+        Concerts["GET /concerts"]
+        Image["GET /concerts/{orient}/{path}"]
+    end
+
+    subgraph STB["SawThatBand API"]
+        Upstream["GET /api/bands"]
+    end
+
+    subgraph Deezer["Deezer API"]
+        ArtistId["GET /search/artist"]
+        Albums["GET /artist/{id}/albums"]
+        Images["CDN Images"]
+    end
+
+    Fetch -->|Concert list data| Concerts
+    Concerts <-->|JSON Data| STB
+    
+    Update -->|Indexed PNGs| Image
+    Image <-->|JSON Data, CDN Images| Deezer
+```
