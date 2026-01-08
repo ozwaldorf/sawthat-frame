@@ -48,7 +48,7 @@ use sawthat_frame_firmware::battery;
 use sawthat_frame_firmware::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
-use sawthat_frame_firmware::widget::{Orientation, WidgetData, MAX_ITEMS};
+use sawthat_frame_firmware::widget::{Orientation, WidgetData};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -72,6 +72,18 @@ const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
 /// Magic number to validate RTC memory state
 const SLEEP_STATE_MAGIC: u32 = 0xCAFE_F00D;
 
+/// Compute a single hash for all widget data
+fn hash_data(items: &WidgetData) -> u32 {
+    let mut hash: u32 = 5381;
+    for item in items.iter() {
+        for byte in item.as_bytes() {
+            hash = hash.wrapping_mul(33).wrapping_add(*byte as u32);
+        }
+        hash = hash.wrapping_mul(33).wrapping_add(0); // separator
+    }
+    hash
+}
+
 /// State persisted in RTC memory across deep sleep
 #[repr(C)]
 struct SleepState {
@@ -89,8 +101,8 @@ struct SleepState {
     next_slot: u8,
     /// Item indices currently displayed in each slot [left, right]
     slot_items: [usize; 2],
-    /// Cache keys of items (to detect data changes)
-    cache_keys: [u32; MAX_ITEMS],
+    /// Hash of all items (to detect data changes)
+    data_hash: u32,
 }
 
 impl SleepState {
@@ -103,7 +115,7 @@ impl SleepState {
             orientation: 0,
             next_slot: 0,
             slot_items: [0, 0],
-            cache_keys: [0; MAX_ITEMS],
+            data_hash: 0,
         }
     }
 
@@ -133,9 +145,7 @@ impl SleepState {
         self.orientation = orientation as u8;
         self.next_slot = next_slot;
         self.slot_items = slot_items;
-        for (i, item) in items.iter().enumerate() {
-            self.cache_keys[i] = item.cache_key;
-        }
+        self.data_hash = hash_data(items);
     }
 
     fn get_orientation(&self) -> Orientation {
@@ -151,15 +161,7 @@ impl SleepState {
     }
 
     fn matches_data(&self, items: &WidgetData) -> bool {
-        if items.len() != self.total_items {
-            return false;
-        }
-        for (i, item) in items.iter().enumerate() {
-            if self.cache_keys[i] != item.cache_key {
-                return false;
-            }
-        }
-        true
+        items.len() == self.total_items && self.data_hash == hash_data(items)
     }
 }
 

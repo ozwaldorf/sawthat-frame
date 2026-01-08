@@ -10,7 +10,7 @@ use crate::deezer;
 use crate::error::AppError;
 use crate::image_processing;
 use crate::text::ConcertInfo;
-use crate::widget::{Orientation, WidgetData, WidgetItem, WidgetWidth};
+use crate::widget::{Orientation, WidgetData, WidgetWidth};
 
 /// SawThat API base URL
 const SAWTHAT_API_URL: &str = "https://server.sawthat.band/api/bands";
@@ -98,14 +98,7 @@ pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData 
         .into_iter()
         .take(limit)
         .map(|(band, concert, _)| {
-            let cache_key = hash_concert(&band.id, &concert.date);
-            let path = format!("{}/{}", band.id, urlencoding::encode(&concert.date));
-
-            WidgetItem {
-                width: WidgetWidth::Full,
-                cache_key,
-                path,
-            }
+            format!("{}/{}", band.id, urlencoding::encode(&concert.date))
         })
         .collect()
 }
@@ -235,29 +228,9 @@ fn format_date(date: &str) -> String {
     }
 }
 
-/// Generate a cache key for a concert
-fn hash_concert(band_id: &str, date: &str) -> u32 {
-    let key = format!("sawthat:{}:{}", band_id, date);
-    let mut hash: u32 = 5381;
-    for byte in key.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
-    }
-    hash
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_hash_concert() {
-        let hash1 = hash_concert("abc123", "01-01-2024");
-        let hash2 = hash_concert("abc123", "01-01-2024");
-        let hash3 = hash_concert("abc123", "02-01-2024");
-
-        assert_eq!(hash1, hash2);
-        assert_ne!(hash1, hash3);
-    }
 
     #[test]
     fn test_bands_to_widget_items() {
@@ -273,6 +246,6 @@ mod tests {
 
         let items = bands_to_widget_items(&bands, 10);
         assert_eq!(items.len(), 1);
-        assert!(items[0].path.contains("test-id"));
+        assert!(items[0].contains("test-id"));
     }
 }

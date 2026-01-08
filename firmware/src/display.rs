@@ -110,7 +110,7 @@ where
         // In vertical mode, always use x_offset 0 (single fullscreen image)
         let x_offset = if orientation == Orientation::Vertical || display_slot == 0 { 0 } else { 400 };
 
-        println!("Fetching image {}: {}", item_idx, item.path.as_str());
+        println!("Fetching image {}: {}", item_idx, item.as_str());
 
         // Build relative path for image (includes orientation)
         let mut path: String<256> = String::new();
@@ -119,7 +119,7 @@ where
             "/{}/{}/{}",
             widget_name,
             orientation.as_str(),
-            item.path.as_str()
+            item.as_str()
         )
         .is_err()
         {
@@ -245,7 +245,7 @@ where
         "/{}/{}/{}",
         widget_name,
         Orientation::Horizontal.as_str(),
-        item.path.as_str()
+        item.as_str()
     )
     .is_err()
     {
@@ -367,8 +367,8 @@ where
         return Err(DisplayError::Http(status));
     }
 
-    // Read response body
-    let mut json_buf = [0u8; 8192];
+    // Read response body (heap allocated to avoid stack overflow)
+    let mut json_buf: Box<[u8; 16384]> = Box::new([0u8; 16384]);
     let mut json_len = 0;
 
     let mut body_reader = response.body().reader();

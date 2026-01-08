@@ -10,7 +10,7 @@
 //! 7. Encode as indexed PNG
 
 use crate::error::AppError;
-use crate::palette::{extract_dominant_color, Oklab, OklabPalette, PNG_PALETTE};
+use crate::palette::{extract_dominant_color, Oklab, OklabPalette, PaletteIndex, PNG_PALETTE};
 use crate::text::{self, ConcertInfo};
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use png::{BitDepth, ColorType, Encoder};

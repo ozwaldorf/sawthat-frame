@@ -23,7 +23,7 @@ use utoipa_scalar::{Scalar, Servable};
 
 use crate::datasource::DataSourceRegistry;
 use crate::error::AppError;
-use crate::widget::{Orientation, WidgetItem, WidgetName};
+use crate::widget::{Orientation, WidgetName};
 
 /// Application state shared across handlers
 #[derive(Clone)]
@@ -43,7 +43,7 @@ struct AppState {
         (name = "Concerts", description = "Concert history widget endpoints")
     ),
     paths(health, get_concerts_data, get_concerts_image),
-    components(schemas(WidgetItem, Orientation))
+    components(schemas(Orientation))
 )]
 struct ApiDoc;
 
@@ -115,7 +115,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
     path = "/concerts",
     tag = "Concerts",
     responses(
-        (status = 200, description = "Concert data", body = Vec<WidgetItem>)
+        (status = 200, description = "Concert data", body = Vec<String>)
     )
 )]
 async fn get_concerts_data(State(state): State<AppState>) -> impl IntoResponse {

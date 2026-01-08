@@ -76,7 +76,7 @@ impl DataSource for ConcertDataSource {
         let bands = self.get_bands().await?;
 
         // Convert to widget items (most recent concerts first)
-        let items = sawthat::bands_to_widget_items(&bands, 100);
+        let items = sawthat::bands_to_widget_items(&bands, 128);
 
         if items.is_empty() {
             tracing::warn!("No concerts found in SawThat data");

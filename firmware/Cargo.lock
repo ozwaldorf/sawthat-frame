@@ -1575,38 +1575,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "photopainter"
-version = "0.1.0"
-dependencies = [
- "critical-section",
- "embassy-executor",
- "embassy-futures",
- "embassy-net",
- "embassy-time",
- "embedded-graphics-core",
- "embedded-hal 1.0.0",
- "embedded-hal-bus",
- "embedded-io 0.7.1",
- "embedded-io-async 0.7.0",
- "embedded-nal-async",
- "esp-alloc",
- "esp-backtrace",
- "esp-bootloader-esp-idf",
- "esp-hal",
- "esp-println",
- "esp-radio",
- "esp-rtos",
- "heapless 0.8.0",
- "log",
- "minipng",
- "reqwless",
- "serde",
- "serde-json-core",
- "smoltcp",
- "static_cell",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1859,6 +1827,38 @@ name = "ryu"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
+
+[[package]]
+name = "sawthat-frame-firmware"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-time",
+ "embedded-graphics-core",
+ "embedded-hal 1.0.0",
+ "embedded-hal-bus",
+ "embedded-io 0.7.1",
+ "embedded-io-async 0.7.0",
+ "embedded-nal-async",
+ "esp-alloc",
+ "esp-backtrace",
+ "esp-bootloader-esp-idf",
+ "esp-hal",
+ "esp-println",
+ "esp-radio",
+ "esp-rtos",
+ "heapless 0.8.0",
+ "log",
+ "minipng",
+ "reqwless",
+ "serde",
+ "serde-json-core",
+ "smoltcp",
+ "static_cell",
+]
 
 [[package]]
 name = "sec1"

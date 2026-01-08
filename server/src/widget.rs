@@ -92,16 +92,5 @@ impl std::fmt::Display for CachePolicy {
     }
 }
 
-/// A single item in a widget response
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct WidgetItem {
-    /// Display width (1 = 400px half, 2 = 800px full)
-    pub width: WidgetWidth,
-    /// Cache key for deduplication (u32)
-    pub cache_key: u32,
-    /// Path to fetch the image (relative to widget)
-    pub path: String,
-}
-
-/// Widget data response (array of items)
-pub type WidgetData = Vec<WidgetItem>;
+/// Widget data response (array of image paths)
+pub type WidgetData = Vec<String>;
