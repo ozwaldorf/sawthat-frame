@@ -66,14 +66,13 @@ pub async fn fetch_bands(client: &Client, user_id: &str) -> Result<Vec<SawThatBa
 
 /// Convert SawThat bands to widget items
 ///
-/// Returns the most recently seen bands with their concert info.
+/// Returns all concerts sorted by date (most recent first).
 pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData {
-    // Sort by most recent concert date
-    let mut bands_with_dates: Vec<_> = bands
+    // Flatten all concerts from all bands
+    let mut all_concerts: Vec<_> = bands
         .iter()
-        .filter_map(|band| {
-            // Get most recent concert
-            band.concerts.first().map(|concert| {
+        .flat_map(|band| {
+            band.concerts.iter().map(move |concert| {
                 let date_parts: Vec<&str> = concert.date.split('-').collect();
                 let sort_key = if date_parts.len() == 3 {
                     // Convert DD-MM-YYYY to YYYYMMDD for sorting
@@ -92,10 +91,10 @@ pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData 
         .collect();
 
     // Sort by date descending (most recent first)
-    bands_with_dates.sort_by(|a, b| b.2.cmp(&a.2));
+    all_concerts.sort_by(|a, b| b.2.cmp(&a.2));
 
     // Take the most recent concerts
-    bands_with_dates
+    all_concerts
         .into_iter()
         .take(limit)
         .map(|(band, concert, _)| {
