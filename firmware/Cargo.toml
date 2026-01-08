@@ -41,6 +41,7 @@ esp-backtrace = { version = "0.18.1", features = [
 esp-println = { version = "0.16.1", features = ["esp32s3", "log-04"] }
 # for more networking protocol support see https://crates.io/crates/edge-net
 embassy-executor = { version = "0.9.1", features = ["log"] }
+embassy-futures = "0.1"
 embassy-time = { version = "0.5.0", features = ["log"] }
 esp-radio = { version = "0.17.0", features = [
   "esp-alloc",

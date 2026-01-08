@@ -8,6 +8,7 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration as CoreDuration;
 
 use embassy_executor::Spawner;
@@ -140,6 +141,32 @@ impl SleepState {
 #[esp_hal::ram(unstable(rtc_fast))]
 static mut SLEEP_STATE: SleepState = SleepState::new();
 
+/// Flag to control red LED blinking from blink task
+static BLINK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Red LED blink task - blinks when BLINK_ACTIVE is true, solid on otherwise
+#[embassy_executor::task]
+async fn blink_task(led: &'static mut Output<'static>) {
+    loop {
+        if BLINK_ACTIVE.load(Ordering::Relaxed) {
+            led.toggle();
+        } else {
+            led.set_low(); // ON (active low)
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
+
+/// Start blinking the red LED
+fn start_blink() {
+    BLINK_ACTIVE.store(true, Ordering::Relaxed);
+}
+
+/// Stop blinking and keep red LED solid on
+fn stop_blink() {
+    BLINK_ACTIVE.store(false, Ordering::Relaxed);
+}
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     // Init logger first so we can see any early crashes
@@ -148,8 +175,68 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // Check wake reason
+    // Check wake reason immediately
     let wake_reason = esp_hal::rtc_cntl::wakeup_cause();
+    let button_wake = matches!(wake_reason, esp_hal::system::SleepSource::Ext0);
+
+    // ==================== Early Button Check (before heavy init) ====================
+    // Set up button and LED GPIOs first for fast response to button wake
+    let key_input = Input::new(
+        peripherals.GPIO4,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    let mut led_green = Output::new(peripherals.GPIO42, Level::High, OutputConfig::default());
+    let led_red = Output::new(peripherals.GPIO45, Level::Low, OutputConfig::default()); // ON by default
+
+    // Spawn red LED blink task (needs 'static lifetime)
+    let led_red_static: &'static mut Output<'static> = mk_static!(Output<'static>, led_red);
+    spawner.spawn(blink_task(led_red_static)).ok();
+    let mut delay = Delay;
+
+    // Check sleep state to get current orientation
+    let resuming = unsafe { (*(&raw const SLEEP_STATE)).is_valid() };
+    let mut orientation = if resuming {
+        unsafe { (*(&raw const SLEEP_STATE)).get_orientation() }
+    } else {
+        Orientation::default()
+    };
+
+    // Track if we should advance to next item (button tap without hold)
+    let mut advance_item = false;
+
+    if button_wake {
+        // Button caused wake - check if held for 500ms total (boot takes ~200ms)
+        delay.delay_ms(300);
+
+        if key_input.is_low() {
+            // Button held - toggle orientation
+            orientation = orientation.toggle();
+
+            // Flash LED 3 times for rotation
+            for _ in 0..3 {
+                led_green.set_low();  // ON
+                delay.delay_ms(100);
+                led_green.set_high(); // OFF
+                delay.delay_ms(100);
+            }
+
+            // Wait for button release
+            while key_input.is_low() {
+                delay.delay_ms(50);
+            }
+        } else {
+            // Button tap - advance to next item
+            advance_item = true;
+
+            // Flash LED 1 time for next item
+            led_green.set_low();  // ON
+            delay.delay_ms(100);
+            led_green.set_high(); // OFF
+        }
+    }
+
+    // ==================== Normal Boot Sequence ====================
+    // Now do the heavier initialization
     println!("Boot! Wake reason: {:?}", wake_reason);
 
     // Wait for USB serial to reconnect after deep sleep wake
@@ -210,7 +297,7 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     // Small delay for power rails to stabilize
-    Delay.delay_ms(100);
+    delay.delay_ms(100);
 
     // ==================== E-Paper Display Setup ====================
     // PhotoPainter GPIO pins for 7.3" e-paper display
@@ -237,8 +324,6 @@ async fn main(spawner: Spawner) -> ! {
     let dc = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default());
     let mut rst = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
 
-    let mut delay = Delay;
-
     // Debug: check BUSY pin state
     println!(
         "BUSY pin initial state: {}",
@@ -263,13 +348,6 @@ async fn main(spawner: Spawner) -> ! {
     let mut epd = Epd7in3e::new(spi_device, busy, dc, rst, &mut delay, RefreshMode::Fast)
         .expect("EPD init failed");
     println!("EPD initialized!");
-
-    // ==================== Button Setup (GPIO4 = KEY button) ====================
-    // Create input to check button state, will convert back to raw pin for deep sleep
-    let key_input = Input::new(
-        peripherals.GPIO4,
-        InputConfig::default().with_pull(Pull::Up),
-    );
 
     // ==================== WiFi Setup ====================
     let esp_radio_ctrl = &*mk_static!(Controller<'static>, esp_radio::init().unwrap());
@@ -307,53 +385,20 @@ async fn main(spawner: Spawner) -> ! {
     println!("Edge URL: {}", EDGE_URL);
     println!("Refresh interval: {} seconds", REFRESH_INTERVAL_SECS);
 
-    // Check if we're resuming from deep sleep
-    let resuming = unsafe { (*(&raw const SLEEP_STATE)).is_valid() };
-    let mut orientation = if resuming {
-        let (index, total, orient) = unsafe {
+    if button_wake {
+        if advance_item {
+            println!("Button tap: will advance to next item");
+        } else {
+            println!("Button hold: toggled orientation to {:?}", orientation);
+        }
+    } else if resuming {
+        let (index, total) = unsafe {
             let state = &raw const SLEEP_STATE;
-            ((*state).index, (*state).total_items, (*state).get_orientation())
+            ((*state).index, (*state).total_items)
         };
-        println!("Resuming from deep sleep: index={}, total={}, orientation={:?}", index, total, orient);
-        orient
+        println!("Resuming from deep sleep: index={}, total={}, orientation={:?}", index, total, orientation);
     } else {
         println!("Fresh boot (no valid sleep state)");
-        Orientation::default()
-    };
-
-    // LED2 (GPIO42) for orientation toggle feedback (active-low: HIGH=off, LOW=on)
-    let mut led2 = Output::new(peripherals.GPIO42, Level::High, OutputConfig::default());
-
-    // Check if KEY button is pressed to toggle orientation
-    // Button is active low (pressed = LOW)
-    println!("Checking KEY button for orientation toggle (press within 2s to switch)...");
-    let mut toggle_detected = false;
-    for _ in 0..20 {
-        // Check for 2 seconds (20 x 100ms)
-        if key_input.is_low() {
-            toggle_detected = true;
-            println!("KEY pressed! Toggling orientation...");
-            orientation = orientation.toggle();
-            println!("New orientation: {:?}", orientation);
-
-            // Flash LED2 to confirm orientation switch (active-low)
-            for _ in 0..3 {
-                led2.set_low();  // ON
-                delay.delay_ms(100);
-                led2.set_high(); // OFF
-                delay.delay_ms(100);
-            }
-
-            // Wait for button release
-            while key_input.is_low() {
-                delay.delay_ms(50);
-            }
-            break;
-        }
-        delay.delay_ms(100);
-    }
-    if !toggle_detected {
-        println!("No button press detected, keeping orientation: {:?}", orientation);
     }
 
     // Allocate framebuffer (uses PSRAM for the 192KB buffer)
@@ -376,7 +421,8 @@ async fn main(spawner: Spawner) -> ! {
     // Fetch widget data (with retries)
     println!("Fetching widget data...");
     let mut items: WidgetData = loop {
-        match display::fetch_widget_data(
+        start_blink();
+        let result = display::fetch_widget_data(
             &tcp_client,
             &dns_socket,
             &mut tls_read_buf,
@@ -384,8 +430,10 @@ async fn main(spawner: Spawner) -> ! {
             EDGE_URL,
             "concerts",
         )
-        .await
-        {
+        .await;
+        stop_blink();
+
+        match result {
             Ok(data) => break data,
             Err(e) => {
                 println!("Failed to fetch widget data: {:?}, retrying in 30s...", e);
@@ -397,11 +445,21 @@ async fn main(spawner: Spawner) -> ! {
     // Determine shuffle seed and starting index
     let (shuffle_seed, mut index) = if resuming && unsafe { (*(&raw const SLEEP_STATE)).matches_data(&items) } {
         // Resume from saved state
-        let (seed, idx) = unsafe {
+        let (seed, mut idx) = unsafe {
             let state = &raw const SLEEP_STATE;
             ((*state).shuffle_seed, (*state).index)
         };
-        println!("Data unchanged, resuming from index {}", idx);
+
+        // If button tap detected, advance to next item(s)
+        if advance_item {
+            idx += match orientation {
+                Orientation::Horizontal => 2,
+                Orientation::Vertical => 1,
+            };
+            println!("Button tap: advancing from saved index to {}", idx);
+        } else {
+            println!("Data unchanged, resuming from index {}", idx);
+        }
         (seed, idx)
     } else {
         // Fresh start with new shuffle
@@ -435,13 +493,13 @@ async fn main(spawner: Spawner) -> ! {
             (index + 1).min(total_items - 1),
             total_items
         );
-        match display::fetch_and_display(
+        // Fetch images and update display with blinking LED
+        start_blink();
+        let fetch_result = display::fetch_to_framebuffer(
             &tcp_client,
             &dns_socket,
             &mut tls_read_buf,
             &mut tls_write_buf,
-            &mut epd,
-            &mut delay,
             &mut framebuffer,
             EDGE_URL,
             "concerts",
@@ -449,8 +507,29 @@ async fn main(spawner: Spawner) -> ! {
             &items,
             index,
         )
-        .await
-        {
+        .await;
+
+        // Update display with non-blocking refresh (allows blink task to run)
+        let display_result = match fetch_result {
+            Ok(()) => {
+                println!("Updating display...");
+                match epd.display_start(framebuffer.as_slice(), &mut delay) {
+                    Ok(()) => {
+                        // Poll busy with async delays (yields to executor for blink task)
+                        while epd.is_busy() {
+                            Timer::after(Duration::from_millis(50)).await;
+                        }
+                        epd.finish_display(&mut delay).map_err(|_| display::DisplayError::Network)
+                    }
+                    Err(_) => Err(display::DisplayError::Network),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        stop_blink();
+        embassy_futures::yield_now().await; // Let blink task set LED on
+
+        match display_result {
             Ok(()) => println!("Display refresh successful!"),
             Err(e) => println!("Display refresh failed: {:?}", e),
         }
@@ -459,39 +538,59 @@ async fn main(spawner: Spawner) -> ! {
         println!("Putting display to sleep...");
         epd.sleep(&mut delay).expect("Failed to sleep display");
 
-        // Wait 30s for orientation switch before deep sleep
-        println!("Press KEY within 30s to switch orientation...");
-        let mut orientation_changed = false;
+        // Wait 30s for button input before deep sleep
+        println!("Press KEY within 30s (tap=next item, hold=rotate)...");
+        let mut should_redisplay = false;
         for _ in 0..300 {
             if key_input.is_low() {
-                println!("KEY pressed! Toggling orientation...");
-                orientation = orientation.toggle();
+                println!("KEY pressed, checking for 500ms hold...");
+                // Wait 500ms and check if button is still held
+                delay.delay_ms(500);
 
-                // Flash LED2 to confirm
-                for _ in 0..3 {
-                    led2.set_low();  // ON
+                if key_input.is_low() {
+                    // Button held - toggle orientation
+                    println!("Button held! Toggling orientation...");
+                    orientation = orientation.toggle();
+
+                    // Flash LED2 3 times to confirm rotation
+                    for _ in 0..3 {
+                        led_green.set_low();  // ON
+                        delay.delay_ms(100);
+                        led_green.set_high(); // OFF
+                        delay.delay_ms(100);
+                    }
+
+                    // Wait for button release
+                    while key_input.is_low() {
+                        delay.delay_ms(50);
+                    }
+
+                    println!("Re-displaying with orientation: {:?}", orientation);
+                } else {
+                    // Button released - advance to next item
+                    index += match orientation {
+                        Orientation::Horizontal => 2,
+                        Orientation::Vertical => 1,
+                    };
+                    println!("Button tap, advancing to index {}", index);
+
+                    // Flash LED2 1 time to confirm next item
+                    led_green.set_low();  // ON
                     delay.delay_ms(100);
-                    led2.set_high(); // OFF
-                    delay.delay_ms(100);
+                    led_green.set_high(); // OFF
                 }
 
-                // Wait for button release
-                while key_input.is_low() {
-                    delay.delay_ms(50);
-                }
-
-                orientation_changed = true;
-                println!("Re-displaying with orientation: {:?}", orientation);
+                should_redisplay = true;
                 break;
             }
-            delay.delay_ms(100);
+            Timer::after(Duration::from_millis(100)).await; // Async yield lets blink task run
         }
 
-        if !orientation_changed {
-            // No change, exit loop and go to sleep
+        if !should_redisplay {
+            // No button press, exit loop and go to sleep
             break;
         }
-        // Loop back to re-display with new orientation
+        // Loop back to re-display
     }
 
     // Advance index for next wake (2 items in horizontal, 1 in vertical)

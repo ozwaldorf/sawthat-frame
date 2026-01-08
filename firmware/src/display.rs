@@ -47,21 +47,19 @@ pub enum DisplayError {
     NoItems,
 }
 
-/// Fetch widget data and display items using a single persistent HTTP connection.
+/// Fetch images and render to framebuffer (no display update).
 ///
 /// This function:
 /// 1. Establishes one HTTP(S) connection to the edge server
-/// 2. Fetches widget data JSON
-/// 3. Fetches all PNG images (reusing the same connection)
-/// 4. Decodes and renders to framebuffer
-/// 5. Updates the e-paper display
-pub async fn fetch_and_display<SPI, BUSY, DC, RST, DELAY, T, D>(
+/// 2. Fetches all PNG images (reusing the same connection)
+/// 3. Decodes and renders to framebuffer
+///
+/// Call `update_display()` separately after this to refresh the e-paper.
+pub async fn fetch_to_framebuffer<T, D>(
     tcp: &T,
     dns: &D,
     tls_read_buf: &mut [u8],
     tls_write_buf: &mut [u8],
-    epd: &mut Epd7in3e<SPI, BUSY, DC, RST>,
-    delay: &mut DELAY,
     framebuffer: &mut Framebuffer,
     edge_url: &str,
     widget_name: &str,
@@ -70,11 +68,6 @@ pub async fn fetch_and_display<SPI, BUSY, DC, RST, DELAY, T, D>(
     start_index: usize,
 ) -> Result<(), DisplayError>
 where
-    SPI: SpiDevice,
-    BUSY: InputPin,
-    DC: OutputPin,
-    RST: OutputPin,
-    DELAY: DelayNs,
     T: TcpConnect,
     D: Dns,
 {
@@ -83,7 +76,7 @@ where
 
     let total_items = items.len();
     println!(
-        "Displaying items starting at index {} (connection reuse enabled)",
+        "Fetching images starting at index {} (connection reuse enabled)",
         start_index
     );
 
@@ -188,13 +181,27 @@ where
         framebuffer.fill_right_half(Color::White);
     }
 
-    // Send framebuffer to display
+    println!("Framebuffer ready for display");
+    Ok(())
+}
+
+/// Update the e-paper display with the framebuffer contents.
+pub fn update_display<SPI, BUSY, DC, RST, DELAY>(
+    epd: &mut Epd7in3e<SPI, BUSY, DC, RST>,
+    delay: &mut DELAY,
+    framebuffer: &Framebuffer,
+) -> Result<(), DisplayError>
+where
+    SPI: SpiDevice,
+    BUSY: InputPin,
+    DC: OutputPin,
+    RST: OutputPin,
+    DELAY: DelayNs,
+{
     println!("Updating display...");
     epd.display(framebuffer.as_slice(), delay)
         .map_err(|_| DisplayError::Network)?;
-
     println!("Display updated!");
-
     Ok(())
 }
 

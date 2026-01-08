@@ -276,6 +276,31 @@ where
         self.refresh(delay)
     }
 
+    /// Start displaying a raw buffer (non-blocking).
+    /// Call `is_busy()` to poll, then `finish_display()` when done.
+    pub fn display_start<DELAY: DelayNs>(
+        &mut self,
+        buffer: &[u8],
+        delay: &mut DELAY,
+    ) -> Result<(), SPI::Error> {
+        self.send_command(Command::DTM)?;
+        self.send_data(buffer)?;
+        self.refresh_start(delay)
+    }
+
+    /// Check if display is still busy refreshing.
+    pub fn is_busy(&mut self) -> bool {
+        self.busy.is_low().unwrap_or(true)
+    }
+
+    /// Finish display refresh after polling `is_busy()` returns false.
+    pub fn finish_display<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<(), SPI::Error> {
+        // Power off
+        self.cmd_with_data(Command::POF, &[0x00])?;
+        self.wait_until_idle(delay);
+        Ok(())
+    }
+
     /// Trigger display refresh (blocking)
     fn refresh<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<(), SPI::Error> {
         self.refresh_start(delay)?;
