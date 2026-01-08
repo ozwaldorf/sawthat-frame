@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use core::time::Duration as CoreDuration;
 
 use embassy_executor::Spawner;
@@ -143,6 +143,8 @@ static mut SLEEP_STATE: SleepState = SleepState::new();
 
 /// Flag to control red LED blinking from blink task
 static BLINK_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Blink interval in milliseconds (100 = fast, 500 = normal)
+static BLINK_INTERVAL_MS: AtomicU16 = AtomicU16::new(500);
 
 /// Red LED blink task - blinks when BLINK_ACTIVE is true, solid on otherwise
 #[embassy_executor::task]
@@ -153,12 +155,20 @@ async fn blink_task(led: &'static mut Output<'static>) {
         } else {
             led.set_low(); // ON (active low)
         }
-        Timer::after(Duration::from_millis(500)).await;
+        let interval = BLINK_INTERVAL_MS.load(Ordering::Relaxed) as u64;
+        Timer::after(Duration::from_millis(interval)).await;
     }
 }
 
-/// Start blinking the red LED
+/// Start blinking the red LED (normal speed - 500ms)
 fn start_blink() {
+    BLINK_INTERVAL_MS.store(500, Ordering::Relaxed);
+    BLINK_ACTIVE.store(true, Ordering::Relaxed);
+}
+
+/// Start fast blinking the red LED (100ms)
+fn start_fast_blink() {
+    BLINK_INTERVAL_MS.store(100, Ordering::Relaxed);
     BLINK_ACTIVE.store(true, Ordering::Relaxed);
 }
 
@@ -648,6 +658,7 @@ fn enter_deep_sleep<P: esp_hal::gpio::RtcPinWithResistors>(
 
 /// Connect to WiFi network
 async fn wifi_connect(controller: &mut WifiController<'static>) {
+    start_fast_blink();
     println!("Device capabilities: {:?}", controller.capabilities());
 
     if !matches!(controller.is_started(), Ok(true)) {
@@ -667,6 +678,7 @@ async fn wifi_connect(controller: &mut WifiController<'static>) {
         match controller.connect_async().await {
             Ok(_) => {
                 println!("WiFi connected!");
+                stop_blink();
                 break;
             }
             Err(e) => {
