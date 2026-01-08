@@ -1,23 +1,26 @@
 //! Image processing for 6-color E Ink display
 //!
-//! Pipeline (matching aitjcize/esp32-photoframe approach):
+//! Pipeline:
 //! 1. Resize to target dimensions
-//! 2. Apply exposure adjustment
-//! 3. Apply saturation adjustment (HSL-based)
-//! 4. Apply S-curve tone mapping
+//! 2. Apply exposure/saturation/s-curve adjustments
+//! 3. Extract dominant color from image edges
+//! 4. Compose canvas: image + gradient + solid color text area
 //! 5. Floyd-Steinberg dithering to 6-color palette (OKLab color space)
-//! 6. Render concert info text
+//! 6. Render concert info text (black or white based on background)
 //! 7. Encode as indexed PNG
 
 use crate::error::AppError;
-use crate::palette::{Oklab, OklabPalette, PaletteIndex, PNG_PALETTE};
+use crate::palette::{extract_dominant_color, Oklab, OklabPalette, PNG_PALETTE};
 use crate::text::{self, ConcertInfo};
-use image::{DynamicImage, GenericImageView, RgbImage};
+use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use png::{BitDepth, ColorType, Encoder};
 use std::io::Cursor;
 
 /// Height reserved for text info at bottom
 const TEXT_AREA_HEIGHT: u32 = 120;
+
+/// Height of the gradient transition zone
+const GRADIENT_HEIGHT: u32 = 80;
 
 // Image adjustment parameters (aitjcize/esp32-photoframe style)
 const EXPOSURE: f32 = 0.8;
@@ -137,13 +140,14 @@ fn apply_adjustments(img: &mut RgbImage) {
 
 /// Process a source image for the e-paper display
 ///
-/// Pipeline (matching aitjcize/esp32-photoframe approach):
-/// 1. Resize to cover width (fill width, center crop any height overflow)
-/// 2. Apply adjustments: exposure (0.8), saturation (2.0), s-curve
-/// 3. Apply Floyd-Steinberg dithering in OKLab space to 6-color palette
-/// 4. Compose final canvas: dithered image + solid black text area
-/// 5. Render concert info text (white on solid black for crisp text)
-/// 6. Encode as indexed PNG
+/// Pipeline:
+/// 1. Extract dominant color from original image edges
+/// 2. Resize to cover width (fill width, center crop any height overflow)
+/// 3. Apply adjustments: exposure (0.8), saturation (2.0), s-curve
+/// 4. Compose RGB canvas: image + gradient transition + solid color text area
+/// 5. Apply Floyd-Steinberg dithering in OKLab space to 6-color palette
+/// 6. Render concert info text (black/white based on background lightness)
+/// 7. Encode as indexed PNG
 pub fn process_image(
     image_data: &[u8],
     target_width: u32,
@@ -154,32 +158,102 @@ pub fn process_image(
     let img = image::load_from_memory(image_data)
         .map_err(|e| AppError::ImageProcessing(format!("Failed to decode image: {}", e)))?;
 
+    // 1. Extract dominant color from original image (before resize/adjustments)
+    let dominant = extract_dominant_color(&img.to_rgb8());
+    tracing::info!(
+        "Extracted dominant color: RGB({}, {}, {}), light_bg: {}",
+        dominant.r,
+        dominant.g,
+        dominant.b,
+        dominant.is_light
+    );
+
     // Calculate image area (leave room for text)
     let image_area_height = target_height - TEXT_AREA_HEIGHT;
 
-    // Resize to cover image area (fill width, center crop height)
+    // 2. Resize to cover image area (fill width, center crop height)
     let mut resized = resize_cover(&img, target_width, image_area_height);
 
-    // Apply image adjustments (exposure, saturation, s-curve)
+    // 3. Apply image adjustments (exposure, saturation, s-curve)
     apply_adjustments(&mut resized);
 
-    // Apply Floyd-Steinberg dithering in OKLab space
-    let dithered_image = floyd_steinberg_dither(&resized);
+    // 4. Compose full RGB canvas with gradient
+    let canvas = compose_canvas_with_gradient(
+        &resized,
+        target_width,
+        target_height,
+        image_area_height,
+        dominant.r,
+        dominant.g,
+        dominant.b,
+    );
 
-    // Compose final canvas: dithered image at top, solid black text area at bottom
-    let mut indexed = vec![PaletteIndex::Black.as_u8(); (target_width * target_height) as usize];
+    // 5. Apply Floyd-Steinberg dithering to entire canvas
+    let mut indexed = floyd_steinberg_dither(&canvas);
 
-    // Copy dithered image to top of canvas
-    let image_pixels = (target_width * image_area_height) as usize;
-    indexed[..image_pixels].copy_from_slice(&dithered_image);
-
-    // Render concert info text on the solid black text area
+    // 6. Render concert info text
     if let Some(info) = concert_info {
-        text::render_concert_info_indexed(&mut indexed, target_width, info, image_area_height);
+        text::render_concert_info_indexed(
+            &mut indexed,
+            target_width,
+            info,
+            image_area_height,
+            dominant.is_light,
+        );
     }
 
-    // Encode as indexed PNG
+    // 7. Encode as indexed PNG
     encode_indexed_png(&indexed, target_width, target_height)
+}
+
+/// Compose the full canvas with image, gradient transition, and solid background
+fn compose_canvas_with_gradient(
+    img: &RgbImage,
+    target_width: u32,
+    target_height: u32,
+    image_area_height: u32,
+    bg_r: u8,
+    bg_g: u8,
+    bg_b: u8,
+) -> RgbImage {
+    let mut canvas = RgbImage::new(target_width, target_height);
+
+    // Gradient starts this many pixels above the image/text boundary
+    let gradient_start = image_area_height.saturating_sub(GRADIENT_HEIGHT);
+
+    for y in 0..target_height {
+        for x in 0..target_width {
+            let pixel = if y < gradient_start {
+                // Pure image region
+                *img.get_pixel(x, y)
+            } else if y < image_area_height {
+                // Gradient transition zone (blend image into background color)
+                let img_pixel = img.get_pixel(x, y);
+                let t = (y - gradient_start) as f32 / GRADIENT_HEIGHT as f32;
+                // Smooth easing (ease-in-out)
+                let t = t * t * (3.0 - 2.0 * t);
+                Rgb([
+                    lerp_u8(img_pixel[0], bg_r, t),
+                    lerp_u8(img_pixel[1], bg_g, t),
+                    lerp_u8(img_pixel[2], bg_b, t),
+                ])
+            } else {
+                // Solid background for text area
+                Rgb([bg_r, bg_g, bg_b])
+            };
+            canvas.put_pixel(x, y, pixel);
+        }
+    }
+
+    canvas
+}
+
+/// Linear interpolation between two u8 values
+#[inline]
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let a = a as f32;
+    let b = b as f32;
+    (a + (b - a) * t).clamp(0.0, 255.0) as u8
 }
 
 /// Resize image to cover the target area (fill width, center crop height)

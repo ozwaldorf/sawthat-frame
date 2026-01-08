@@ -4,10 +4,11 @@
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 
-/// Embedded Inter Bold font
-const FONT_DATA: &[u8] = include_bytes!("../fonts/Inter-Bold.ttf");
+/// Font found at build time via fontconfig (see build.rs)
+const FONT_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/font.ttf"));
 
-/// White palette index
+/// Palette indices
+const BLACK_INDEX: u8 = 0;
 const WHITE_INDEX: u8 = 1;
 
 /// Concert info to render
@@ -18,30 +19,33 @@ pub struct ConcertInfo {
 }
 
 /// Render concert info text onto an indexed buffer (post-dithering)
-/// Places white text in the bottom area (below the image)
+/// Places text in the bottom area (below the image)
+/// Uses black text on light backgrounds, white text on dark backgrounds
 pub fn render_concert_info_indexed(
     indexed: &mut [u8],
     width: u32,
     info: &ConcertInfo,
     text_area_top: u32,
+    is_light_bg: bool,
 ) {
     let font = FontRef::try_from_slice(FONT_DATA).expect("Failed to load font");
+    let text_color = if is_light_bg { BLACK_INDEX } else { WHITE_INDEX };
 
-    // Band name - large, centered
-    let band_scale = PxScale::from(36.0);
-    let band_y = text_area_top + 10;
-    draw_text_indexed_centered(indexed, width, &font, &info.band_name, band_scale, band_y);
+    // Band name - large, centered (40px)
+    let band_scale = PxScale::from(40.0);
+    let band_y = text_area_top + 4;
+    draw_text_indexed_centered(indexed, width, &font, &info.band_name, band_scale, band_y, text_color);
 
-    // Date - medium
-    let date_scale = PxScale::from(24.0);
-    let date_y = band_y + 45;
-    draw_text_indexed_centered(indexed, width, &font, &info.date, date_scale, date_y);
+    // Date - medium (32px)
+    let date_scale = PxScale::from(32.0);
+    let date_y = band_y + 44;
+    draw_text_indexed_centered(indexed, width, &font, &info.date, date_scale, date_y, text_color);
 
-    // Venue - smaller, may truncate if too long
-    let venue_scale = PxScale::from(20.0);
-    let venue_y = date_y + 35;
-    let venue_text = truncate_text(&info.venue, 40);
-    draw_text_indexed_centered(indexed, width, &font, &venue_text, venue_scale, venue_y);
+    // Venue (24px)
+    let venue_scale = PxScale::from(24.0);
+    let venue_y = date_y + 36;
+    let venue_text = truncate_text(&info.venue, 35);
+    draw_text_indexed_centered(indexed, width, &font, &venue_text, venue_scale, venue_y, text_color);
 }
 
 /// Draw text centered horizontally onto indexed buffer
@@ -52,6 +56,7 @@ fn draw_text_indexed_centered(
     text: &str,
     scale: PxScale,
     y: u32,
+    color: u8,
 ) {
     let scaled_font = font.as_scaled(scale);
 
@@ -67,11 +72,10 @@ fn draw_text_indexed_centered(
     // Center horizontally
     let x = ((width as f32 - text_width) / 2.0).max(0.0) as u32;
 
-    draw_text_indexed(indexed, width, font, text, scale, x, y);
+    draw_text_indexed(indexed, width, font, text, scale, x, y, color);
 }
 
 /// Draw text at a specific position onto indexed buffer
-/// Sets pixels directly to white palette index
 fn draw_text_indexed(
     indexed: &mut [u8],
     width: u32,
@@ -80,6 +84,7 @@ fn draw_text_indexed(
     scale: PxScale,
     x: u32,
     y: u32,
+    color: u8,
 ) {
     let scaled_font = font.as_scaled(scale);
     let mut cursor_x = x as f32;
@@ -95,11 +100,11 @@ fn draw_text_indexed(
                 let px = bounds.min.x as u32 + gx;
                 let py = bounds.min.y as u32 + gy;
 
-                // Hard edge threshold - set to white index
-                if px < width && py < height && coverage > 0.4 {
+                // Hard edge threshold (0.5 for clean edges with bold fonts)
+                if px < width && py < height && coverage > 0.5 {
                     let idx = (py * width + px) as usize;
                     if idx < indexed.len() {
-                        indexed[idx] = WHITE_INDEX;
+                        indexed[idx] = color;
                     }
                 }
             });
