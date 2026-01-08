@@ -64,7 +64,7 @@ impl Framebuffer {
         }
 
         let byte_idx = (y as usize * (WIDTH as usize / 2)) + (x as usize / 2);
-        let is_high_nibble = (x % 2) == 0;
+        let is_high_nibble = x.is_multiple_of(2);
 
         if is_high_nibble {
             self.buffer[byte_idx] = (self.buffer[byte_idx] & 0x0F) | (color.to_4bit() << 4);
@@ -82,7 +82,7 @@ impl Framebuffer {
 
         let color = remap_color(palette_idx);
         let byte_idx = (y as usize * (WIDTH as usize / 2)) + (x as usize / 2);
-        let is_high_nibble = (x % 2) == 0;
+        let is_high_nibble = x.is_multiple_of(2);
 
         if is_high_nibble {
             self.buffer[byte_idx] = (self.buffer[byte_idx] & 0x0F) | (color << 4);

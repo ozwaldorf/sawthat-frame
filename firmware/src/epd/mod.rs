@@ -20,6 +20,48 @@ pub const HEIGHT: u32 = 480;
 /// Buffer size: 4 bits per pixel, 2 pixels per byte
 pub const BUFFER_SIZE: usize = (WIDTH as usize * HEIGHT as usize) / 2;
 
+/// Rectangle defining a partial update region
+#[derive(Debug, Clone, Copy)]
+pub struct Rect {
+    /// X coordinate of top-left corner (must be even for pixel alignment)
+    pub x: u16,
+    /// Y coordinate of top-left corner
+    pub y: u16,
+    /// Width in pixels (must be even for byte alignment)
+    pub width: u16,
+    /// Height in pixels
+    pub height: u16,
+}
+
+impl Rect {
+    /// Create a new rectangle
+    ///
+    /// `x` and `width` will be adjusted to even values for byte alignment.
+    pub const fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
+        Self {
+            x: x & !1,           // Round down to even
+            y,
+            width: (width + 1) & !1, // Round up to even
+            height,
+        }
+    }
+
+    /// Calculate buffer size needed for this region (bytes)
+    pub const fn buffer_size(&self) -> usize {
+        (self.width as usize * self.height as usize) / 2
+    }
+
+    /// Check if rectangle is within display bounds
+    pub const fn is_valid(&self) -> bool {
+        self.x < WIDTH as u16
+            && self.y < HEIGHT as u16
+            && self.x + self.width <= WIDTH as u16
+            && self.y + self.height <= HEIGHT as u16
+            && self.width > 0
+            && self.height > 0
+    }
+}
+
 /// Initialization/refresh mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RefreshMode {
@@ -368,6 +410,156 @@ where
     pub fn refresh_mode(&self) -> RefreshMode {
         self.refresh_mode
     }
+
+    // ==================== Partial Update Methods ====================
+
+    /// Set the partial window region for subsequent partial updates.
+    ///
+    /// Coordinates are specified as inclusive start/end positions.
+    fn set_partial_window(&mut self, rect: &Rect) -> Result<(), SPI::Error> {
+        let x_start = rect.x;
+        let x_end = rect.x + rect.width - 1;
+        let y_start = rect.y;
+        let y_end = rect.y + rect.height - 1;
+
+        self.send_command(Command::PTLW)?;
+        // X coordinates (10-bit: MSB [9:8], LSB [7:0])
+        self.send_data(&[(x_start >> 8) as u8 & 0x03])?;
+        self.send_data(&[(x_start & 0xFF) as u8])?;
+        self.send_data(&[(x_end >> 8) as u8 & 0x03])?;
+        self.send_data(&[(x_end & 0xFF) as u8])?;
+        // Y coordinates (10-bit: MSB [9:8], LSB [7:0])
+        self.send_data(&[(y_start >> 8) as u8 & 0x03])?;
+        self.send_data(&[(y_start & 0xFF) as u8])?;
+        self.send_data(&[(y_end >> 8) as u8 & 0x03])?;
+        self.send_data(&[(y_end & 0xFF) as u8])?;
+        // Enable partial window mode
+        self.send_data(&[0x01])
+    }
+
+    /// Perform a partial update on a rectangular region (blocking).
+    ///
+    /// The buffer must contain exactly `rect.buffer_size()` bytes of 4bpp packed pixel data
+    /// for the specified region.
+    pub fn partial_update<DELAY: DelayNs>(
+        &mut self,
+        rect: &Rect,
+        buffer: &[u8],
+        delay: &mut DELAY,
+    ) -> Result<(), SPI::Error> {
+        debug_assert!(rect.is_valid(), "Partial update rect out of bounds");
+        debug_assert_eq!(
+            buffer.len(),
+            rect.buffer_size(),
+            "Buffer size mismatch for partial update"
+        );
+
+        // Set partial window
+        self.set_partial_window(rect)?;
+        self.wait_until_idle(delay);
+
+        // Send pixel data
+        self.send_command(Command::DTM)?;
+        self.send_data(buffer)?;
+
+        // Refresh the partial region
+        self.partial_refresh(delay)
+    }
+
+    /// Fill a rectangular region with a solid color (blocking).
+    pub fn partial_fill<DELAY: DelayNs>(
+        &mut self,
+        rect: &Rect,
+        color: Color,
+        delay: &mut DELAY,
+    ) -> Result<(), SPI::Error> {
+        debug_assert!(rect.is_valid(), "Partial fill rect out of bounds");
+
+        // Set partial window
+        self.set_partial_window(rect)?;
+        self.wait_until_idle(delay);
+
+        // Send solid color data
+        let color_byte = color.to_dual_pixel();
+        let row_bytes = rect.width as usize / 2;
+
+        self.send_command(Command::DTM)?;
+        let _ = self.dc.set_high();
+
+        // Send row by row to avoid large stack allocations
+        let chunk = [color_byte; 100];
+        for _ in 0..rect.height {
+            let mut remaining = row_bytes;
+            while remaining > 0 {
+                let send = remaining.min(100);
+                self.spi.write(&chunk[..send])?;
+                remaining -= send;
+            }
+        }
+
+        // Refresh the partial region
+        self.partial_refresh(delay)
+    }
+
+    /// Start a partial update (non-blocking after refresh starts).
+    /// Call `refresh_wait()` before the next display operation.
+    pub fn partial_update_start<DELAY: DelayNs>(
+        &mut self,
+        rect: &Rect,
+        buffer: &[u8],
+        delay: &mut DELAY,
+    ) -> Result<(), SPI::Error> {
+        debug_assert!(rect.is_valid(), "Partial update rect out of bounds");
+        debug_assert_eq!(
+            buffer.len(),
+            rect.buffer_size(),
+            "Buffer size mismatch for partial update"
+        );
+
+        // Set partial window
+        self.set_partial_window(rect)?;
+        self.wait_until_idle(delay);
+
+        // Send pixel data
+        self.send_command(Command::DTM)?;
+        self.send_data(buffer)?;
+
+        // Start refresh (non-blocking)
+        self.partial_refresh_start(delay)
+    }
+
+    /// Refresh after partial data transmission (blocking).
+    fn partial_refresh<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<(), SPI::Error> {
+        self.partial_refresh_start(delay)?;
+        self.refresh_wait(delay)
+    }
+
+    /// Start refresh after partial data transmission (non-blocking).
+    fn partial_refresh_start<DELAY: DelayNs>(
+        &mut self,
+        delay: &mut DELAY,
+    ) -> Result<(), SPI::Error> {
+        self.wait_until_idle(delay);
+
+        // Power on
+        self.send_command(Command::PON)?;
+        self.wait_until_idle(delay);
+
+        // Booster settings (same as standard refresh)
+        if self.refresh_mode == RefreshMode::Standard {
+            self.cmd_with_data(Command::BTST2, &[0x6F, 0x1F, 0x17, 0x49])?;
+        } else {
+            self.cmd_with_data(Command::BTST2, &[0x6F, 0x1F, 0x16, 0x25])?;
+        }
+
+        // Trigger display refresh
+        self.cmd_with_data(Command::DRF, &[0x00])?;
+        delay.delay_ms(1);
+
+        Ok(())
+    }
+
+    // ==================== Test Pattern Methods ====================
 
     /// Display a 6-color test pattern
     /// Layout (2 rows x 3 cols):

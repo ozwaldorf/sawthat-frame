@@ -56,6 +56,8 @@ pub enum Command {
     CCSET = 0xE0,
     /// TSSET (Temperature Sensor Setting - fast mode)
     TSSET = 0xE6,
+    /// Partial Window Setting
+    PTLW = 0x83,
 }
 
 impl Command {

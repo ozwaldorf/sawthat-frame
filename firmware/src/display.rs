@@ -55,6 +55,7 @@ pub enum DisplayError {
 /// 3. Decodes and renders to framebuffer
 ///
 /// Call `update_display()` separately after this to refresh the e-paper.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_to_framebuffer<T, D>(
     tcp: &T,
     dns: &D,
