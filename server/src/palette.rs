@@ -1,7 +1,7 @@
 //! 6-color palette for E Ink Spectra 6 display
 //!
 //! Uses OKLab color space for perceptually uniform color matching.
-//! Palette values tuned from epdoptimize project.
+//! Palette values from aitjcize/esp32-photoframe (measured e-paper colors).
 
 /// RGB color representation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,25 +127,25 @@ impl PaletteIndex {
     }
 }
 
-/// Tuned Spectra 6 palette (from epdoptimize)
-/// These values are optimized for how the display actually renders colors
+/// Measured Spectra 6 palette (from aitjcize/esp32-photoframe)
+/// These values are actual measured e-paper display colors
 pub const PALETTE: [Rgb; 6] = [
-    Rgb::new(25, 30, 33),     // Black  #191E21
-    Rgb::new(232, 232, 232),  // White  #e8e8e8
-    Rgb::new(178, 19, 24),    // Red    #b21318
-    Rgb::new(239, 222, 68),   // Yellow #efde44
-    Rgb::new(33, 87, 186),    // Blue   #2157ba
-    Rgb::new(18, 95, 32),     // Green  #125f20
+    Rgb::new(2, 2, 2),        // Black
+    Rgb::new(232, 232, 232),  // White
+    Rgb::new(135, 19, 0),     // Red
+    Rgb::new(205, 202, 0),    // Yellow
+    Rgb::new(5, 64, 158),     // Blue
+    Rgb::new(39, 102, 60),    // Green
 ];
 
-/// PNG palette bytes (RGB triplets) - same tuned values
+/// PNG palette bytes (RGB triplets) - same measured values
 pub const PNG_PALETTE: [u8; 18] = [
-    25, 30, 33,      // Black
+    2, 2, 2,         // Black
     232, 232, 232,   // White
-    178, 19, 24,     // Red
-    239, 222, 68,    // Yellow
-    33, 87, 186,     // Blue
-    18, 95, 32,      // Green
+    135, 19, 0,      // Red
+    205, 202, 0,     // Yellow
+    5, 64, 158,      // Blue
+    39, 102, 60,     // Green
 ];
 
 /// Palette matcher using OKLab perceptual distance

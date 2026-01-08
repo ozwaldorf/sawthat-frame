@@ -1,9 +1,13 @@
 //! Image processing for 6-color E Ink display
 //!
-//! - Resize to target dimensions
-//! - Sierra-3 dithering to 6-color palette (entirely in OKLab color space)
-//! - Render concert info text
-//! - Encode as indexed PNG
+//! Pipeline (matching aitjcize/esp32-photoframe approach):
+//! 1. Resize to target dimensions
+//! 2. Apply exposure adjustment
+//! 3. Apply saturation adjustment (HSL-based)
+//! 4. Apply S-curve tone mapping
+//! 5. Floyd-Steinberg dithering to 6-color palette (OKLab color space)
+//! 6. Render concert info text
+//! 7. Encode as indexed PNG
 
 use crate::error::AppError;
 use crate::palette::{Oklab, OklabPalette, PaletteIndex, PNG_PALETTE};
@@ -15,13 +19,131 @@ use std::io::Cursor;
 /// Height reserved for text info at bottom
 const TEXT_AREA_HEIGHT: u32 = 120;
 
+// Image adjustment parameters (aitjcize/esp32-photoframe style)
+const EXPOSURE: f32 = 0.8;
+const SATURATION: f32 = 2.0;
+const SCURVE_STRENGTH: f32 = 1.0;
+const SCURVE_SHADOW_BOOST: f32 = 0.0;
+const SCURVE_HIGHLIGHT_COMPRESS: f32 = 2.0;
+const SCURVE_MIDPOINT: f32 = 0.5;
+
+/// Apply exposure adjustment to a single channel value
+#[inline]
+fn apply_exposure(value: u8) -> u8 {
+    (value as f32 * EXPOSURE).min(255.0) as u8
+}
+
+/// Apply S-curve tone mapping to a normalized [0,1] value
+#[inline]
+fn apply_scurve(normalized: f32) -> f32 {
+    if normalized <= SCURVE_MIDPOINT {
+        // Shadows region
+        let shadow_val = normalized / SCURVE_MIDPOINT;
+        let exponent = 1.0 - SCURVE_STRENGTH * SCURVE_SHADOW_BOOST;
+        shadow_val.powf(exponent) * SCURVE_MIDPOINT
+    } else {
+        // Highlights region
+        let highlight_val = (normalized - SCURVE_MIDPOINT) / (1.0 - SCURVE_MIDPOINT);
+        let exponent = 1.0 + SCURVE_STRENGTH * SCURVE_HIGHLIGHT_COMPRESS;
+        SCURVE_MIDPOINT + highlight_val.powf(exponent) * (1.0 - SCURVE_MIDPOINT)
+    }
+}
+
+/// Apply saturation adjustment using HSL color space
+fn apply_saturation(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    // Convert RGB to HSL
+    let r_norm = r as f32 / 255.0;
+    let g_norm = g as f32 / 255.0;
+    let b_norm = b as f32 / 255.0;
+
+    let max = r_norm.max(g_norm).max(b_norm);
+    let min = r_norm.min(g_norm).min(b_norm);
+    let delta = max - min;
+
+    let l = (max + min) / 2.0;
+
+    if delta < 1e-6 {
+        // Achromatic (gray)
+        return (r, g, b);
+    }
+
+    // Calculate hue
+    let h = if (max - r_norm).abs() < 1e-6 {
+        ((g_norm - b_norm) / delta) % 6.0
+    } else if (max - g_norm).abs() < 1e-6 {
+        (b_norm - r_norm) / delta + 2.0
+    } else {
+        (r_norm - g_norm) / delta + 4.0
+    };
+    let h = if h < 0.0 { h + 6.0 } else { h };
+
+    // Calculate saturation
+    let s = if l < 1e-6 || l > 1.0 - 1e-6 {
+        0.0
+    } else {
+        delta / (1.0 - (2.0 * l - 1.0).abs())
+    };
+
+    // Apply saturation multiplier
+    let new_s = (s * SATURATION).clamp(0.0, 1.0);
+
+    // Convert HSL back to RGB
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * new_s;
+    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
+    let m = l - c / 2.0;
+
+    let (r1, g1, b1) = if h < 1.0 {
+        (c, x, 0.0)
+    } else if h < 2.0 {
+        (x, c, 0.0)
+    } else if h < 3.0 {
+        (0.0, c, x)
+    } else if h < 4.0 {
+        (0.0, x, c)
+    } else if h < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+
+    (
+        ((r1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// Apply all image adjustments (exposure, saturation, s-curve) to an RGB image
+fn apply_adjustments(img: &mut RgbImage) {
+    for pixel in img.pixels_mut() {
+        // 1. Exposure adjustment
+        let r = apply_exposure(pixel[0]);
+        let g = apply_exposure(pixel[1]);
+        let b = apply_exposure(pixel[2]);
+
+        // 2. Saturation adjustment (HSL-based)
+        let (r, g, b) = apply_saturation(r, g, b);
+
+        // 3. S-curve tone mapping (per channel)
+        let r = (apply_scurve(r as f32 / 255.0) * 255.0).clamp(0.0, 255.0) as u8;
+        let g = (apply_scurve(g as f32 / 255.0) * 255.0).clamp(0.0, 255.0) as u8;
+        let b = (apply_scurve(b as f32 / 255.0) * 255.0).clamp(0.0, 255.0) as u8;
+
+        pixel[0] = r;
+        pixel[1] = g;
+        pixel[2] = b;
+    }
+}
+
 /// Process a source image for the e-paper display
 ///
+/// Pipeline (matching aitjcize/esp32-photoframe approach):
 /// 1. Resize to cover width (fill width, center crop any height overflow)
-/// 2. Apply Sierra-3 dithering in OKLab space to 6-color palette (image only)
-/// 3. Compose final canvas: dithered image + solid black text area
-/// 4. Render concert info text (white on solid black for crisp text)
-/// 5. Encode as indexed PNG
+/// 2. Apply adjustments: exposure (0.8), saturation (2.0), s-curve
+/// 3. Apply Floyd-Steinberg dithering in OKLab space to 6-color palette
+/// 4. Compose final canvas: dithered image + solid black text area
+/// 5. Render concert info text (white on solid black for crisp text)
+/// 6. Encode as indexed PNG
 pub fn process_image(
     image_data: &[u8],
     target_width: u32,
@@ -36,10 +158,13 @@ pub fn process_image(
     let image_area_height = target_height - TEXT_AREA_HEIGHT;
 
     // Resize to cover image area (fill width, center crop height)
-    let resized = resize_cover(&img, target_width, image_area_height);
+    let mut resized = resize_cover(&img, target_width, image_area_height);
 
-    // Apply Sierra-3 dithering in OKLab space to just the image
-    let dithered_image = sierra3_dither(&resized);
+    // Apply image adjustments (exposure, saturation, s-curve)
+    apply_adjustments(&mut resized);
+
+    // Apply Floyd-Steinberg dithering in OKLab space
+    let dithered_image = floyd_steinberg_dither(&resized);
 
     // Compose final canvas: dithered image at top, solid black text area at bottom
     let mut indexed = vec![PaletteIndex::Black.as_u8(); (target_width * target_height) as usize];
@@ -97,9 +222,9 @@ fn resize_cover(img: &DynamicImage, target_width: u32, target_height: u32) -> Rg
     output
 }
 
-/// Apply Sierra-3 dithering to convert RGB image to 6-color indexed
+/// Apply Floyd-Steinberg dithering to convert RGB image to 6-color indexed
 /// All operations performed in OKLab color space for perceptual uniformity
-fn sierra3_dither(img: &RgbImage) -> Vec<u8> {
+fn floyd_steinberg_dither(img: &RgbImage) -> Vec<u8> {
     let (width, height) = img.dimensions();
     let mut indexed = vec![0u8; (width * height) as usize];
 
@@ -131,33 +256,40 @@ fn sierra3_dither(img: &RgbImage) -> Vec<u8> {
             let err_a = current.a - target.a;
             let err_b = current.b - target.b;
 
-            // Distribute error to neighboring pixels (Sierra-3 pattern)
-            // Sierra-3 (Sierra Lite): simpler pattern with 3 neighbors
-            //       * 2/4
-            //   1/4 1/4
+            // Floyd-Steinberg error diffusion pattern:
+            //       *  7/16
+            // 3/16 5/16 1/16
 
-            // Right: 2/4
+            // Right: 7/16
             if x + 1 < width {
                 let right_idx = idx + 1;
-                buffer[right_idx].l += err_l * 0.5;
-                buffer[right_idx].a += err_a * 0.5;
-                buffer[right_idx].b += err_b * 0.5;
+                buffer[right_idx].l += err_l * (7.0 / 16.0);
+                buffer[right_idx].a += err_a * (7.0 / 16.0);
+                buffer[right_idx].b += err_b * (7.0 / 16.0);
             }
 
             if y + 1 < height {
-                // Bottom-left: 1/4
+                // Bottom-left: 3/16
                 if x > 0 {
                     let bl_idx = idx + width as usize - 1;
-                    buffer[bl_idx].l += err_l * 0.25;
-                    buffer[bl_idx].a += err_a * 0.25;
-                    buffer[bl_idx].b += err_b * 0.25;
+                    buffer[bl_idx].l += err_l * (3.0 / 16.0);
+                    buffer[bl_idx].a += err_a * (3.0 / 16.0);
+                    buffer[bl_idx].b += err_b * (3.0 / 16.0);
                 }
 
-                // Bottom: 1/4
+                // Bottom: 5/16
                 let bottom_idx = idx + width as usize;
-                buffer[bottom_idx].l += err_l * 0.25;
-                buffer[bottom_idx].a += err_a * 0.25;
-                buffer[bottom_idx].b += err_b * 0.25;
+                buffer[bottom_idx].l += err_l * (5.0 / 16.0);
+                buffer[bottom_idx].a += err_a * (5.0 / 16.0);
+                buffer[bottom_idx].b += err_b * (5.0 / 16.0);
+
+                // Bottom-right: 1/16
+                if x + 1 < width {
+                    let br_idx = idx + width as usize + 1;
+                    buffer[br_idx].l += err_l * (1.0 / 16.0);
+                    buffer[br_idx].a += err_a * (1.0 / 16.0);
+                    buffer[br_idx].b += err_b * (1.0 / 16.0);
+                }
             }
         }
     }
