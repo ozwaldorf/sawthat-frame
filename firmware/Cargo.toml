@@ -1,11 +1,11 @@
 [package]
 edition      = "2024"
-name         = "photopainter"
+name         = "sawthat-frame-firmware"
 rust-version = "1.88"
 version      = "0.1.0"
 
 [[bin]]
-name = "photopainter"
+name = "sawthat-frame-firmware"
 path = "./src/bin/main.rs"
 
 [dependencies]

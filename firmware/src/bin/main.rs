@@ -1,4 +1,4 @@
-//! PhotoPainter - ESP32-S3 E-Paper Photo Frame
+//! SawThat Frame Firmware - ESP32-S3 E-Paper Photo Frame
 //!
 //! Environment variables required:
 //! - WIFI_SSID: WiFi network name
@@ -44,11 +44,11 @@ use esp_radio::{
     Controller,
     wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice},
 };
-use photopainter::battery;
-use photopainter::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
-use photopainter::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
-use photopainter::framebuffer::Framebuffer;
-use photopainter::widget::{Orientation, WidgetData, MAX_ITEMS};
+use sawthat_frame_firmware::battery;
+use sawthat_frame_firmware::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
+use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
+use sawthat_frame_firmware::framebuffer::Framebuffer;
+use sawthat_frame_firmware::widget::{Orientation, WidgetData, MAX_ITEMS};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -299,7 +299,7 @@ async fn main(spawner: Spawner) -> ! {
     println!("RTOS started");
 
     // ==================== Power Management (AXP2101) ====================
-    // PhotoPainter uses AXP2101 PMIC to control display power
+    // SawThat Frame uses AXP2101 PMIC to control display power
     // I2C: SDA=GPIO47, SCL=GPIO48, Address=0x34
     println!("Initializing AXP2101 PMIC...");
 
@@ -340,7 +340,7 @@ async fn main(spawner: Spawner) -> ! {
     // PhotoPainter GPIO pins for 7.3" e-paper display
     // DC=GPIO8, CS=GPIO9, SCK=GPIO10, MOSI=GPIO11, RST=GPIO12, BUSY=GPIO13
 
-    // PhotoPainter uses SPI3 (not SPI2)
+    // SawThat Frame uses SPI3 (not SPI2)
     let spi = Spi::new(
         peripherals.SPI3,
         SpiConfig::default()

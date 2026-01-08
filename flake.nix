@@ -14,7 +14,7 @@
       {
         packages = {
           server = pkgs.rustPlatform.buildRustPackage {
-            pname = "concert-display-server";
+            pname = "sawthat-frame-server";
             version = "0.1.0";
 
             src = ./server;
@@ -22,8 +22,8 @@
             cargoLock.lockFile = ./server/Cargo.lock;
 
             meta = {
-              description = "Concert display server for e-paper widgets";
-              mainProgram = "concert-display-server";
+              description = "SawThat Frame server for e-paper widgets";
+              mainProgram = "sawthat-frame-server";
             };
           };
 
@@ -43,11 +43,11 @@
     // {
       nixosModules.default = { config, lib, pkgs, ... }:
         let
-          cfg = config.services.concert-display-server;
+          cfg = config.services.sawthat-frame-server;
         in
         {
-          options.services.concert-display-server = {
-            enable = lib.mkEnableOption "Concert Display server";
+          options.services.sawthat-frame-server = {
+            enable = lib.mkEnableOption "SawThat Frame server";
 
             port = lib.mkOption {
               type = lib.types.port;
@@ -64,7 +64,7 @@
             package = lib.mkOption {
               type = lib.types.package;
               default = self.packages.${pkgs.system}.server;
-              description = "The concert-display-server package to use";
+              description = "The sawthat-frame-server package to use";
             };
 
             openFirewall = lib.mkOption {
@@ -76,8 +76,8 @@
 
           config = lib.mkIf cfg.enable {
             networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
-            systemd.services.concert-display-server = {
-              description = "Concert Display Server";
+            systemd.services.sawthat-frame-server = {
+              description = "SawThat Frame Server";
               wantedBy = [ "multi-user.target" ];
               after = [ "network.target" ];
 
@@ -88,7 +88,7 @@
 
               serviceConfig = {
                 Type = "simple";
-                ExecStart = "${cfg.package}/bin/concert-display-server";
+                ExecStart = "${cfg.package}/bin/sawthat-frame-server";
                 Restart = "on-failure";
                 RestartSec = 5;
 
