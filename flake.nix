@@ -21,6 +21,12 @@
 
             cargoLock.lockFile = ./server/Cargo.lock;
 
+            nativeBuildInputs = [ pkgs.fontconfig ];
+
+            FONTCONFIG_FILE = pkgs.makeFontsConf {
+              fontDirectories = [ pkgs.ibm-plex ];
+            };
+
             meta = {
               description = "SawThat Frame server for e-paper widgets";
               mainProgram = "sawthat-frame-server";
