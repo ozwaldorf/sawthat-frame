@@ -11,6 +11,12 @@ const FONT_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/font.ttf"));
 const BLACK_INDEX: u8 = 0;
 const WHITE_INDEX: u8 = 1;
 
+/// Font size steps for band name (largest to smallest)
+const BAND_SIZES: &[f32] = &[48.0, 40.0, 32.0, 24.0, 20.0];
+
+/// Font size steps for venue (largest to smallest)
+const VENUE_SIZES: &[f32] = &[24.0, 20.0, 16.0];
+
 /// Concert info to render
 pub struct ConcertInfo {
     pub band_name: String,
@@ -31,21 +37,59 @@ pub fn render_concert_info_indexed(
     let font = FontRef::try_from_slice(FONT_DATA).expect("Failed to load font");
     let text_color = if is_light_bg { BLACK_INDEX } else { WHITE_INDEX };
 
-    // Band name - large, centered (40px)
-    let band_scale = PxScale::from(40.0);
-    let band_y = text_area_top + 4;
+    // Leave some horizontal padding (8px each side)
+    let max_width = width.saturating_sub(16) as f32;
+
+    // Band name - find largest font size that fits
+    let (band_scale, band_y_offset) = fit_text_size(&font, &info.band_name, max_width, BAND_SIZES);
+    let band_y = text_area_top + band_y_offset;
     draw_text_indexed_centered(indexed, width, &font, &info.band_name, band_scale, band_y, text_color);
 
-    // Date - medium (32px)
-    let date_scale = PxScale::from(32.0);
-    let date_y = band_y + 44;
+    // Calculate remaining space and position date/venue accordingly
+    let band_height = (band_scale.y * 1.1) as u32;
+
+    // Date - fixed size (24px)
+    let date_scale = PxScale::from(24.0);
+    let date_y = band_y + band_height;
     draw_text_indexed_centered(indexed, width, &font, &info.date, date_scale, date_y, text_color);
 
-    // Venue (24px)
-    let venue_scale = PxScale::from(24.0);
-    let venue_y = date_y + 36;
-    let venue_text = truncate_text(&info.venue, 35);
-    draw_text_indexed_centered(indexed, width, &font, &venue_text, venue_scale, venue_y, text_color);
+    // Venue - scale to fit if needed
+    let (venue_scale, _) = fit_text_size(&font, &info.venue, max_width, VENUE_SIZES);
+    let venue_y = date_y + 28;
+    draw_text_indexed_centered(indexed, width, &font, &info.venue, venue_scale, venue_y, text_color);
+}
+
+/// Find the largest font size that fits the text within max_width
+fn fit_text_size(font: &FontRef, text: &str, max_width: f32, sizes: &[f32]) -> (PxScale, u32) {
+    for &size in sizes {
+        let scale = PxScale::from(size);
+        let text_width = measure_text_width(font, text, scale);
+        if text_width <= max_width {
+            // Y offset decreases as font gets smaller to keep text vertically centered
+            let y_offset = match size as u32 {
+                48 => 0,
+                40 => 4,
+                32 => 8,
+                24 => 12,
+                _ => 16,
+            };
+            return (scale, y_offset);
+        }
+    }
+    // Fallback to smallest size
+    let smallest = sizes.last().copied().unwrap_or(20.0);
+    (PxScale::from(smallest), 16)
+}
+
+/// Measure the width of text at a given scale
+fn measure_text_width(font: &FontRef, text: &str, scale: PxScale) -> f32 {
+    let scaled_font = font.as_scaled(scale);
+    text.chars()
+        .map(|c| {
+            let glyph_id = font.glyph_id(c);
+            scaled_font.h_advance(glyph_id)
+        })
+        .sum()
 }
 
 /// Draw text centered horizontally onto indexed buffer
@@ -111,15 +155,5 @@ fn draw_text_indexed(
         }
 
         cursor_x += scaled_font.h_advance(glyph_id);
-    }
-}
-
-/// Truncate text to max characters, adding ellipsis if needed
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
-    } else {
-        let truncated: String = text.chars().take(max_chars - 3).collect();
-        format!("{}...", truncated)
     }
 }

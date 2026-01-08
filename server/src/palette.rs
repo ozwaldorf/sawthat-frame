@@ -213,74 +213,60 @@ pub struct DominantColor {
     pub is_light: bool,
 }
 
-/// Extract dominant color from an image, excluding the center region.
-/// First resizes to 50x50 using bilinear interpolation (like ossian.dev).
-/// Weights pixels toward the bottom of the image (where the gradient will blend).
-/// Returns the actual dominant color (dithering will approximate it).
+/// Extract dominant color from the bottom 20% of an image.
+/// Finds the top 3 most common colors and averages them in OKLab space.
 pub fn extract_dominant_color(img: &image::RgbImage) -> DominantColor {
     use image::imageops::FilterType;
     use std::collections::HashMap;
 
-    // Resize to 50x50 using bilinear (Triangle) filter for speed and natural color averaging
-    let small = image::imageops::resize(img, 50, 50, FilterType::Triangle);
-    let (width, height) = (50u32, 50u32);
+    // Resize to 100x100 using bilinear (Triangle) filter
+    let small = image::imageops::resize(img, 100, 100, FilterType::Triangle);
 
-    // Define center exclusion zone (middle 66%)
-    let margin_x = width / 6;
-    let margin_y = height / 6;
+    // Count colors in bottom 20% (last 20 rows)
+    let mut color_counts: HashMap<u32, (Oklab, u32)> = HashMap::new();
 
-    // Collect unique colors and their accumulated weights
-    // Key: RGB as u32, Value: (Oklab, accumulated_weight)
-    let mut color_weights: HashMap<u32, (Oklab, f32)> = HashMap::new();
-
-    for y in 0..height {
-        // Linear weight favoring bottom (where gradient blends)
-        let y_weight = (y + 1) as f32 / height as f32;
-
-        for x in 0..width {
-            // Skip center region (often contains text/subject)
-            if x >= margin_x && x < width - margin_x && y >= margin_y && y < height - margin_y {
-                continue;
-            }
-
+    for y in 80..100 {
+        for x in 0..100 {
             let pixel = small.get_pixel(x, y);
             let rgb_key = ((pixel[0] as u32) << 16) | ((pixel[1] as u32) << 8) | (pixel[2] as u32);
 
-            color_weights
+            color_counts
                 .entry(rgb_key)
-                .and_modify(|(_, w)| *w += y_weight)
+                .and_modify(|(_, count)| *count += 1)
                 .or_insert_with(|| {
                     let oklab = Oklab::from_rgb(pixel[0], pixel[1], pixel[2]);
-                    (oklab, y_weight)
+                    (oklab, 1)
                 });
         }
     }
 
-    // Weighted average in Oklab space with sharpness applied to accumulated weights
-    let sharpness = 4.0_f32;
+    // Get top 3 colors by count
+    let mut colors: Vec<_> = color_counts.into_values().collect();
+    colors.sort_by(|a, b| b.1.cmp(&a.1));
+    let top3: Vec<_> = colors.into_iter().take(3).collect();
+
+    // Average top 3 in OKLab space (weighted by count)
     let mut sum_l = 0.0_f32;
     let mut sum_a = 0.0_f32;
     let mut sum_b = 0.0_f32;
-    let mut total_weight = 0.0_f32;
+    let mut total_count = 0u32;
 
-    for (oklab, weight) in color_weights.values() {
-        let w = weight.powf(sharpness);
-        sum_l += oklab.l * w;
-        sum_a += oklab.a * w;
-        sum_b += oklab.b * w;
-        total_weight += w;
+    for (oklab, count) in &top3 {
+        sum_l += oklab.l * *count as f32;
+        sum_a += oklab.a * *count as f32;
+        sum_b += oklab.b * *count as f32;
+        total_count += count;
     }
 
-    // Compute weighted average
-    let avg_l = sum_l / total_weight;
-    let avg_a = sum_a / total_weight;
-    let avg_b = sum_b / total_weight;
+    let avg_l = sum_l / total_count as f32;
+    let avg_a = sum_a / total_count as f32;
+    let avg_b = sum_b / total_count as f32;
 
     // Convert back to RGB
     let oklab = Oklab::new(avg_l, avg_a, avg_b);
     let rgb = oklab.to_rgb();
 
-    // Lightness threshold for text contrast (L > 0.6 in Oklab)
+    // Lightness threshold for text contrast (L > 0.6 in OKLab)
     let is_light = avg_l > 0.6;
 
     DominantColor {
