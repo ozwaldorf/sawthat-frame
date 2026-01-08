@@ -9,7 +9,14 @@ Built on the [Waveshare ESP32-S3-PhotoPainter](https://www.amazon.com/dp/B0FWRJD
 - GPIO Buttons and LEDs
 - (unused) Speaker, microphones
 
-## API Examples
+## Examples
+
+### Physical Device
+
+<img height="300" alt="image" src="https://github.com/user-attachments/assets/1339362c-3e16-41e8-9678-fdbbde66b622" />
+<img height="300" alt="image" src="https://github.com/user-attachments/assets/48a749e5-eb84-4dd3-bde5-b50005cf1192" />
+
+### API Examples
 
 <img width="200" alt="image" src="https://github.com/user-attachments/assets/fec53b02-4f2d-4364-ad80-8443322e50a5" />
 <img width="200" alt="image" src="https://github.com/user-attachments/assets/3dbf4be8-1f17-4b98-9662-7f4bce0b97fc" />
@@ -34,21 +41,23 @@ A nix dev shell can be used for all required build tools:
 nix develop
 ```
 
-### Server
+### Running the server
 
 The server provides the widget API for data fetching and image processing
 
-#### Source
+#### From source
+
+The server can be ran from 
 
 ```bash
 cd server
 PORT=3000 cargo run -r
 ```
 
-#### Nix
+#### Using nix
 
 ```bash
-nix run
+nix run .
 ```
 
 #### NixOS Module
