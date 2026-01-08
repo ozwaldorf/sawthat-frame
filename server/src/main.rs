@@ -39,8 +39,11 @@ struct AppState {
         description = "Widget API and image processing for concert display e-paper frame",
         version = "0.1.0"
     ),
-    paths(health, get_widget_data, get_widget_image),
-    components(schemas(WidgetItem, WidgetName, Orientation))
+    tags(
+        (name = "Concerts", description = "Concert history widget endpoints")
+    ),
+    paths(health, get_concerts_data, get_concerts_image),
+    components(schemas(WidgetItem, Orientation))
 )]
 struct ApiDoc;
 
@@ -66,11 +69,8 @@ async fn main() {
     // Build router
     let app = Router::new()
         .route("/health", get(health))
-        .route("/api/widget/{widget_name}", get(get_widget_data))
-        .route(
-            "/api/widget/{widget_name}/{orientation}/{*image_path}",
-            get(get_widget_image),
-        )
+        .route("/concerts", get(get_concerts_data))
+        .route("/concerts/{orientation}/{*image_path}", get(get_concerts_image))
         .merge(Scalar::with_url("/docs", ApiDoc::openapi()))
         .route("/openapi.json", get(openapi_json))
         .layer(CorsLayer::permissive())
@@ -107,25 +107,19 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
 }
 
-/// Get widget data
+/// Get concerts data
 ///
-/// Returns a list of widget items for the specified widget.
+/// Returns a list of concert items to display.
 #[utoipa::path(
     get,
-    path = "/api/widget/{widget_name}",
-    params(
-        ("widget_name" = WidgetName, Path, description = "Name of the widget")
-    ),
+    path = "/concerts",
+    tag = "Concerts",
     responses(
-        (status = 200, description = "Widget data", body = Vec<WidgetItem>),
-        (status = 400, description = "Invalid widget name")
+        (status = 200, description = "Concert data", body = Vec<WidgetItem>)
     )
 )]
-async fn get_widget_data(
-    State(state): State<AppState>,
-    Path(widget_name): Path<WidgetName>,
-) -> impl IntoResponse {
-    let source = state.registry.get(widget_name);
+async fn get_concerts_data(State(state): State<AppState>) -> impl IntoResponse {
+    let source = state.registry.get(WidgetName::Concerts);
     let items = source.fetch_data().await;
     let cache_policy = source.data_cache_policy();
 
@@ -138,35 +132,34 @@ async fn get_widget_data(
     }
 }
 
-/// Get processed widget image
+/// Get processed concert image
 ///
-/// Returns a processed PNG image for the specified widget item.
+/// Returns a processed PNG image for a concert item.
 #[utoipa::path(
     get,
-    path = "/api/widget/{widget_name}/{orientation}/{image_path}",
+    path = "/concerts/{orientation}/{image_path}",
+    tag = "Concerts",
     params(
-        ("widget_name" = WidgetName, Path, description = "Name of the widget"),
         ("orientation" = Orientation, Path, description = "Display orientation: horiz (400x480 or 800x480) or vert (480x800)"),
         ("image_path" = String, Path, description = "Path to the image resource")
     ),
     responses(
         (status = 200, description = "Processed image", content_type = "image/png"),
-        (status = 400, description = "Invalid widget name, orientation, or path"),
+        (status = 400, description = "Invalid orientation or path"),
         (status = 404, description = "Image not found")
     )
 )]
-async fn get_widget_image(
+async fn get_concerts_image(
     State(state): State<AppState>,
-    Path((widget_name, orientation, image_path)): Path<(WidgetName, Orientation, String)>,
+    Path((orientation, image_path)): Path<(Orientation, String)>,
 ) -> Result<Response, AppError> {
     tracing::info!(
-        "Image request: widget={:?}, orientation={:?}, path={}",
-        widget_name,
+        "Image request: concerts, orientation={:?}, path={}",
         orientation,
         image_path
     );
 
-    let source = state.registry.get(widget_name);
+    let source = state.registry.get(WidgetName::Concerts);
     let png_data = source.fetch_image(&image_path, orientation).await?;
 
     Ok((
