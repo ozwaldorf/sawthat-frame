@@ -1,6 +1,6 @@
 # SawThat Frame
 
-E-paper display frame for concert/album art, powered by an ESP32-S3 with a .
+E-paper display frame for concert/album art data pulled from [sawthat.band](https://sawthat.band).
 
 Built on the [Waveshare ESP32-S3-PhotoPainter](https://www.amazon.com/dp/B0FWRJD8HZ):
 - 7.3" Spectra 6 color e-paper display
@@ -36,14 +36,22 @@ nix develop
 
 ### Server
 
-The server provides the widget API and image processing.
+The server provides the widget API for data fetching and image processing
+
+#### Source
 
 ```bash
 cd server
 PORT=3000 cargo run -r
 ```
 
-#### NixOS
+#### Nix
+
+```bash
+nix run
+```
+
+#### NixOS Module
 
 For nixos systems, a module is provided to run the server as a systemd service. 
 Add the following flake input and NixOS configuration:
