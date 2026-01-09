@@ -131,6 +131,7 @@ impl SleepState {
         self.magic = 0;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn save(
         &mut self,
         index: usize,
@@ -235,11 +236,15 @@ async fn main(spawner: Spawner) -> ! {
     let mut delay = Delay;
 
     // Check sleep state to get current orientation
-    let resuming = unsafe { (SLEEP_STATE).is_valid() };
-    let mut orientation = if resuming {
-        unsafe { (SLEEP_STATE).get_orientation() }
-    } else {
-        Orientation::default()
+    let (resuming, mut orientation) = unsafe {
+        let state = &raw const SLEEP_STATE;
+        let valid = (*state).is_valid();
+        let orient = if valid {
+            (*state).get_orientation()
+        } else {
+            Orientation::default()
+        };
+        (valid, orient)
     };
 
     // Track if we should advance to next item (button tap without hold)
@@ -558,13 +563,14 @@ async fn main(spawner: Spawner) -> ! {
     display::shuffle_items(&mut items, shuffle_seed);
 
     // Now check if data matches (after shuffling, so cache_keys are in same order)
-    let data_matches = resuming && unsafe { (SLEEP_STATE).matches_data(&items) };
-
-    // Determine if we can use partial refresh
-    let saved_orientation = if resuming {
-        unsafe { (SLEEP_STATE).get_orientation() }
+    // Also get saved orientation for partial refresh check
+    let (data_matches, saved_orientation) = if resuming {
+        unsafe {
+            let state = &raw const SLEEP_STATE;
+            ((*state).matches_data(&items), (*state).get_orientation())
+        }
     } else {
-        Orientation::Horizontal
+        (false, Orientation::Horizontal)
     };
 
     let can_partial = data_matches
@@ -638,10 +644,9 @@ async fn main(spawner: Spawner) -> ! {
             // Check cache first
             let png_len = if sd_cache.has_image(item_path, Orientation::Horizontal) {
                 println!("Cache HIT: {}", item_path);
-                match sd_cache.read_image(item_path, Orientation::Horizontal, &mut *png_buf) {
-                    Ok(len) => len,
-                    Err(_) => 0,
-                }
+                sd_cache
+                    .read_image(item_path, Orientation::Horizontal, &mut *png_buf)
+                    .unwrap_or_default()
             } else {
                 println!("Cache MISS: {}", item_path);
                 match display::fetch_png(
@@ -768,10 +773,9 @@ async fn main(spawner: Spawner) -> ! {
                 // Check cache first
                 let png_len = if sd_cache.has_image(item_path, orientation) {
                     println!("Cache HIT: {}", item_path);
-                    match sd_cache.read_image(item_path, orientation, &mut *png_buf) {
-                        Ok(len) => len,
-                        Err(_) => 0,
-                    }
+                    sd_cache
+                        .read_image(item_path, orientation, &mut *png_buf)
+                        .unwrap_or_default()
                 } else {
                     println!("Cache MISS: {}", item_path);
                     // Fetch from network
@@ -1031,8 +1035,7 @@ async fn main(spawner: Spawner) -> ! {
     println!("Disconnecting WiFi for deep sleep...");
     wifi_disconnect(&mut controller).await;
 
-    // Drop the Input and reclaim GPIO4 for deep sleep wake source
-    drop(key_input);
+    // Reclaim GPIO4 for deep sleep wake source
     let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
 
     // Enter deep sleep
