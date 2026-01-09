@@ -1,0 +1,8 @@
+# SawThat Frame Custom Partition Table for 16MB Flash
+# Name,        Type, SubType,  Offset,    Size,      Flags
+nvs,           data, nvs,      0x9000,    0x6000,
+phy_init,      data, phy,      0xf000,    0x1000,
+factory,       app,  factory,  0x10000,   0x200000,
+widget_data,   data, 0x40,     0x210000,  0x2000,
+cache_index,   data, 0x41,     0x212000,  0xe000,
+cache_data,    data, 0x42,     0x220000,  0xde0000,
