@@ -119,48 +119,95 @@ cd firmware
 cargo run --release
 ```
 
-## Project Lifecycle
+## Firmware Lifecycle
 
 ```mermaid
-flowchart TD
-    subgraph Firmware["ESP32-S3-PhotoPainter"]
-        Power(Power On) ==> Boot
-        style Power fill:green
-        Boot[Device Boot] ==> Init
-        Init[Initialize Components] ==> Wifi 
-        Wifi[Connect to WIFI] ==> Orient 
+---
+config:
+  layout: elk
+  look: handDrawn
+---
+stateDiagram-v2
+    PowerOn --> Boot
 
-        subgraph Runtime
-            Orient{Next image or<br>flip orientation} ==> Fetch
-            Fetch[Fetch Widget Data] ==> Update
-            Update[Display Update] ==> Input
-            Input{Sleep Timer} -.->|button pressed/held| Orient
-        end
+    state Boot {
+        direction LR
+        InitSD: Init SD card
+        InitSD --> LoadJson: Load widget.json
+    }
 
-        Sleep[Deep Sleep] ==>|15 minute timer or<br>button pressed/held| Boot
-        style Sleep fill:#555
-        Input ==>|30 second timeout| Sleep
-    end
+    Boot --> CacheCheck: Check image cache
 
+    state CacheCheck <<choice>>
+    CacheCheck --> ReadSD: Cached
+    CacheCheck --> Init: Not cached
 
-    subgraph Server["Server API"]
-        Concerts["GET /concerts"]
-        Image["GET /concerts/{orient}/{path}"]
-    end
+    state Init {
+        direction LR
+        [*] --> Connect
+        Connect --> FetchJson: Fetch widget.json
+        FetchJson --> FetchPNG: Fetch PNG
+        FetchPNG --> StorePNG: Store to SD
+    }
 
-    subgraph STB["SawThatBand API"]
-        Upstream["GET /api/bands"]
-    end
+    ReadSD --> Display
+    Init --> Display
 
-    subgraph Deezer["Deezer API"]
-        ArtistId["GET /search/artist"]
-        Albums["GET /artist/{id}/albums"]
-        Images["CDN Images"]
-    end
+    state Display {
+        [*] --> Refresh: E-paper refresh (~15s)
+        [*] --> Sync
 
-    Fetch -->|Concert list data| Concerts
-    Concerts <-->|JSON Data| STB
-    
-    Update -->|Indexed PNGs| Image
-    Image <-->|JSON Data, CDN Images| Deezer
+        state "Background Sync" as Sync {
+            direction LR
+            [*] --> WiFi: Connect
+            WiFi --> FetchFresh: Fetch fresh data
+            FetchFresh --> Update: Update widget.json
+            Update --> Cleanup: Remove stale PNGs
+            Cleanup --> Prefetch: Prefetch next PNG
+        }
+
+        Refresh --> [*]
+        Sync --> [*]
+    }
+
+    Display --> Input: 10s button wait
+
+    state Input <<choice>>
+    Input --> CacheCheck: Button tap
+    Input --> Orientation: Button hold
+    Input --> Sleep: Timeout
+
+    Orientation --> CacheCheck: Toggle horiz/vert
+
+    Sleep --> Boot: 15min timer or button
+```
+
+## Network Interactions
+
+```mermaid
+sequenceDiagram
+    participant FW as Firmware
+    participant API as Server API
+    participant ST as SawThat.band
+    participant DZ as Deezer
+
+    Note over FW,DZ: Fetch Widget Data
+    FW->>API: GET /concerts
+    API->>ST: GET /api/bands/{user_id}
+    ST-->>API: Band list + concerts JSON
+    Note over API: Compute concert list
+    API-->>FW: ["2024-06-15-band-id", ...]
+
+    Note over FW,DZ: Fetch Image (cache miss)
+    FW->>API: GET /concerts/horiz/2024-06-15-band-id
+    API->>DZ: GET /search/artist?q={band}
+    DZ-->>API: Artist ID
+    API->>DZ: GET /artist/{id}/albums
+    DZ-->>API: Album list with dates
+    API->>DZ: GET CDN image (closest album)
+    DZ-->>API: Album art JPEG
+    Note over API: Render widget PNG<br/>(dither, palette, text)
+    API-->>FW: PNG image
+
+    Note over FW: Cache and display
 ```
