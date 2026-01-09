@@ -9,8 +9,9 @@
 //! 6. Render concert info text (black or white based on background)
 //! 7. Encode as indexed PNG
 
+use crate::cache::PrimaryColor;
 use crate::error::AppError;
-use crate::palette::{extract_dominant_color, Oklab, OklabPalette, PaletteIndex, PNG_PALETTE};
+use crate::palette::{extract_dominant_color, Oklab, OklabPalette, PNG_PALETTE};
 use crate::text::{self, ConcertInfo};
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use png::{BitDepth, ColorType, Encoder};
@@ -81,7 +82,7 @@ fn apply_saturation(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let h = if h < 0.0 { h + 6.0 } else { h };
 
     // Calculate saturation
-    let s = if l < 1e-6 || l > 1.0 - 1e-6 {
+    let s = if !(1e-6..=1.0 - 1e-6).contains(&l) {
         0.0
     } else {
         delta / (1.0 - (2.0 * l - 1.0).abs())
@@ -141,31 +142,43 @@ fn apply_adjustments(img: &mut RgbImage) {
 /// Process a source image for the e-paper display
 ///
 /// Pipeline:
-/// 1. Extract dominant color from original image edges
-/// 2. Resize to cover width (fill width, center crop any height overflow)
-/// 3. Apply adjustments: exposure (0.8), saturation (2.0), s-curve
-/// 4. Compose RGB canvas: image + gradient transition + solid color text area
-/// 5. Apply Floyd-Steinberg dithering in OKLab space to 6-color palette
-/// 6. Render concert info text (black/white based on background lightness)
-/// 7. Encode as indexed PNG
-pub fn process_image(
+/// Extract primary color from image bytes
+///
+/// Returns the dominant color from the bottom of the image (for text background).
+pub fn extract_primary_color(image_data: &[u8]) -> Result<PrimaryColor, AppError> {
+    let img = image::load_from_memory(image_data)
+        .map_err(|e| AppError::ImageProcessing(format!("Failed to decode image: {}", e)))?;
+
+    let dominant = extract_dominant_color(&img.to_rgb8());
+
+    Ok(PrimaryColor {
+        r: dominant.r,
+        g: dominant.g,
+        b: dominant.b,
+        is_light: dominant.is_light,
+    })
+}
+
+/// Process image with pre-extracted primary color
+///
+/// Use this when the color has already been extracted and cached.
+pub fn process_image_with_color(
     image_data: &[u8],
     target_width: u32,
     target_height: u32,
     concert_info: Option<&ConcertInfo>,
+    color: &PrimaryColor,
 ) -> Result<Vec<u8>, AppError> {
     // Decode source image
     let img = image::load_from_memory(image_data)
         .map_err(|e| AppError::ImageProcessing(format!("Failed to decode image: {}", e)))?;
 
-    // 1. Extract dominant color from original image (before resize/adjustments)
-    let dominant = extract_dominant_color(&img.to_rgb8());
     tracing::info!(
-        "Extracted dominant color: RGB({}, {}, {}), light_bg: {}",
-        dominant.r,
-        dominant.g,
-        dominant.b,
-        dominant.is_light
+        "Processing with color: RGB({}, {}, {}), light_bg: {}",
+        color.r,
+        color.g,
+        color.b,
+        color.is_light
     );
 
     // Calculate image area (leave room for text)
@@ -183,9 +196,9 @@ pub fn process_image(
         target_width,
         target_height,
         image_area_height,
-        dominant.r,
-        dominant.g,
-        dominant.b,
+        color.r,
+        color.g,
+        color.b,
     );
 
     // 5. Apply Floyd-Steinberg dithering to entire canvas
@@ -198,7 +211,7 @@ pub fn process_image(
             target_width,
             info,
             image_area_height,
-            dominant.is_light,
+            color.is_light,
         );
     }
 
@@ -396,6 +409,7 @@ fn encode_indexed_png(indexed: &[u8], width: u32, height: u32) -> Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::palette::PaletteIndex;
 
     #[test]
     fn test_nearest_color() {

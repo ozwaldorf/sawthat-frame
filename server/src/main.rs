@@ -1,3 +1,4 @@
+mod cache;
 mod datasource;
 mod deezer;
 mod error;

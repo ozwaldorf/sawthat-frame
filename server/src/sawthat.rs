@@ -5,7 +5,9 @@
 
 use reqwest::Client;
 use serde::Deserialize;
+use std::sync::Arc;
 
+use crate::cache::{ConcertCache, ConcertEntry};
 use crate::deezer;
 use crate::error::AppError;
 use crate::image_processing;
@@ -103,23 +105,139 @@ pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData 
 
 /// Fetch and process an image for a band
 ///
-/// Tries to find album art from Deezer matching the concert date,
-/// falls back to the band's Spotify picture if not found.
+/// Uses cached data when available. Caches:
+/// - Resolved image URL (Deezer or Spotify fallback)
+/// - Source image bytes
+/// - Primary color
+/// - Rendered images per orientation
 pub async fn fetch_band_image(
     client: &Client,
     bands: &[SawThatBand],
     band_id: &str,
     date: Option<&str>,
     orientation: Orientation,
+    cache_key: &str,
+    cache: &ConcertCache,
 ) -> Result<Vec<u8>, AppError> {
-    // Find the band
+    // Check if we have a cached entry
+    if let Some(entry) = cache.get_concert(cache_key).await {
+        // Check if we have this orientation's image
+        if let Some(cached_image) = entry.get_image(orientation) {
+            tracing::debug!(
+                "Using fully cached image for {} ({:?})",
+                cache_key,
+                orientation
+            );
+            return Ok((**cached_image).clone());
+        }
+
+        // We have cached data but need to render this orientation
+        tracing::info!(
+            "Rendering {:?} for {} using cached data",
+            orientation,
+            cache_key
+        );
+        let (target_width, target_height) = orientation.dimensions(WidgetWidth::Half);
+        let rendered = image_processing::process_image_with_color(
+            &entry.source_image,
+            target_width,
+            target_height,
+            Some(&ConcertInfo {
+                band_name: entry.band_name.clone(),
+                date: entry.formatted_date.clone(),
+                venue: entry.venue.clone(),
+            }),
+            &entry.primary_color,
+        )?;
+
+        // Cache this orientation
+        cache
+            .set_concert_image(cache_key, orientation, Arc::new(rendered.clone()))
+            .await;
+
+        return Ok(rendered);
+    }
+
+    // No cached entry - fetch everything from scratch
     let band = bands
         .iter()
         .find(|b| b.id == band_id)
         .ok_or_else(|| AppError::BandNotFound(band_id.to_string()))?;
 
-    // Try to get album art from Deezer if we have a date
-    let image_url = if let Some(concert_date) = date {
+    // Resolve image URL (Deezer or fallback)
+    let image_url = resolve_image_url(client, band, date).await;
+
+    // Fetch the source image
+    tracing::info!("Fetching source image from: {}", image_url);
+    let response = client
+        .get(&image_url)
+        .header("Accept", "image/*")
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(AppError::ExternalApi(format!(
+            "Failed to fetch image: {}",
+            response.status()
+        )));
+    }
+    let source_image = Arc::new(response.bytes().await?.to_vec());
+
+    // Extract primary color
+    let primary_color = image_processing::extract_primary_color(&source_image)?;
+
+    // Build concert info
+    let (formatted_date, venue) = date
+        .and_then(|d| {
+            band.concerts
+                .iter()
+                .find(|c| c.date == d)
+                .map(|c| (format_date(&c.date), c.location.clone()))
+        })
+        .unwrap_or_else(|| ("".to_string(), "".to_string()));
+
+    // Create and cache the entry data
+    cache
+        .set_or_update_concert(
+            cache_key.to_string(),
+            ConcertEntry {
+                band_name: band.band.clone(),
+                venue: venue.clone(),
+                formatted_date: formatted_date.clone(),
+                source_image: source_image.clone(),
+                primary_color,
+                image_horiz: None,
+                image_vert: None,
+            },
+        )
+        .await;
+
+    // Render the image
+    let (target_width, target_height) = orientation.dimensions(WidgetWidth::Half);
+    let rendered = image_processing::process_image_with_color(
+        &source_image,
+        target_width,
+        target_height,
+        Some(&ConcertInfo {
+            band_name: band.band.clone(),
+            date: formatted_date.clone(),
+            venue: venue.clone(),
+        }),
+        &primary_color,
+    )?;
+
+    // Add the rendered image
+    cache
+        .set_concert_image(cache_key, orientation, Arc::new(rendered.clone()))
+        .await;
+
+    Ok(rendered)
+}
+
+/// Resolve the image URL for a band/concert
+///
+/// Tries Deezer album art first, falls back to Spotify picture.
+async fn resolve_image_url(client: &Client, band: &SawThatBand, date: Option<&str>) -> String {
+    if let Some(concert_date) = date {
         match deezer::fetch_album_art_for_concert(client, &band.band, concert_date).await {
             Ok(Some(url)) => {
                 tracing::info!(
@@ -128,7 +246,7 @@ pub async fn fetch_band_image(
                     concert_date,
                     url
                 );
-                url
+                return url;
             }
             Ok(None) => {
                 tracing::info!(
@@ -136,7 +254,6 @@ pub async fn fetch_band_image(
                     band.band,
                     concert_date
                 );
-                band.picture.clone()
             }
             Err(e) => {
                 tracing::warn!(
@@ -145,57 +262,13 @@ pub async fn fetch_band_image(
                     concert_date,
                     e
                 );
-                band.picture.clone()
             }
         }
     } else {
         tracing::info!("No date provided for {}, using Spotify picture", band.band);
-        band.picture.clone()
-    };
-
-    tracing::info!("Fetching image for band: {} from {}", band.band, image_url);
-
-    // Fetch the image
-    let response = client
-        .get(&image_url)
-        .header("Accept", "image/*")
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(AppError::ExternalApi(format!(
-            "Failed to fetch image: {}",
-            response.status()
-        )));
     }
 
-    let image_data = response.bytes().await?;
-
-    // Build concert info for text rendering
-    let concert_info = date.and_then(|d| {
-        // Find the concert matching this date
-        band.concerts.iter().find(|c| c.date == d).map(|concert| {
-            // Format date from DD-MM-YYYY to more readable format
-            let formatted_date = format_date(&concert.date);
-            ConcertInfo {
-                band_name: band.band.clone(),
-                date: formatted_date,
-                venue: concert.location.clone(),
-            }
-        })
-    });
-
-    // Get dimensions based on orientation (using Half width as default)
-    let (target_width, target_height) = orientation.dimensions(WidgetWidth::Half);
-
-    let processed = image_processing::process_image(
-        &image_data,
-        target_width,
-        target_height,
-        concert_info.as_ref(),
-    )?;
-
-    Ok(processed)
+    band.picture.clone()
 }
 
 /// Format date from DD-MM-YYYY to "Month DDth, YYYY" (e.g., "July 17th, 2025")
