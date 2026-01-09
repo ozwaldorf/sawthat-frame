@@ -250,14 +250,27 @@ async fn main(spawner: Spawner) -> ! {
 
     // Track if we should advance to next item (button tap without hold)
     let mut advance_item = false;
+    // Track if orientation was changed during boot (to save to SD card later)
+    let mut orientation_changed = false;
 
     if button_wake {
-        // Button caused wake - check if held for 500ms total (boot takes ~200ms)
-        delay.delay_ms(300);
+        // Button caused wake - poll every 50ms to detect hold vs tap
+        let mut hold_time_ms: u32 = 0;
+        const HOLD_THRESHOLD_MS: u32 = 500;
 
-        if key_input.is_low() {
-            // Button held - toggle orientation
+        // Poll button state every 50ms
+        while key_input.is_low() {
+            delay.delay_ms(50);
+            hold_time_ms += 50;
+            if hold_time_ms >= HOLD_THRESHOLD_MS {
+                break;
+            }
+        }
+
+        if hold_time_ms >= HOLD_THRESHOLD_MS {
+            // Button held >= 500ms - toggle orientation
             orientation = orientation.toggle();
+            orientation_changed = true;
 
             // Flash LED 3 times for rotation
             for _ in 0..3 {
@@ -272,7 +285,7 @@ async fn main(spawner: Spawner) -> ! {
                 delay.delay_ms(50);
             }
         } else {
-            // Button tap - advance to next item
+            // Button released before 500ms - advance to next item
             advance_item = true;
 
             // Flash LED 1 time for next item
@@ -346,6 +359,18 @@ async fn main(spawner: Spawner) -> ! {
         "Cached widget data: {}",
         if has_cached_data { "found" } else { "not found" }
     );
+
+    // Handle orientation persistence
+    if orientation_changed {
+        // Orientation was changed during boot button hold - save to SD card
+        if let Err(e) = sd_cache.store_orientation(orientation) {
+            println!("Failed to store orientation: {:?}", e);
+        }
+    } else if let Some(cached_orient) = sd_cache.load_orientation() {
+        // Load orientation from SD card (persistent across power cycles)
+        orientation = cached_orient;
+        println!("Using cached orientation: {:?}", orientation);
+    }
 
     // ==================== Power Management (AXP2101) ====================
     // SawThat Frame uses AXP2101 PMIC to control display power
@@ -1071,16 +1096,29 @@ async fn main(spawner: Spawner) -> ! {
         // Wait 10s for button input before deep sleep
         println!("Press KEY within 10s (tap=next item, hold=rotate)...");
         let mut should_redisplay = false;
+        const HOLD_THRESHOLD_MS: u32 = 500;
         for _ in 0..100 {
             if key_input.is_low() {
-                println!("KEY pressed, checking for 500ms hold...");
-                // Wait 500ms and check if button is still held
-                delay.delay_ms(500);
+                println!("KEY pressed, polling for hold...");
 
-                if key_input.is_low() {
-                    // Button held - toggle orientation
+                // Poll every 50ms to detect hold vs tap
+                let mut hold_time_ms: u32 = 0;
+                while key_input.is_low() {
+                    Timer::after(Duration::from_millis(50)).await;
+                    hold_time_ms += 50;
+                    if hold_time_ms >= HOLD_THRESHOLD_MS {
+                        break;
+                    }
+                }
+
+                if hold_time_ms >= HOLD_THRESHOLD_MS {
+                    // Button held >= 500ms - toggle orientation
                     println!("Button held! Toggling orientation...");
                     orientation = orientation.toggle();
+                    // Save to SD card
+                    if let Err(e) = sd_cache.store_orientation(orientation) {
+                        println!("Failed to store orientation: {:?}", e);
+                    }
                     // Reset partial mode on orientation change
                     use_partial = false;
                     slot_items = [0, 0];
@@ -1101,8 +1139,7 @@ async fn main(spawner: Spawner) -> ! {
 
                     println!("Re-displaying with orientation: {:?}", orientation);
                 } else {
-                    // Button released - show next item
-                    // Index already incremented by previous display, just trigger redisplay
+                    // Button released before 500ms - show next item
                     println!("Button tap, next item (index={})", index);
 
                     // Flash LED2 1 time to confirm next item

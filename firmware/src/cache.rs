@@ -31,6 +31,9 @@ const VERT_DIR: &str = "vert";
 /// Widget data filename (JSON array of item paths) - 8.3 format
 const WIDGET_FILE: &str = "WIDGET.JSN";
 
+/// Orientation state filename - 8.3 format
+const ORIENT_FILE: &str = "ORIENT.DAT";
+
 /// Dummy time source (SD cards need timestamps but we don't care)
 pub struct DummyTimesource;
 
@@ -357,6 +360,48 @@ where
         file.write(b"]").map_err(|_| CacheError::Write)?;
 
         println!("Stored {} widget items to cache JSON", items.len());
+        Ok(())
+    }
+
+    /// Load orientation from cache
+    pub fn load_orientation(&mut self) -> Option<Orientation> {
+        let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
+        let mut root_dir = volume.open_root_dir().ok()?;
+        let mut concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
+
+        let mut file = concerts_dir
+            .open_file_in_dir(ORIENT_FILE, Mode::ReadOnly)
+            .ok()?;
+
+        let mut buf = [0u8; 1];
+        file.read(&mut buf).ok()?;
+
+        let orientation = Orientation::from_u8(buf[0]);
+        println!("Loaded orientation from cache: {:?}", orientation);
+        Some(orientation)
+    }
+
+    /// Store orientation to cache
+    pub fn store_orientation(&mut self, orientation: Orientation) -> Result<(), CacheError> {
+        let mut volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| CacheError::Filesystem)?;
+
+        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+
+        let mut concerts_dir = root_dir
+            .open_dir(ROOT_DIR)
+            .map_err(|_| CacheError::Filesystem)?;
+
+        let mut file = concerts_dir
+            .open_file_in_dir(ORIENT_FILE, Mode::ReadWriteCreateOrTruncate)
+            .map_err(|_| CacheError::Write)?;
+
+        file.write(&[orientation as u8])
+            .map_err(|_| CacheError::Write)?;
+
+        println!("Stored orientation to cache: {:?}", orientation);
         Ok(())
     }
 
