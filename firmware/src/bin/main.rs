@@ -730,10 +730,10 @@ async fn main(spawner: Spawner) -> ! {
         println!("Putting display to sleep...");
         epd.sleep(&mut delay).expect("Failed to sleep display");
 
-        // Wait 30s for button input before deep sleep
-        println!("Press KEY within 30s (tap=next item, hold=rotate)...");
+        // Wait 10s for button input before deep sleep
+        println!("Press KEY within 10s (tap=next item, hold=rotate)...");
         let mut should_redisplay = false;
-        for _ in 0..300 {
+        for _ in 0..100 {
             if key_input.is_low() {
                 println!("KEY pressed, checking for 500ms hold...");
                 // Wait 500ms and check if button is still held
