@@ -8,6 +8,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use core::time::Duration as CoreDuration;
 
@@ -45,6 +47,7 @@ use esp_radio::{
     wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice},
 };
 use sawthat_frame_firmware::battery;
+use sawthat_frame_firmware::cache::SdCache;
 use sawthat_frame_firmware::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
@@ -300,6 +303,44 @@ async fn main(spawner: Spawner) -> ! {
     );
     println!("RTOS started");
 
+    // ==================== SD Card Cache Initialization ====================
+    // SD card SPI pins: CS=GPIO38, CLK=GPIO39, MISO=GPIO40, MOSI=GPIO41
+    println!("Initializing SD card cache...");
+
+    let sd_spi = Spi::new(
+        peripherals.SPI2,
+        SpiConfig::default()
+            .with_frequency(Rate::from_mhz(20))
+            .with_mode(Mode::_0),
+    )
+    .expect("SD SPI init failed")
+    .with_sck(peripherals.GPIO39)
+    .with_mosi(peripherals.GPIO41)
+    .with_miso(peripherals.GPIO40);
+
+    let sd_cs = Output::new(peripherals.GPIO38, Level::High, OutputConfig::default());
+    let sd_spi_device = ExclusiveDevice::new_no_delay(sd_spi, sd_cs).unwrap();
+
+    let mut sd_cache = match SdCache::new(sd_spi_device, delay.clone()) {
+        Ok(cache) => cache,
+        Err(e) => {
+            println!("SD card init failed: {:?}", e);
+            panic!("SD card required for caching");
+        }
+    };
+
+    if let Err(e) = sd_cache.init() {
+        println!("SD cache init error: {:?}", e);
+    }
+
+    // Try to load widget data from cache (for cache-first boot)
+    let cached_items = sd_cache.load_widget_data();
+    let has_cached_data = cached_items.is_some();
+    println!(
+        "Cached widget data: {}",
+        if has_cached_data { "found" } else { "not found" }
+    );
+
     // ==================== Power Management (AXP2101) ====================
     // SawThat Frame uses AXP2101 PMIC to control display power
     // I2C: SDA=GPIO47, SCL=GPIO48, Address=0x34
@@ -460,26 +501,38 @@ async fn main(spawner: Spawner) -> ! {
     let tcp_client = TcpClient::new(stack, tcp_state);
     let dns_socket = DnsSocket::new(stack);
 
-    // Fetch widget data (with retries)
+    // Fetch widget data (use cache if available, then refresh from network)
     println!("Fetching widget data...");
-    let mut items: WidgetData = loop {
-        start_blink();
-        let result = display::fetch_widget_data(
-            &tcp_client,
-            &dns_socket,
-            &mut tls_read_buf,
-            &mut tls_write_buf,
-            SERVER_URL,
-            "concerts",
-        )
-        .await;
-        stop_blink();
+    let mut items: WidgetData = if let Some(cached) = cached_items {
+        println!("Using cached widget data ({} items)", cached.len());
+        cached
+    } else {
+        // No cache - must fetch from network
+        loop {
+            start_blink();
+            let result = display::fetch_widget_data(
+                &tcp_client,
+                &dns_socket,
+                &mut tls_read_buf,
+                &mut tls_write_buf,
+                SERVER_URL,
+                "concerts",
+            )
+            .await;
+            stop_blink();
 
-        match result {
-            Ok(data) => break data,
-            Err(e) => {
-                println!("Failed to fetch widget data: {:?}, retrying in 30s...", e);
-                Timer::after(Duration::from_secs(30)).await;
+            match result {
+                Ok(data) => {
+                    // Store in cache for next boot
+                    if let Err(e) = sd_cache.store_widget_data(&data) {
+                        println!("Failed to cache widget data: {:?}", e);
+                    }
+                    break data;
+                }
+                Err(e) => {
+                    println!("Failed to fetch widget data: {:?}, retrying in 30s...", e);
+                    Timer::after(Duration::from_secs(30)).await;
+                }
             }
         }
     };
@@ -567,30 +620,69 @@ async fn main(spawner: Spawner) -> ! {
         };
 
         let display_result = if use_partial && orientation == Orientation::Horizontal {
-            // ==================== Partial Refresh Mode ====================
+            // ==================== Partial Refresh Mode (Cache-Aware) ====================
             // Only update one half of the display with a single new item
             let item_idx = index % total_items;
+            let item_path = items[item_idx].as_str();
             println!(
                 "Partial update: slot={}, item={} of {}",
                 next_slot, item_idx, total_items
             );
 
+            // PNG buffer for fetching/reading (256KB)
+            let mut png_buf: alloc::boxed::Box<[u8; 256 * 1024]> =
+                alloc::boxed::Box::new([0u8; 256 * 1024]);
+
             start_blink();
 
-            // Fetch single image to the target slot
-            let fetch_result = display::fetch_single_to_framebuffer(
-                &tcp_client,
-                &dns_socket,
-                &mut tls_read_buf,
-                &mut tls_write_buf,
-                &mut framebuffer,
-                SERVER_URL,
-                "concerts",
-                &items,
-                item_idx,
-                next_slot,
-            )
-            .await;
+            // Check cache first
+            let png_len = if sd_cache.has_image(item_path, Orientation::Horizontal) {
+                println!("Cache HIT: {}", item_path);
+                match sd_cache.read_image(item_path, Orientation::Horizontal, &mut *png_buf) {
+                    Ok(len) => len,
+                    Err(_) => 0,
+                }
+            } else {
+                println!("Cache MISS: {}", item_path);
+                match display::fetch_png(
+                    &tcp_client,
+                    &dns_socket,
+                    &mut tls_read_buf,
+                    &mut tls_write_buf,
+                    &mut *png_buf,
+                    SERVER_URL,
+                    "concerts",
+                    item_path,
+                    Orientation::Horizontal,
+                )
+                .await
+                {
+                    Ok(len) => {
+                        if let Err(e) =
+                            sd_cache.write_image(item_path, Orientation::Horizontal, &png_buf[..len])
+                        {
+                            println!("Cache store failed: {:?}", e);
+                        }
+                        len
+                    }
+                    Err(e) => {
+                        println!("Fetch failed: {:?}", e);
+                        0
+                    }
+                }
+            };
+
+            // Render to framebuffer
+            let fetch_result = if png_len > 0 {
+                display::render_png_to_framebuffer(
+                    &png_buf[..png_len],
+                    &mut framebuffer,
+                    next_slot,
+                    Orientation::Horizontal,
+                )
+            } else {
+                Err(display::DisplayError::Network)
+            };
 
             // Draw battery indicator centered horizontally
             if fetch_result.is_ok() {
@@ -644,7 +736,7 @@ async fn main(spawner: Spawner) -> ! {
 
             result
         } else {
-            // ==================== Full Refresh Mode ====================
+            // ==================== Full Refresh Mode (Cache-Aware) ====================
             // Update entire display with 2 items (horizontal) or 1 item (vertical)
             println!(
                 "Full refresh: items {} and {} of {}",
@@ -653,20 +745,86 @@ async fn main(spawner: Spawner) -> ! {
                 total_items
             );
 
+            // Clear framebuffer
+            framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
+
+            // PNG buffer for fetching/reading (256KB)
+            let mut png_buf: alloc::boxed::Box<[u8; 256 * 1024]> =
+                alloc::boxed::Box::new([0u8; 256 * 1024]);
+
             start_blink();
-            let fetch_result = display::fetch_to_framebuffer(
-                &tcp_client,
-                &dns_socket,
-                &mut tls_read_buf,
-                &mut tls_write_buf,
-                &mut framebuffer,
-                SERVER_URL,
-                "concerts",
-                orientation,
-                &items,
-                index,
-            )
-            .await;
+
+            // Number of items to display
+            let items_per_screen = match orientation {
+                Orientation::Horizontal => 2,
+                Orientation::Vertical => 1,
+            };
+
+            let mut fetch_ok = true;
+            for slot in 0..items_per_screen {
+                let item_idx = (index + slot) % total_items;
+                let item_path = items[item_idx].as_str();
+
+                // Check cache first
+                let png_len = if sd_cache.has_image(item_path, orientation) {
+                    println!("Cache HIT: {}", item_path);
+                    match sd_cache.read_image(item_path, orientation, &mut *png_buf) {
+                        Ok(len) => len,
+                        Err(_) => 0,
+                    }
+                } else {
+                    println!("Cache MISS: {}", item_path);
+                    // Fetch from network
+                    match display::fetch_png(
+                        &tcp_client,
+                        &dns_socket,
+                        &mut tls_read_buf,
+                        &mut tls_write_buf,
+                        &mut *png_buf,
+                        SERVER_URL,
+                        "concerts",
+                        item_path,
+                        orientation,
+                    )
+                    .await
+                    {
+                        Ok(len) => {
+                            // Store in cache
+                            if let Err(e) =
+                                sd_cache.write_image(item_path, orientation, &png_buf[..len])
+                            {
+                                println!("Cache store failed: {:?}", e);
+                            }
+                            len
+                        }
+                        Err(e) => {
+                            println!("Fetch failed: {:?}", e);
+                            0
+                        }
+                    }
+                };
+
+                // Decode and render to framebuffer
+                if png_len > 0 {
+                    if let Err(e) = display::render_png_to_framebuffer(
+                        &png_buf[..png_len],
+                        &mut framebuffer,
+                        slot as u8,
+                        orientation,
+                    ) {
+                        println!("Render failed: {:?}", e);
+                        fetch_ok = false;
+                    }
+                } else {
+                    fetch_ok = false;
+                }
+            }
+
+            let fetch_result: Result<(), display::DisplayError> = if fetch_ok {
+                Ok(())
+            } else {
+                Err(display::DisplayError::Network)
+            };
 
             // Draw battery indicator into framebuffer
             if fetch_result.is_ok() {
@@ -724,6 +882,72 @@ async fn main(spawner: Spawner) -> ! {
         match display_result {
             Ok(()) => println!("Display refresh successful!"),
             Err(e) => println!("Display refresh failed: {:?}", e),
+        }
+
+        // Prefetch next image while display is refreshing
+        let prefetch_idx = index % total_items;
+        let prefetch_path = items[prefetch_idx].as_str();
+        if !sd_cache.has_image(prefetch_path, orientation) {
+            println!("Prefetching next image: {}", prefetch_path);
+            let mut prefetch_buf: alloc::boxed::Box<[u8; 256 * 1024]> =
+                alloc::boxed::Box::new([0u8; 256 * 1024]);
+            if let Ok(len) = display::fetch_png(
+                &tcp_client,
+                &dns_socket,
+                &mut tls_read_buf,
+                &mut tls_write_buf,
+                &mut *prefetch_buf,
+                SERVER_URL,
+                "concerts",
+                prefetch_path,
+                orientation,
+            )
+            .await
+            {
+                if let Err(e) =
+                    sd_cache.write_image(prefetch_path, orientation, &prefetch_buf[..len])
+                {
+                    println!("Prefetch cache store failed: {:?}", e);
+                } else {
+                    println!("Prefetched and cached: {}", prefetch_path);
+                }
+            }
+        }
+
+        // Refresh widget data from server if we used cached data
+        if has_cached_data {
+            println!("Refreshing widget data from server...");
+            if let Ok(fresh_items) = display::fetch_widget_data(
+                &tcp_client,
+                &dns_socket,
+                &mut tls_read_buf,
+                &mut tls_write_buf,
+                SERVER_URL,
+                "concerts",
+            )
+            .await
+            {
+                // Check if data changed
+                if fresh_items.len() != items.len()
+                    || fresh_items
+                        .iter()
+                        .zip(items.iter())
+                        .any(|(a, b)| a.as_str() != b.as_str())
+                {
+                    println!("Widget data changed, updating cache");
+                    if let Err(e) = sd_cache.store_widget_data(&fresh_items) {
+                        println!("Failed to update widget data cache: {:?}", e);
+                    }
+                    // Invalidate stale image cache entries
+                    if let Ok(count) = sd_cache.cleanup_stale(&fresh_items) {
+                        if count > 0 {
+                            println!("Invalidated {} stale cache entries", count);
+                        }
+                    }
+                    // Note: items is not updated here since we're about to sleep
+                    // Next boot will use the fresh cached data
+                }
+            }
         }
 
         // Put display to sleep

@@ -2,7 +2,7 @@
 //!
 //! JSON format from edge service:
 //! ```json
-//! ["band-id/01-01-2024", "band-id/02-01-2024"]
+//! ["2024-01-01-band-id", "2024-01-02-band-id"]
 //! ```
 
 use heapless::{String, Vec};
@@ -66,13 +66,13 @@ mod tests {
 
     #[test]
     fn test_parse_widget_data() {
-        let json = r#"["band-id/01-01-2024", "band-id/02-01-2024"]"#;
+        let json = r#"["2024-01-01-band-id", "2024-01-02-band-id"]"#;
 
         let result = parse_widget_data(json);
         assert!(result.is_ok());
         let items = result.unwrap();
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].as_str(), "band-id/01-01-2024");
-        assert_eq!(items[1].as_str(), "band-id/02-01-2024");
+        assert_eq!(items[0].as_str(), "2024-01-01-band-id");
+        assert_eq!(items[1].as_str(), "2024-01-02-band-id");
     }
 }

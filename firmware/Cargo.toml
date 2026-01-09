@@ -81,6 +81,9 @@ heapless = "0.8"
 # PNG decoding (no_std, no alloc)
 minipng = "0.1"
 
+# SD card storage for caching
+embedded-sdmmc = "0.8"
+
 # HTTP client with TLS support (use git for embedded-nal-async 0.9 compatibility)
 reqwless = { git = "https://github.com/drogue-iot/reqwless", default-features = false, features = ["embedded-tls", "alloc"] }
 embedded-nal-async = "0.9"

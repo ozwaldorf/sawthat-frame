@@ -69,25 +69,26 @@ pub async fn fetch_bands(client: &Client, user_id: &str) -> Result<Vec<SawThatBa
 /// Convert SawThat bands to widget items
 ///
 /// Returns all concerts sorted by date (most recent first).
+/// Path format: YYYY-MM-DD-band-id (FAT-safe, sortable)
 pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData {
     // Flatten all concerts from all bands
     let mut all_concerts: Vec<_> = bands
         .iter()
         .flat_map(|band| {
-            band.concerts.iter().map(move |concert| {
+            band.concerts.iter().filter_map(move |concert| {
+                // Parse DD-MM-YYYY to create sortable YYYY-MM-DD format
                 let date_parts: Vec<&str> = concert.date.split('-').collect();
-                let sort_key = if date_parts.len() == 3 {
-                    // Convert DD-MM-YYYY to YYYYMMDD for sorting
-                    format!(
-                        "{}{}{}",
+                if date_parts.len() == 3 {
+                    let iso_date = format!(
+                        "{}-{}-{}",
                         date_parts[2], // year
                         date_parts[1], // month
                         date_parts[0]  // day
-                    )
+                    );
+                    Some((band, concert, iso_date))
                 } else {
-                    concert.date.clone()
-                };
-                (band, concert, sort_key)
+                    None
+                }
             })
         })
         .collect();
@@ -96,11 +97,30 @@ pub fn bands_to_widget_items(bands: &[SawThatBand], limit: usize) -> WidgetData 
     all_concerts.sort_by(|a, b| b.2.cmp(&a.2));
 
     // Take the most recent concerts
+    // Path format: YYYY-MM-DD-band-id
     all_concerts
         .into_iter()
         .take(limit)
-        .map(|(band, concert, _)| format!("{}/{}", band.id, urlencoding::encode(&concert.date)))
+        .map(|(band, _concert, iso_date)| format!("{}-{}", iso_date, band.id))
         .collect()
+}
+
+/// Parse item path (YYYY-MM-DD-band-id) into (band_id, original_date DD-MM-YYYY)
+pub fn parse_item_path(path: &str) -> Option<(String, String)> {
+    // Format: YYYY-MM-DD-band-id
+    // Split at 4th hyphen to separate date from band-id (band-id may contain hyphens)
+    let parts: Vec<&str> = path.splitn(4, '-').collect();
+    if parts.len() == 4 {
+        let year = parts[0];
+        let month = parts[1];
+        let day = parts[2];
+        let band_id = parts[3];
+        // Convert back to DD-MM-YYYY for internal use
+        let original_date = format!("{}-{}-{}", day, month, year);
+        Some((band_id.to_string(), original_date))
+    } else {
+        None
+    }
 }
 
 /// Fetch and process an image for a band
@@ -322,6 +342,27 @@ mod tests {
 
         let items = bands_to_widget_items(&bands, 10);
         assert_eq!(items.len(), 1);
-        assert!(items[0].contains("test-id"));
+        // New format: YYYY-MM-DD-band-id
+        assert_eq!(items[0], "2024-06-15-test-id");
+    }
+
+    #[test]
+    fn test_parse_item_path() {
+        let path = "2024-06-15-test-band-id";
+        let result = parse_item_path(path);
+        assert!(result.is_some());
+        let (band_id, date) = result.unwrap();
+        assert_eq!(band_id, "test-band-id");
+        assert_eq!(date, "15-06-2024");
+    }
+
+    #[test]
+    fn test_parse_item_path_with_hyphens_in_band_id() {
+        let path = "2024-01-20-my-cool-band-name";
+        let result = parse_item_path(path);
+        assert!(result.is_some());
+        let (band_id, date) = result.unwrap();
+        assert_eq!(band_id, "my-cool-band-name");
+        assert_eq!(date, "20-01-2024");
     }
 }

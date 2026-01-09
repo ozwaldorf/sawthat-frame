@@ -508,3 +508,95 @@ pub const fn tls_read_buffer_size() -> usize {
 pub const fn tls_write_buffer_size() -> usize {
     TLS_WRITE_BUF_SIZE
 }
+
+/// Fetch a single PNG image from the network (for caching).
+///
+/// Returns the number of bytes written to `png_buf`.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_png<T, D>(
+    tcp: &T,
+    dns: &D,
+    tls_read_buf: &mut [u8],
+    tls_write_buf: &mut [u8],
+    png_buf: &mut [u8],
+    server_url: &str,
+    widget_name: &str,
+    item_path: &str,
+    orientation: Orientation,
+) -> Result<usize, DisplayError>
+where
+    T: TcpConnect,
+    D: Dns,
+{
+    // Create HTTP client with TLS
+    let tls_config = TlsConfig::new(TLS_SEED, tls_read_buf, tls_write_buf, TlsVerify::None);
+    let mut client = HttpClient::new_with_tls(tcp, dns, tls_config);
+
+    // Establish connection
+    let mut resource = client
+        .resource(server_url)
+        .await
+        .map_err(|_| DisplayError::Network)?;
+
+    // Build path
+    let mut path: String<256> = String::new();
+    if write!(
+        &mut path,
+        "/{}/{}/{}",
+        widget_name,
+        orientation.as_str(),
+        item_path
+    )
+    .is_err()
+    {
+        return Err(DisplayError::Network);
+    }
+
+    let mut rx_buf = [0u8; 2048];
+    let response = resource
+        .request(Method::GET, path.as_str())
+        .send(&mut rx_buf)
+        .await
+        .map_err(|_| DisplayError::Network)?;
+
+    let status = response.status.0;
+    if status >= 400 {
+        return Err(DisplayError::Http(status));
+    }
+
+    // Read PNG body
+    let mut png_len = 0;
+    let mut body_reader = response.body().reader();
+    loop {
+        match body_reader.read(&mut png_buf[png_len..]).await {
+            Ok(0) => break,
+            Ok(n) => png_len += n,
+            Err(_) => break,
+        }
+    }
+
+    println!("Fetched {} bytes from network", png_len);
+    Ok(png_len)
+}
+
+/// Decode PNG data and render to framebuffer at the specified slot.
+///
+/// For horizontal mode: slot 0 = left (x_offset=0), slot 1 = right (x_offset=400)
+/// For vertical mode: full screen render
+pub fn render_png_to_framebuffer(
+    png_data: &[u8],
+    framebuffer: &mut Framebuffer,
+    slot: u8,
+    orientation: Orientation,
+) -> Result<(), DisplayError> {
+    // Allocate decode buffer from heap
+    let mut decode_buf: Box<[u8; DECODE_BUF_SIZE]> = Box::new([0u8; DECODE_BUF_SIZE]);
+
+    let x_offset = if orientation == Orientation::Vertical || slot == 0 {
+        0
+    } else {
+        400
+    };
+
+    decode_png_to_framebuffer(png_data, framebuffer, x_offset, &mut *decode_buf, orientation)
+}
