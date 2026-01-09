@@ -341,19 +341,20 @@ async fn main(spawner: Spawner) -> ! {
     let sd_spi_device = ExclusiveDevice::new_no_delay(sd_spi, sd_cs).unwrap();
 
     let mut sd_cache = match SdCache::new(sd_spi_device, delay.clone()) {
-        Ok(cache) => cache,
+        Ok(mut cache) => {
+            if let Err(e) = cache.init() {
+                println!("SD cache init error: {:?}", e);
+            }
+            Some(cache)
+        }
         Err(e) => {
-            println!("SD card init failed: {:?}", e);
-            panic!("SD card required for caching");
+            println!("SD card init failed: {:?} (cache disabled)", e);
+            None
         }
     };
 
-    if let Err(e) = sd_cache.init() {
-        println!("SD cache init error: {:?}", e);
-    }
-
     // Try to load widget data from cache (for cache-first boot)
-    let cached_items = sd_cache.load_widget_data();
+    let cached_items = sd_cache.as_mut().and_then(|c| c.load_widget_data());
     let has_cached_data = cached_items.is_some();
     println!(
         "Cached widget data: {}",
@@ -363,10 +364,12 @@ async fn main(spawner: Spawner) -> ! {
     // Handle orientation persistence
     if orientation_changed {
         // Orientation was changed during boot button hold - save to SD card
-        if let Err(e) = sd_cache.store_orientation(orientation) {
-            println!("Failed to store orientation: {:?}", e);
+        if let Some(cache) = sd_cache.as_mut() {
+            if let Err(e) = cache.store_orientation(orientation) {
+                println!("Failed to store orientation: {:?}", e);
+            }
         }
-    } else if let Some(cached_orient) = sd_cache.load_orientation() {
+    } else if let Some(cached_orient) = sd_cache.as_mut().and_then(|c| c.load_orientation()) {
         // Load orientation from SD card (persistent across power cycles)
         orientation = cached_orient;
         println!("Using cached orientation: {:?}", orientation);
@@ -585,8 +588,10 @@ async fn main(spawner: Spawner) -> ! {
             match result {
                 Ok(data) => {
                     // Store in cache for next boot
-                    if let Err(e) = sd_cache.store_widget_data(&data) {
-                        println!("Failed to cache widget data: {:?}", e);
+                    if let Some(cache) = sd_cache.as_mut() {
+                        if let Err(e) = cache.store_widget_data(&data) {
+                            println!("Failed to cache widget data: {:?}", e);
+                        }
                     }
                     break data;
                 }
@@ -698,10 +703,11 @@ async fn main(spawner: Spawner) -> ! {
             start_blink();
 
             // Check cache first
-            let png_len = if sd_cache.has_image(item_path, Orientation::Horizontal) {
+            let cache_hit = sd_cache.as_mut().map_or(false, |c| c.has_image(item_path, Orientation::Horizontal));
+            let png_len = if cache_hit {
                 println!("Cache HIT: {}", item_path);
-                sd_cache
-                    .read_image(item_path, Orientation::Horizontal, &mut *png_buf)
+                sd_cache.as_mut()
+                    .and_then(|c| c.read_image(item_path, Orientation::Horizontal, &mut *png_buf).ok())
                     .unwrap_or_default()
             } else {
                 println!("Cache MISS: {}", item_path);
@@ -721,10 +727,10 @@ async fn main(spawner: Spawner) -> ! {
                 .await
                 {
                     Ok(len) => {
-                        if let Err(e) =
-                            sd_cache.write_image(item_path, Orientation::Horizontal, &png_buf[..len])
-                        {
-                            println!("Cache store failed: {:?}", e);
+                        if let Some(cache) = sd_cache.as_mut() {
+                            if let Err(e) = cache.write_image(item_path, Orientation::Horizontal, &png_buf[..len]) {
+                                println!("Cache store failed: {:?}", e);
+                            }
                         }
                         len
                     }
@@ -791,31 +797,31 @@ async fn main(spawner: Spawner) -> ! {
                 // Initialize and connect WiFi now if we deferred it
                 ensure_wifi!();
 
-                // Prefetch next image
-                let prefetch_idx = index % total_items;
-                let prefetch_path = items[prefetch_idx].as_str();
-                if !sd_cache.has_image(prefetch_path, Orientation::Horizontal) {
-                    println!("Prefetching next image: {}", prefetch_path);
-                    let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
-                    if let Ok(len) = display::fetch_png(
-                        tcp_client.as_ref().unwrap(),
-                        dns_socket.as_ref().unwrap(),
-                        &mut *tls_read_buf,
-                        &mut *tls_write_buf,
-                        &mut *prefetch_buf,
-                        SERVER_URL,
-                        "concerts",
-                        prefetch_path,
-                        Orientation::Horizontal,
-                    )
-                    .await
-                    {
-                        if let Err(e) =
-                            sd_cache.write_image(prefetch_path, Orientation::Horizontal, &prefetch_buf[..len])
+                // Prefetch next image (only if cache is available)
+                if let Some(cache) = sd_cache.as_mut() {
+                    let prefetch_idx = index % total_items;
+                    let prefetch_path = items[prefetch_idx].as_str();
+                    if !cache.has_image(prefetch_path, Orientation::Horizontal) {
+                        println!("Prefetching next image: {}", prefetch_path);
+                        let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
+                        if let Ok(len) = display::fetch_png(
+                            tcp_client.as_ref().unwrap(),
+                            dns_socket.as_ref().unwrap(),
+                            &mut *tls_read_buf,
+                            &mut *tls_write_buf,
+                            &mut *prefetch_buf,
+                            SERVER_URL,
+                            "concerts",
+                            prefetch_path,
+                            Orientation::Horizontal,
+                        )
+                        .await
                         {
-                            println!("Prefetch cache store failed: {:?}", e);
-                        } else {
-                            println!("Prefetched and cached: {}", prefetch_path);
+                            if let Err(e) = cache.write_image(prefetch_path, Orientation::Horizontal, &prefetch_buf[..len]) {
+                                println!("Prefetch cache store failed: {:?}", e);
+                            } else {
+                                println!("Prefetched and cached: {}", prefetch_path);
+                            }
                         }
                     }
                 }
@@ -840,13 +846,15 @@ async fn main(spawner: Spawner) -> ! {
                                 .any(|(a, b)| a.as_str() != b.as_str())
                         {
                             println!("Widget data changed, updating cache");
-                            if let Err(e) = sd_cache.store_widget_data(&fresh_items) {
-                                println!("Failed to update widget data cache: {:?}", e);
-                            }
-                            if let Ok(count) = sd_cache.cleanup_stale(&fresh_items)
-                                && count > 0
-                            {
-                                println!("Invalidated {} stale cache entries", count);
+                            if let Some(cache) = sd_cache.as_mut() {
+                                if let Err(e) = cache.store_widget_data(&fresh_items) {
+                                    println!("Failed to update widget data cache: {:?}", e);
+                                }
+                                if let Ok(count) = cache.cleanup_stale(&fresh_items)
+                                    && count > 0
+                                {
+                                    println!("Invalidated {} stale cache entries", count);
+                                }
                             }
                         }
                     }
@@ -898,10 +906,11 @@ async fn main(spawner: Spawner) -> ! {
                 let item_path = items[item_idx].as_str();
 
                 // Check cache first
-                let png_len = if sd_cache.has_image(item_path, orientation) {
+                let cache_hit = sd_cache.as_mut().map_or(false, |c| c.has_image(item_path, orientation));
+                let png_len = if cache_hit {
                     println!("Cache HIT: {}", item_path);
-                    sd_cache
-                        .read_image(item_path, orientation, &mut *png_buf)
+                    sd_cache.as_mut()
+                        .and_then(|c| c.read_image(item_path, orientation, &mut *png_buf).ok())
                         .unwrap_or_default()
                 } else {
                     println!("Cache MISS: {}", item_path);
@@ -923,10 +932,10 @@ async fn main(spawner: Spawner) -> ! {
                     {
                         Ok(len) => {
                             // Store in cache
-                            if let Err(e) =
-                                sd_cache.write_image(item_path, orientation, &png_buf[..len])
-                            {
-                                println!("Cache store failed: {:?}", e);
+                            if let Some(cache) = sd_cache.as_mut() {
+                                if let Err(e) = cache.write_image(item_path, orientation, &png_buf[..len]) {
+                                    println!("Cache store failed: {:?}", e);
+                                }
                             }
                             len
                         }
@@ -1004,31 +1013,31 @@ async fn main(spawner: Spawner) -> ! {
                 // Initialize and connect WiFi now if we deferred it (using cached data path)
                 ensure_wifi!();
 
-                // Prefetch next image
-                let prefetch_idx = index % total_items;
-                let prefetch_path = items[prefetch_idx].as_str();
-                if !sd_cache.has_image(prefetch_path, orientation) {
-                    println!("Prefetching next image: {}", prefetch_path);
-                    let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
-                    if let Ok(len) = display::fetch_png(
-                        tcp_client.as_ref().unwrap(),
-                        dns_socket.as_ref().unwrap(),
-                        &mut *tls_read_buf,
-                        &mut *tls_write_buf,
-                        &mut *prefetch_buf,
-                        SERVER_URL,
-                        "concerts",
-                        prefetch_path,
-                        orientation,
-                    )
-                    .await
-                    {
-                        if let Err(e) =
-                            sd_cache.write_image(prefetch_path, orientation, &prefetch_buf[..len])
+                // Prefetch next image (only if cache is available)
+                if let Some(cache) = sd_cache.as_mut() {
+                    let prefetch_idx = index % total_items;
+                    let prefetch_path = items[prefetch_idx].as_str();
+                    if !cache.has_image(prefetch_path, orientation) {
+                        println!("Prefetching next image: {}", prefetch_path);
+                        let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
+                        if let Ok(len) = display::fetch_png(
+                            tcp_client.as_ref().unwrap(),
+                            dns_socket.as_ref().unwrap(),
+                            &mut *tls_read_buf,
+                            &mut *tls_write_buf,
+                            &mut *prefetch_buf,
+                            SERVER_URL,
+                            "concerts",
+                            prefetch_path,
+                            orientation,
+                        )
+                        .await
                         {
-                            println!("Prefetch cache store failed: {:?}", e);
-                        } else {
-                            println!("Prefetched and cached: {}", prefetch_path);
+                            if let Err(e) = cache.write_image(prefetch_path, orientation, &prefetch_buf[..len]) {
+                                println!("Prefetch cache store failed: {:?}", e);
+                            } else {
+                                println!("Prefetched and cached: {}", prefetch_path);
+                            }
                         }
                     }
                 }
@@ -1054,14 +1063,16 @@ async fn main(spawner: Spawner) -> ! {
                                 .any(|(a, b)| a.as_str() != b.as_str())
                         {
                             println!("Widget data changed, updating cache");
-                            if let Err(e) = sd_cache.store_widget_data(&fresh_items) {
-                                println!("Failed to update widget data cache: {:?}", e);
-                            }
-                            // Invalidate stale image cache entries
-                            if let Ok(count) = sd_cache.cleanup_stale(&fresh_items)
-                                && count > 0
-                            {
-                                println!("Invalidated {} stale cache entries", count);
+                            if let Some(cache) = sd_cache.as_mut() {
+                                if let Err(e) = cache.store_widget_data(&fresh_items) {
+                                    println!("Failed to update widget data cache: {:?}", e);
+                                }
+                                // Invalidate stale image cache entries
+                                if let Ok(count) = cache.cleanup_stale(&fresh_items)
+                                    && count > 0
+                                {
+                                    println!("Invalidated {} stale cache entries", count);
+                                }
                             }
                         }
                     }
@@ -1116,8 +1127,10 @@ async fn main(spawner: Spawner) -> ! {
                     println!("Button held! Toggling orientation...");
                     orientation = orientation.toggle();
                     // Save to SD card
-                    if let Err(e) = sd_cache.store_orientation(orientation) {
-                        println!("Failed to store orientation: {:?}", e);
+                    if let Some(cache) = sd_cache.as_mut() {
+                        if let Err(e) = cache.store_orientation(orientation) {
+                            println!("Failed to store orientation: {:?}", e);
+                        }
                     }
                     // Reset partial mode on orientation change
                     use_partial = false;
