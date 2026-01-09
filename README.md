@@ -16,7 +16,7 @@ Built on the [Waveshare ESP32-S3-PhotoPainter](https://www.amazon.com/dp/B0FWRJD
 <img height="300" alt="image" src="https://github.com/user-attachments/assets/1339362c-3e16-41e8-9678-fdbbde66b622" />
 <img height="300" alt="image" src="https://github.com/user-attachments/assets/48a749e5-eb84-4dd3-bde5-b50005cf1192" />
 
-### API Examples
+### API Outputs
 
 <img width="200" alt="image" src="https://github.com/user-attachments/assets/fec53b02-4f2d-4364-ad80-8443322e50a5" />
 <img width="200" alt="image" src="https://github.com/user-attachments/assets/3dbf4be8-1f17-4b98-9662-7f4bce0b97fc" />
@@ -47,8 +47,6 @@ The server provides the widget API for data fetching and image processing
 
 #### From source
 
-The server can be ran from 
-
 ```bash
 cd server
 PORT=3000 cargo run -r
@@ -62,7 +60,7 @@ nix run .
 
 #### NixOS Module
 
-For nixos systems, a module is provided to run the server as a systemd service. 
+For nixos systems, a module is provided to run the server as a systemd service.
 Add the following flake input and NixOS configuration:
 
 ```nix
@@ -121,11 +119,11 @@ cargo run --release
 
 #### Button Controls
 
-The KEY button (GPIO4) controls navigation and orientation:
+The KEY button controls navigation and orientation:
 
 | Action | Duration | Effect |
 |--------|----------|--------|
-| Tap | < 500ms | Next item |
+| Tap | >= 50ms | Next item |
 | Hold | >= 500ms | Toggle orientation (horizontal/vertical) |
 
 Button input is detected in two places:
