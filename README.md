@@ -119,14 +119,11 @@ cd firmware
 cargo run --release
 ```
 
-## Firmware Lifecycle
+## Specifications
+
+### Firmware Lifecycle
 
 ```mermaid
----
-config:
-  layout: elk
-  look: handDrawn
----
 stateDiagram-v2
     PowerOn --> Boot
 
@@ -182,7 +179,7 @@ stateDiagram-v2
     Sleep --> Boot: 15min timer or button
 ```
 
-## Network Interactions
+### Network Interactions
 
 ```mermaid
 sequenceDiagram
