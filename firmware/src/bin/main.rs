@@ -45,7 +45,7 @@ use esp_hal::{
 use esp_println::println;
 use esp_radio::{
     Controller,
-    wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice},
+    wifi::{ClientConfig, Config as WifiConfig, ModeConfig, WifiController, WifiDevice},
 };
 use sawthat_frame_firmware::battery;
 use sawthat_frame_firmware::cache::SdCache;
@@ -435,38 +435,16 @@ async fn main(spawner: Spawner) -> ! {
         .expect("EPD init failed");
     println!("EPD initialized!");
 
-    // ==================== WiFi Setup ====================
-    let esp_radio_ctrl = &*mk_static!(Controller<'static>, esp_radio::init().unwrap());
+    // ==================== WiFi Setup (Deferred) ====================
+    // Keep WiFi peripheral for lazy initialization - saves ~500-1000ms on cached boots
+    let mut wifi_peripheral: Option<esp_hal::peripherals::WIFI<'static>> = Some(peripherals.WIFI);
 
-    let (mut controller, interfaces) =
-        esp_radio::wifi::new(esp_radio_ctrl, peripherals.WIFI, Default::default()).unwrap();
-
-    let wifi_interface = interfaces.sta;
-
-    let net_config = embassy_net::Config::dhcpv4(Default::default());
-
-    let rng = Rng::new();
-    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
-
-    // Init network stack
-    let (stack, runner) = embassy_net::new(
-        wifi_interface,
-        net_config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
-        seed,
-    );
-
-    // Start network task (runs continuously)
-    spawner.spawn(net_task(runner)).ok();
-
-    // Defer WiFi connection if we have cached data - connect during display refresh instead
+    // WiFi state - will be initialized on first network access
+    // Note: _esp_radio_ctrl is a reference because it's stored in static memory
+    // It's kept alive to ensure the radio stays initialized
+    let mut _esp_radio_ctrl: Option<&'static Controller<'static>> = None;
+    let mut wifi_controller: Option<WifiController<'static>> = None;
     let mut wifi_connected = false;
-    if !has_cached_data {
-        // No cache - must connect now to fetch data
-        wifi_connect(&mut controller).await;
-        wait_for_ip(stack).await;
-        wifi_connected = true;
-    }
 
     // ==================== RTC for Deep Sleep ====================
     let mut rtc = Rtc::new(peripherals.LPWR);
@@ -507,10 +485,54 @@ async fn main(spawner: Spawner) -> ! {
     let mut tls_read_buf: Box<[u8; TLS_READ_BUF_SIZE]> = Box::new([0u8; TLS_READ_BUF_SIZE]);
     let mut tls_write_buf: Box<[u8; TLS_WRITE_BUF_SIZE]> = Box::new([0u8; TLS_WRITE_BUF_SIZE]);
 
-    // Create TCP client and DNS socket for HTTP requests
-    let tcp_state = mk_static!(TcpClientState<1, 1024, 1024>, TcpClientState::new());
-    let tcp_client = TcpClient::new(stack, tcp_state);
-    let dns_socket = DnsSocket::new(stack);
+    // TCP client and DNS socket - created lazily after WiFi init
+    let mut tcp_client: Option<TcpClient<'static, 1, 1024, 1024>> = None;
+    let mut dns_socket: Option<DnsSocket<'static>> = None;
+
+    // Helper macro to ensure WiFi is initialized and connected
+    macro_rules! ensure_wifi {
+        () => {{
+            if !wifi_connected {
+                println!("Initializing WiFi (deferred)...");
+                start_fast_blink(); // Visual feedback during slow init
+
+                // Initialize esp-radio (this is the slow part ~500-1000ms)
+                let ctrl = esp_radio::init().unwrap();
+                let ctrl = mk_static!(Controller<'static>, ctrl);
+
+                // Create WiFi controller and interfaces
+                let wifi = wifi_peripheral.take().unwrap();
+                let (wifi_ctrl, ifaces) = esp_radio::wifi::new(
+                    ctrl,
+                    wifi,
+                    WifiConfig::default(),
+                )
+                .unwrap();
+
+                let net_config = embassy_net::Config::dhcpv4(Default::default());
+                let (stk, runner) = embassy_net::new(
+                    ifaces.sta,
+                    net_config,
+                    mk_static!(StackResources<3>, StackResources::<3>::new()),
+                    rng.random() as u64,
+                );
+                let stk = mk_static!(Stack<'static>, stk);
+                spawner.spawn(net_task(runner)).ok();
+
+                let tcp_state = mk_static!(TcpClientState<1, 1024, 1024>, TcpClientState::new());
+                tcp_client = Some(TcpClient::new(*stk, tcp_state));
+                dns_socket = Some(DnsSocket::new(*stk));
+                _esp_radio_ctrl = Some(ctrl);
+                wifi_controller = Some(wifi_ctrl);
+
+                // Connect to WiFi
+                wifi_connect(wifi_controller.as_mut().unwrap()).await;
+                wait_for_ip(*stk).await;
+                wifi_connected = true;
+                println!("WiFi ready!");
+            }
+        }};
+    }
 
     // Fetch widget data (use cache if available, then refresh from network)
     // Keep boxed to avoid 6KB on stack
@@ -520,11 +542,13 @@ async fn main(spawner: Spawner) -> ! {
         Box::new(cached)
     } else {
         // No cache - must fetch from network
+        ensure_wifi!();
+
         loop {
             start_blink();
             let result = display::fetch_widget_data(
-                &tcp_client,
-                &dns_socket,
+                tcp_client.as_ref().unwrap(),
+                dns_socket.as_ref().unwrap(),
                 &mut *tls_read_buf,
                 &mut *tls_write_buf,
                 SERVER_URL,
@@ -656,16 +680,11 @@ async fn main(spawner: Spawner) -> ! {
                     .unwrap_or_default()
             } else {
                 println!("Cache MISS: {}", item_path);
-                // Connect WiFi if not already connected
-                if !wifi_connected {
-                    println!("Connecting WiFi for image fetch...");
-                    wifi_connect(&mut controller).await;
-                    wait_for_ip(stack).await;
-                    wifi_connected = true;
-                }
+                // Initialize and connect WiFi if not already connected
+                ensure_wifi!();
                 match display::fetch_png(
-                    &tcp_client,
-                    &dns_socket,
+                    tcp_client.as_ref().unwrap(),
+                    dns_socket.as_ref().unwrap(),
                     &mut *tls_read_buf,
                     &mut *tls_write_buf,
                     &mut *png_buf,
@@ -744,13 +763,8 @@ async fn main(spawner: Spawner) -> ! {
 
             // Prefetch next image and refresh widget data while display is refreshing
             if display_started {
-                // Connect WiFi now if we deferred it
-                if !wifi_connected {
-                    println!("Connecting WiFi during display refresh...");
-                    wifi_connect(&mut controller).await;
-                    wait_for_ip(stack).await;
-                    wifi_connected = true;
-                }
+                // Initialize and connect WiFi now if we deferred it
+                ensure_wifi!();
 
                 // Prefetch next image
                 let prefetch_idx = index % total_items;
@@ -759,8 +773,8 @@ async fn main(spawner: Spawner) -> ! {
                     println!("Prefetching next image: {}", prefetch_path);
                     let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
                     if let Ok(len) = display::fetch_png(
-                        &tcp_client,
-                        &dns_socket,
+                        tcp_client.as_ref().unwrap(),
+                        dns_socket.as_ref().unwrap(),
                         &mut *tls_read_buf,
                         &mut *tls_write_buf,
                         &mut *prefetch_buf,
@@ -785,8 +799,8 @@ async fn main(spawner: Spawner) -> ! {
                 if has_cached_data {
                     println!("Refreshing widget data from server...");
                     if let Ok(fresh_items) = display::fetch_widget_data(
-                        &tcp_client,
-                        &dns_socket,
+                        tcp_client.as_ref().unwrap(),
+                        dns_socket.as_ref().unwrap(),
                         &mut *tls_read_buf,
                         &mut *tls_write_buf,
                         SERVER_URL,
@@ -866,17 +880,12 @@ async fn main(spawner: Spawner) -> ! {
                         .unwrap_or_default()
                 } else {
                     println!("Cache MISS: {}", item_path);
-                    // Connect WiFi if not already connected
-                    if !wifi_connected {
-                        println!("Connecting WiFi for image fetch...");
-                        wifi_connect(&mut controller).await;
-                        wait_for_ip(stack).await;
-                        wifi_connected = true;
-                    }
+                    // Initialize and connect WiFi if not already connected
+                    ensure_wifi!();
                     // Fetch from network
                     match display::fetch_png(
-                        &tcp_client,
-                        &dns_socket,
+                        tcp_client.as_ref().unwrap(),
+                        dns_socket.as_ref().unwrap(),
                         &mut *tls_read_buf,
                         &mut *tls_write_buf,
                         &mut *png_buf,
@@ -967,13 +976,8 @@ async fn main(spawner: Spawner) -> ! {
 
             // Prefetch next image and refresh widget data while display is refreshing
             if display_started {
-                // Connect WiFi now if we deferred it (using cached data path)
-                if !wifi_connected {
-                    println!("Connecting WiFi during display refresh...");
-                    wifi_connect(&mut controller).await;
-                    wait_for_ip(stack).await;
-                    wifi_connected = true;
-                }
+                // Initialize and connect WiFi now if we deferred it (using cached data path)
+                ensure_wifi!();
 
                 // Prefetch next image
                 let prefetch_idx = index % total_items;
@@ -982,8 +986,8 @@ async fn main(spawner: Spawner) -> ! {
                     println!("Prefetching next image: {}", prefetch_path);
                     let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
                     if let Ok(len) = display::fetch_png(
-                        &tcp_client,
-                        &dns_socket,
+                        tcp_client.as_ref().unwrap(),
+                        dns_socket.as_ref().unwrap(),
                         &mut *tls_read_buf,
                         &mut *tls_write_buf,
                         &mut *prefetch_buf,
@@ -1008,8 +1012,8 @@ async fn main(spawner: Spawner) -> ! {
                 if has_cached_data {
                     println!("Refreshing widget data from server...");
                     if let Ok(fresh_items) = display::fetch_widget_data(
-                        &tcp_client,
-                        &dns_socket,
+                        tcp_client.as_ref().unwrap(),
+                        dns_socket.as_ref().unwrap(),
                         &mut *tls_read_buf,
                         &mut *tls_write_buf,
                         SERVER_URL,
@@ -1138,9 +1142,13 @@ async fn main(spawner: Spawner) -> ! {
         index, total_items, orientation, next_slot, slot_items[0], slot_items[1]
     );
 
-    // Disconnect WiFi before deep sleep
-    println!("Disconnecting WiFi for deep sleep...");
-    wifi_disconnect(&mut controller).await;
+    // Disconnect WiFi before deep sleep (only if it was initialized)
+    if let Some(ctrl) = wifi_controller.as_mut() {
+        println!("Disconnecting WiFi for deep sleep...");
+        wifi_disconnect(ctrl).await;
+    } else {
+        println!("WiFi was never initialized, skipping disconnect");
+    }
 
     // Reclaim GPIO4 for deep sleep wake source
     let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
