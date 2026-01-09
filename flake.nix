@@ -13,25 +13,34 @@
       in
       {
         packages = {
-          server = pkgs.rustPlatform.buildRustPackage {
-            pname = "sawthat-frame-server";
-            version = "0.1.0";
+          server =
+            let
+              fontconfig = pkgs.makeFontsConf {
+                fontDirectories = [ pkgs.ibm-plex ];
+              };
+              unwrapped = pkgs.rustPlatform.buildRustPackage {
+                pname = "sawthat-frame-server";
+                version = "0.1.0";
 
-            src = ./server;
+                src = ./server;
 
-            cargoLock.lockFile = ./server/Cargo.lock;
+                cargoLock.lockFile = ./server/Cargo.lock;
 
-            nativeBuildInputs = [ pkgs.fontconfig ];
-
-            FONTCONFIG_FILE = pkgs.makeFontsConf {
-              fontDirectories = [ pkgs.ibm-plex ];
-            };
-
-            meta = {
-              description = "SawThat Frame server for e-paper widgets";
-              mainProgram = "sawthat-frame-server";
-            };
-          };
+                meta = {
+                  description = "SawThat Frame server for e-paper widgets";
+                  mainProgram = "sawthat-frame-server";
+                };
+              };
+            in
+            pkgs.runCommand "sawthat-frame-server" {
+              nativeBuildInputs = [ pkgs.makeWrapper ];
+              inherit (unwrapped) meta;
+            } ''
+              mkdir -p $out/bin
+              makeWrapper ${unwrapped}/bin/sawthat-frame-server $out/bin/sawthat-frame-server \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fontconfig ]} \
+                --set FONTCONFIG_FILE ${fontconfig}
+            '';
 
           default = self.packages.${system}.server;
         };

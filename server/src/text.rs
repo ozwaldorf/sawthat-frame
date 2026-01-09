@@ -1,11 +1,81 @@
 //! Text rendering for e-paper display
 //!
-//! Renders text onto indexed images using embedded fonts.
+//! Renders text onto indexed images using fonts discovered at runtime via fontconfig.
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
 
-/// Font found at build time via fontconfig (see build.rs)
-const FONT_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/font.ttf"));
+/// Cached font loaded at runtime
+static FONT: OnceLock<FontVec> = OnceLock::new();
+
+/// Font patterns to try in order of preference
+const FONT_PATTERNS: &[&str] = &[
+    "Berkeley Mono:style=Bold",
+    "Berkeley Mono",
+    "IBM Plex Mono:style=Bold",
+    "IBM Plex Sans:style=Bold",
+    "DejaVu Sans:style=Bold",
+    "Liberation Sans:style=Bold",
+];
+
+/// Load and cache the font, or return the cached version
+fn get_font() -> &'static FontVec {
+    FONT.get_or_init(|| {
+        load_font().expect("Failed to load font. Install Berkeley Mono or a fallback (IBM Plex, DejaVu Sans, Liberation Sans)")
+    })
+}
+
+/// Find and load a font using fontconfig's fc-match
+fn load_font() -> Option<FontVec> {
+    for pattern in FONT_PATTERNS {
+        if let Some(path) = find_font(pattern) {
+            match std::fs::read(&path) {
+                Ok(data) => match FontVec::try_from_vec(data) {
+                    Ok(font) => {
+                        tracing::debug!("Loaded font: {}", path.display());
+                        return Some(font);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse font {}: {}", path.display(), e);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to read font {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Use fc-match to find a font by pattern
+fn find_font(pattern: &str) -> Option<PathBuf> {
+    let output = Command::new("fc-match")
+        .args(["--format=%{file}", pattern])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let path_str = String::from_utf8(output.stdout).ok()?;
+    let path = PathBuf::from(path_str.trim());
+
+    // Verify the file exists and is a TTF/OTF
+    if path.exists()
+        && path
+            .extension()
+            .map(|e| e == "ttf" || e == "otf")
+            .unwrap_or(false)
+    {
+        Some(path)
+    } else {
+        None
+    }
+}
 
 /// Palette indices
 const BLACK_INDEX: u8 = 0;
@@ -34,7 +104,7 @@ pub fn render_concert_info_indexed(
     text_area_top: u32,
     is_light_bg: bool,
 ) {
-    let font = FontRef::try_from_slice(FONT_DATA).expect("Failed to load font");
+    let font = get_font();
     let text_color = if is_light_bg {
         BLACK_INDEX
     } else {
@@ -82,7 +152,7 @@ pub fn render_concert_info_indexed(
 }
 
 /// Find the largest font size that fits the text within max_width
-fn fit_text_size(font: &FontRef, text: &str, max_width: f32, sizes: &[f32]) -> (PxScale, u32) {
+fn fit_text_size(font: &impl Font, text: &str, max_width: f32, sizes: &[f32]) -> (PxScale, u32) {
     for &size in sizes {
         let scale = PxScale::from(size);
         let text_width = measure_text_width(font, text, scale);
@@ -104,7 +174,7 @@ fn fit_text_size(font: &FontRef, text: &str, max_width: f32, sizes: &[f32]) -> (
 }
 
 /// Measure the width of text at a given scale
-fn measure_text_width(font: &FontRef, text: &str, scale: PxScale) -> f32 {
+fn measure_text_width(font: &impl Font, text: &str, scale: PxScale) -> f32 {
     let scaled_font = font.as_scaled(scale);
     text.chars()
         .map(|c| {
@@ -118,7 +188,7 @@ fn measure_text_width(font: &FontRef, text: &str, scale: PxScale) -> f32 {
 fn draw_text_indexed_centered(
     indexed: &mut [u8],
     width: u32,
-    font: &FontRef,
+    font: &impl Font,
     text: &str,
     scale: PxScale,
     y: u32,
@@ -146,7 +216,7 @@ fn draw_text_indexed_centered(
 fn draw_text_indexed(
     indexed: &mut [u8],
     width: u32,
-    font: &FontRef,
+    font: &impl Font,
     text: &str,
     scale: PxScale,
     x: u32,
