@@ -300,9 +300,6 @@ async fn main(spawner: Spawner) -> ! {
     // Now do the heavier initialization
     info!("Boot! Wake reason: {:?}", wake_reason);
 
-    // Wait for USB serial to reconnect after deep sleep wake
-    esp_hal::delay::Delay::new().delay_millis(2000);
-
     // Initialize internal RAM heap (for smaller allocations)
     info!("Initializing heap...");
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
