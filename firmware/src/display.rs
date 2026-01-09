@@ -338,7 +338,7 @@ pub async fn fetch_widget_data<T, D>(
     tls_write_buf: &mut [u8],
     server_url: &str,
     widget_name: &str,
-) -> Result<WidgetData, DisplayError>
+) -> Result<Box<WidgetData>, DisplayError>
 where
     T: TcpConnect,
     D: Dns,

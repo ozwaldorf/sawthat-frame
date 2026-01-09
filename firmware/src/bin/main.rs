@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use core::time::Duration as CoreDuration;
 
@@ -458,9 +459,14 @@ async fn main(spawner: Spawner) -> ! {
     // Start network task (runs continuously)
     spawner.spawn(net_task(runner)).ok();
 
-    // Initial WiFi connection
-    wifi_connect(&mut controller).await;
-    wait_for_ip(stack).await;
+    // Defer WiFi connection if we have cached data - connect during display refresh instead
+    let mut wifi_connected = false;
+    if !has_cached_data {
+        // No cache - must connect now to fetch data
+        wifi_connect(&mut controller).await;
+        wait_for_ip(stack).await;
+        wifi_connected = true;
+    }
 
     // ==================== RTC for Deep Sleep ====================
     let mut rtc = Rtc::new(peripherals.LPWR);
@@ -497,9 +503,9 @@ async fn main(spawner: Spawner) -> ! {
     // Use RNG for shuffle seed
     let rng = Rng::new();
 
-    // Allocate TLS buffers for HTTPS support
-    let mut tls_read_buf = [0u8; TLS_READ_BUF_SIZE];
-    let mut tls_write_buf = [0u8; TLS_WRITE_BUF_SIZE];
+    // Allocate TLS buffers for HTTPS support (on heap to save stack)
+    let mut tls_read_buf: Box<[u8; TLS_READ_BUF_SIZE]> = Box::new([0u8; TLS_READ_BUF_SIZE]);
+    let mut tls_write_buf: Box<[u8; TLS_WRITE_BUF_SIZE]> = Box::new([0u8; TLS_WRITE_BUF_SIZE]);
 
     // Create TCP client and DNS socket for HTTP requests
     let tcp_state = mk_static!(TcpClientState<1, 1024, 1024>, TcpClientState::new());
@@ -507,10 +513,11 @@ async fn main(spawner: Spawner) -> ! {
     let dns_socket = DnsSocket::new(stack);
 
     // Fetch widget data (use cache if available, then refresh from network)
+    // Keep boxed to avoid 6KB on stack
     println!("Fetching widget data...");
-    let mut items: WidgetData = if let Some(cached) = cached_items {
+    let mut items: Box<WidgetData> = if let Some(cached) = cached_items {
         println!("Using cached widget data ({} items)", cached.len());
-        cached
+        Box::new(cached)
     } else {
         // No cache - must fetch from network
         loop {
@@ -518,8 +525,8 @@ async fn main(spawner: Spawner) -> ! {
             let result = display::fetch_widget_data(
                 &tcp_client,
                 &dns_socket,
-                &mut tls_read_buf,
-                &mut tls_write_buf,
+                &mut *tls_read_buf,
+                &mut *tls_write_buf,
                 SERVER_URL,
                 "concerts",
             )
@@ -649,11 +656,18 @@ async fn main(spawner: Spawner) -> ! {
                     .unwrap_or_default()
             } else {
                 println!("Cache MISS: {}", item_path);
+                // Connect WiFi if not already connected
+                if !wifi_connected {
+                    println!("Connecting WiFi for image fetch...");
+                    wifi_connect(&mut controller).await;
+                    wait_for_ip(stack).await;
+                    wifi_connected = true;
+                }
                 match display::fetch_png(
                     &tcp_client,
                     &dns_socket,
-                    &mut tls_read_buf,
-                    &mut tls_write_buf,
+                    &mut *tls_read_buf,
+                    &mut *tls_write_buf,
                     &mut *png_buf,
                     SERVER_URL,
                     "concerts",
@@ -703,7 +717,8 @@ async fn main(spawner: Spawner) -> ! {
                 );
             }
 
-            let result = match fetch_result {
+            // Start partial update
+            let display_started = match fetch_result {
                 Ok(()) => {
                     // Extract the half we need to update
                     let mut half_buffer = [0u8; HALF_BUFFER_SIZE];
@@ -715,29 +730,102 @@ async fn main(spawner: Spawner) -> ! {
 
                     println!("Partial refresh: x={}, w={}, h={}", x_offset, 400, 480);
 
-                    // Do partial update
-                    match epd.partial_update_start(&rect, &half_buffer, &mut delay) {
-                        Ok(()) => {
-                            while epd.is_busy() {
-                                Timer::after(Duration::from_millis(50)).await;
-                            }
-                            epd.refresh_wait(&mut delay)
-                                .map_err(|_| display::DisplayError::Network)
-                        }
-                        Err(_) => Err(display::DisplayError::Network),
-                    }
+                    epd.partial_update_start(&rect, &half_buffer, &mut delay).is_ok()
                 }
-                Err(e) => Err(e),
+                Err(_) => false,
             };
-            stop_blink();
-            embassy_futures::yield_now().await;
 
-            // Update slot tracking
-            if result.is_ok() {
+            // Update slot tracking early so prefetch uses correct next index
+            if display_started {
                 slot_items[next_slot as usize] = item_idx;
                 next_slot = (next_slot + 1) % 2;
                 index += 1; // Advance by 1 for partial updates
             }
+
+            // Prefetch next image and refresh widget data while display is refreshing
+            if display_started {
+                // Connect WiFi now if we deferred it
+                if !wifi_connected {
+                    println!("Connecting WiFi during display refresh...");
+                    wifi_connect(&mut controller).await;
+                    wait_for_ip(stack).await;
+                    wifi_connected = true;
+                }
+
+                // Prefetch next image
+                let prefetch_idx = index % total_items;
+                let prefetch_path = items[prefetch_idx].as_str();
+                if !sd_cache.has_image(prefetch_path, Orientation::Horizontal) {
+                    println!("Prefetching next image: {}", prefetch_path);
+                    let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
+                    if let Ok(len) = display::fetch_png(
+                        &tcp_client,
+                        &dns_socket,
+                        &mut *tls_read_buf,
+                        &mut *tls_write_buf,
+                        &mut *prefetch_buf,
+                        SERVER_URL,
+                        "concerts",
+                        prefetch_path,
+                        Orientation::Horizontal,
+                    )
+                    .await
+                    {
+                        if let Err(e) =
+                            sd_cache.write_image(prefetch_path, Orientation::Horizontal, &prefetch_buf[..len])
+                        {
+                            println!("Prefetch cache store failed: {:?}", e);
+                        } else {
+                            println!("Prefetched and cached: {}", prefetch_path);
+                        }
+                    }
+                }
+
+                // Refresh widget data from server if we used cached data
+                if has_cached_data {
+                    println!("Refreshing widget data from server...");
+                    if let Ok(fresh_items) = display::fetch_widget_data(
+                        &tcp_client,
+                        &dns_socket,
+                        &mut *tls_read_buf,
+                        &mut *tls_write_buf,
+                        SERVER_URL,
+                        "concerts",
+                    )
+                    .await
+                    {
+                        if fresh_items.len() != items.len()
+                            || fresh_items
+                                .iter()
+                                .zip(items.iter())
+                                .any(|(a, b)| a.as_str() != b.as_str())
+                        {
+                            println!("Widget data changed, updating cache");
+                            if let Err(e) = sd_cache.store_widget_data(&fresh_items) {
+                                println!("Failed to update widget data cache: {:?}", e);
+                            }
+                            if let Ok(count) = sd_cache.cleanup_stale(&fresh_items)
+                                && count > 0
+                            {
+                                println!("Invalidated {} stale cache entries", count);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Now wait for display to finish
+            let result = if display_started {
+                while epd.is_busy() {
+                    Timer::after(Duration::from_millis(50)).await;
+                }
+                epd.refresh_wait(&mut delay)
+                    .map_err(|_| display::DisplayError::Network)
+            } else {
+                Err(display::DisplayError::Network)
+            };
+            stop_blink();
+            embassy_futures::yield_now().await;
 
             result
         } else {
@@ -778,12 +866,19 @@ async fn main(spawner: Spawner) -> ! {
                         .unwrap_or_default()
                 } else {
                     println!("Cache MISS: {}", item_path);
+                    // Connect WiFi if not already connected
+                    if !wifi_connected {
+                        println!("Connecting WiFi for image fetch...");
+                        wifi_connect(&mut controller).await;
+                        wait_for_ip(stack).await;
+                        wifi_connected = true;
+                    }
                     // Fetch from network
                     match display::fetch_png(
                         &tcp_client,
                         &dns_socket,
-                        &mut tls_read_buf,
-                        &mut tls_write_buf,
+                        &mut *tls_read_buf,
+                        &mut *tls_write_buf,
                         &mut *png_buf,
                         SERVER_URL,
                         "concerts",
@@ -850,35 +945,112 @@ async fn main(spawner: Spawner) -> ! {
                 );
             }
 
-            let result = match fetch_result {
+            // Start display update
+            let display_started = match fetch_result {
                 Ok(()) => {
                     println!("Updating display (full refresh)...");
-                    match epd.display_start(framebuffer.as_slice(), &mut delay) {
-                        Ok(()) => {
-                            while epd.is_busy() {
-                                Timer::after(Duration::from_millis(50)).await;
-                            }
-                            epd.finish_display(&mut delay)
-                                .map_err(|_| display::DisplayError::Network)
-                        }
-                        Err(_) => Err(display::DisplayError::Network),
-                    }
+                    epd.display_start(framebuffer.as_slice(), &mut delay).is_ok()
                 }
-                Err(e) => Err(e),
+                Err(_) => false,
             };
-            stop_blink();
-            embassy_futures::yield_now().await;
 
             // Update slot tracking for horizontal mode (enables partial updates next time)
-            if result.is_ok() && orientation == Orientation::Horizontal {
+            if display_started && orientation == Orientation::Horizontal {
                 slot_items[0] = index % total_items;
                 slot_items[1] = (index + 1) % total_items;
                 next_slot = 0;
                 index += 2;
                 use_partial = true; // Enable partial updates for subsequent refreshes
-            } else if result.is_ok() {
+            } else if display_started {
                 index += 1; // Vertical mode: advance by 1
             }
+
+            // Prefetch next image and refresh widget data while display is refreshing
+            if display_started {
+                // Connect WiFi now if we deferred it (using cached data path)
+                if !wifi_connected {
+                    println!("Connecting WiFi during display refresh...");
+                    wifi_connect(&mut controller).await;
+                    wait_for_ip(stack).await;
+                    wifi_connected = true;
+                }
+
+                // Prefetch next image
+                let prefetch_idx = index % total_items;
+                let prefetch_path = items[prefetch_idx].as_str();
+                if !sd_cache.has_image(prefetch_path, orientation) {
+                    println!("Prefetching next image: {}", prefetch_path);
+                    let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
+                    if let Ok(len) = display::fetch_png(
+                        &tcp_client,
+                        &dns_socket,
+                        &mut *tls_read_buf,
+                        &mut *tls_write_buf,
+                        &mut *prefetch_buf,
+                        SERVER_URL,
+                        "concerts",
+                        prefetch_path,
+                        orientation,
+                    )
+                    .await
+                    {
+                        if let Err(e) =
+                            sd_cache.write_image(prefetch_path, orientation, &prefetch_buf[..len])
+                        {
+                            println!("Prefetch cache store failed: {:?}", e);
+                        } else {
+                            println!("Prefetched and cached: {}", prefetch_path);
+                        }
+                    }
+                }
+
+                // Refresh widget data from server if we used cached data
+                if has_cached_data {
+                    println!("Refreshing widget data from server...");
+                    if let Ok(fresh_items) = display::fetch_widget_data(
+                        &tcp_client,
+                        &dns_socket,
+                        &mut *tls_read_buf,
+                        &mut *tls_write_buf,
+                        SERVER_URL,
+                        "concerts",
+                    )
+                    .await
+                    {
+                        // Check if data changed
+                        if fresh_items.len() != items.len()
+                            || fresh_items
+                                .iter()
+                                .zip(items.iter())
+                                .any(|(a, b)| a.as_str() != b.as_str())
+                        {
+                            println!("Widget data changed, updating cache");
+                            if let Err(e) = sd_cache.store_widget_data(&fresh_items) {
+                                println!("Failed to update widget data cache: {:?}", e);
+                            }
+                            // Invalidate stale image cache entries
+                            if let Ok(count) = sd_cache.cleanup_stale(&fresh_items)
+                                && count > 0
+                            {
+                                println!("Invalidated {} stale cache entries", count);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Now wait for display to finish
+            let result = if display_started {
+                while epd.is_busy() {
+                    Timer::after(Duration::from_millis(50)).await;
+                }
+                epd.finish_display(&mut delay)
+                    .map_err(|_| display::DisplayError::Network)
+            } else {
+                Err(display::DisplayError::Network)
+            };
+            stop_blink();
+            embassy_futures::yield_now().await;
 
             result
         };
@@ -886,71 +1058,6 @@ async fn main(spawner: Spawner) -> ! {
         match display_result {
             Ok(()) => println!("Display refresh successful!"),
             Err(e) => println!("Display refresh failed: {:?}", e),
-        }
-
-        // Prefetch next image while display is refreshing
-        let prefetch_idx = index % total_items;
-        let prefetch_path = items[prefetch_idx].as_str();
-        if !sd_cache.has_image(prefetch_path, orientation) {
-            println!("Prefetching next image: {}", prefetch_path);
-            let mut prefetch_buf: alloc::boxed::Box<[u8; 256 * 1024]> =
-                alloc::boxed::Box::new([0u8; 256 * 1024]);
-            if let Ok(len) = display::fetch_png(
-                &tcp_client,
-                &dns_socket,
-                &mut tls_read_buf,
-                &mut tls_write_buf,
-                &mut *prefetch_buf,
-                SERVER_URL,
-                "concerts",
-                prefetch_path,
-                orientation,
-            )
-            .await
-            {
-                if let Err(e) =
-                    sd_cache.write_image(prefetch_path, orientation, &prefetch_buf[..len])
-                {
-                    println!("Prefetch cache store failed: {:?}", e);
-                } else {
-                    println!("Prefetched and cached: {}", prefetch_path);
-                }
-            }
-        }
-
-        // Refresh widget data from server if we used cached data
-        if has_cached_data {
-            println!("Refreshing widget data from server...");
-            if let Ok(fresh_items) = display::fetch_widget_data(
-                &tcp_client,
-                &dns_socket,
-                &mut tls_read_buf,
-                &mut tls_write_buf,
-                SERVER_URL,
-                "concerts",
-            )
-            .await
-            {
-                // Check if data changed
-                if fresh_items.len() != items.len()
-                    || fresh_items
-                        .iter()
-                        .zip(items.iter())
-                        .any(|(a, b)| a.as_str() != b.as_str())
-                {
-                    println!("Widget data changed, updating cache");
-                    if let Err(e) = sd_cache.store_widget_data(&fresh_items) {
-                        println!("Failed to update widget data cache: {:?}", e);
-                    }
-                    // Invalidate stale image cache entries
-                    if let Ok(count) = sd_cache.cleanup_stale(&fresh_items)
-                        && count > 0 {
-                            println!("Invalidated {} stale cache entries", count);
-                        }
-                    // Note: items is not updated here since we're about to sleep
-                    // Next boot will use the fresh cached data
-                }
-            }
         }
 
         // Put display to sleep

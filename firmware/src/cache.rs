@@ -17,7 +17,7 @@ use embedded_sdmmc::{Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManag
 use esp_println::println;
 use heapless::String;
 
-use crate::widget::{Orientation, WidgetData, MAX_PATH_LEN};
+use crate::widget::{Orientation, WidgetData};
 
 /// Root directory (mirrors API path)
 const ROOT_DIR: &str = "concerts";
@@ -28,8 +28,8 @@ const HORIZ_DIR: &str = "horiz";
 /// Vertical orientation subdirectory
 const VERT_DIR: &str = "vert";
 
-/// Widget data filename (JSON array of item paths)
-const WIDGET_FILE: &str = "widget.json";
+/// Widget data filename (JSON array of item paths) - 8.3 format
+const WIDGET_FILE: &str = "WIDGET.JSN";
 
 /// Dummy time source (SD cards need timestamps but we don't care)
 pub struct DummyTimesource;
@@ -65,11 +65,16 @@ pub enum CacheError {
 }
 
 /// Generate cache filename for an image
-/// Format: {item_path}.png (orientation is in directory path)
-/// Example: 2024-06-15-band-id.png
-fn cache_filename(path: &str) -> String<64> {
-    let mut name: String<64> = String::new();
-    let _ = write!(name, "{}.png", path);
+/// Format: 8-char hash + .PNG (FAT 8.3 compatible)
+/// Uses djb2 hash of the path to create a short unique filename
+fn cache_filename(path: &str) -> String<16> {
+    // djb2 hash
+    let mut hash: u32 = 5381;
+    for byte in path.as_bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(*byte as u32);
+    }
+    let mut name: String<16> = String::new();
+    let _ = write!(name, "{:08X}.PNG", hash);
     name
 }
 
@@ -81,21 +86,26 @@ fn orientation_dir(orientation: Orientation) -> &'static str {
     }
 }
 
-/// Parse cache filename to extract item path
-/// Input: 2024-06-15-band-id.png
-/// Output: 2024-06-15-band-id
-fn parse_cache_filename(filename: &str) -> Option<String<MAX_PATH_LEN>> {
+/// Compute hash for a path (same algorithm as cache_filename)
+fn path_hash(path: &str) -> u32 {
+    let mut hash: u32 = 5381;
+    for byte in path.as_bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(*byte as u32);
+    }
+    hash
+}
+
+/// Parse cache filename to extract hash value
+/// Input: ABCD1234.PNG
+/// Output: hash value as u32
+fn parse_cache_filename(filename: &str) -> Option<u32> {
     // Remove .png suffix (FAT filesystems uppercase extensions)
     let name = filename
         .strip_suffix(".PNG")
         .or_else(|| filename.strip_suffix(".png"))?;
 
-    let mut path: String<MAX_PATH_LEN> = String::new();
-    if path.push_str(name).is_ok() {
-        Some(path)
-    } else {
-        None
-    }
+    // Parse hex string
+    u32::from_str_radix(name.trim(), 16).ok()
 }
 
 /// SD card image cache
@@ -352,6 +362,12 @@ where
 
     /// Remove cache entries not in the valid items list
     pub fn cleanup_stale(&mut self, valid_items: &WidgetData) -> Result<u32, CacheError> {
+        // Pre-compute hashes of valid items
+        let mut valid_hashes: heapless::Vec<u32, 128> = heapless::Vec::new();
+        for item in valid_items.iter() {
+            let _ = valid_hashes.push(path_hash(item.as_str()));
+        }
+
         let mut volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
@@ -371,7 +387,7 @@ where
                 continue;
             };
 
-            let mut to_delete: heapless::Vec<heapless::String<64>, 64> = heapless::Vec::new();
+            let mut to_delete: heapless::Vec<heapless::String<16>, 64> = heapless::Vec::new();
 
             // Find stale files
             orient_dir
@@ -380,7 +396,7 @@ where
                         let name = entry.name.base_name();
                         if let Ok(name_str) = core::str::from_utf8(name) {
                             let ext = entry.name.extension();
-                            let mut full_name: heapless::String<64> = heapless::String::new();
+                            let mut full_name: heapless::String<16> = heapless::String::new();
                             if let Ok(ext_str) = core::str::from_utf8(ext) {
                                 if !ext_str.is_empty() && ext_str.trim() != "" {
                                     let _ =
@@ -390,11 +406,12 @@ where
                                 }
                             }
 
-                            // Parse to get item path and check if valid
-                            if let Some(path) = parse_cache_filename(full_name.as_str())
-                                && !valid_items.iter().any(|p| p.as_str() == path.as_str()) {
+                            // Parse to get hash and check if valid
+                            if let Some(file_hash) = parse_cache_filename(full_name.as_str()) {
+                                if !valid_hashes.contains(&file_hash) {
                                     let _ = to_delete.push(full_name);
                                 }
+                            }
                         }
                     }
                 })
