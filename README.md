@@ -4,8 +4,8 @@ E-paper display frame for concert/album art data pulled from [sawthat.band](http
 
 Built on the [Waveshare ESP32-S3-PhotoPainter](https://www.amazon.com/dp/B0FWRJD8HZ):
 - 7.3" Spectra 6 color e-paper display
-- ESP32S3 with wifi and ble
-- 16MB Flash
+- ESP32-S3 with wifi and ble
+- SDMMC reader with included 16GB sdcard
 - GPIO Buttons and LEDs
 - (unused) Speaker, microphones
 
@@ -259,3 +259,14 @@ sequenceDiagram
 
     Note over FW: Cache and display
 ```
+
+### Image Processing Pipeline
+
+The server transforms source images into 6-color indexed PNGs for the e-paper display:
+
+1. **Resize**: Cover-fit with center crop (400×360 horizontal, 480×680 vertical)
+2. **Tone adjustments**: Exposure (×0.8), saturation boost (×2.0), and S-curve for mid-tones
+3. **Canvas composition**: Image area with gradient blend into solid background for text
+4. **Dithering**: Floyd-Steinberg error diffusion in OKLab color space to 6-color palette
+5. **Text rendering**: Concert info (band, date, venue) with adaptive font sizing
+6. **PNG encode**: Indexed color output with embedded palette
