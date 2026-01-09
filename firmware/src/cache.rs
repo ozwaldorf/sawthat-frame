@@ -14,7 +14,7 @@ use core::fmt::Write as FmtWrite;
 
 use embedded_hal::spi::SpiDevice;
 use embedded_sdmmc::{Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
-use esp_println::println;
+use log::info;
 use heapless::String;
 
 use crate::widget::{Orientation, WidgetData};
@@ -127,9 +127,9 @@ where
 
         // Get card size to verify it's working
         match sd_card.num_bytes() {
-            Ok(size) => println!("SD card size: {} MB", size / 1024 / 1024),
+            Ok(size) => info!("SD card size: {} MB", size / 1024 / 1024),
             Err(_) => {
-                println!("Failed to read SD card size");
+                info!("Failed to read SD card size");
                 return Err(CacheError::SdCard);
             }
         }
@@ -155,7 +155,7 @@ where
             root_dir
                 .make_dir_in_dir(ROOT_DIR)
                 .map_err(|_| CacheError::Filesystem)?;
-            println!("Created {} directory", ROOT_DIR);
+            info!("Created {} directory", ROOT_DIR);
         }
 
         // Open concerts directory
@@ -168,7 +168,7 @@ where
             concerts_dir
                 .make_dir_in_dir(HORIZ_DIR)
                 .map_err(|_| CacheError::Filesystem)?;
-            println!("Created {}/{} directory", ROOT_DIR, HORIZ_DIR);
+            info!("Created {}/{} directory", ROOT_DIR, HORIZ_DIR);
         }
 
         // Create /concerts/vert/ if it doesn't exist
@@ -176,10 +176,10 @@ where
             concerts_dir
                 .make_dir_in_dir(VERT_DIR)
                 .map_err(|_| CacheError::Filesystem)?;
-            println!("Created {}/{} directory", ROOT_DIR, VERT_DIR);
+            info!("Created {}/{} directory", ROOT_DIR, VERT_DIR);
         }
 
-        println!("Cache directory structure ready");
+        info!("Cache directory structure ready");
         Ok(())
     }
 
@@ -247,7 +247,7 @@ where
             }
         }
 
-        println!(
+        info!(
             "Read {} bytes from cache: {}/{}/{}",
             total_read, ROOT_DIR, orient, filename
         );
@@ -287,7 +287,7 @@ where
         // Write data
         file.write(data).map_err(|_| CacheError::Write)?;
 
-        println!(
+        info!(
             "Wrote {} bytes to cache: {}/{}/{}",
             data.len(),
             ROOT_DIR,
@@ -325,7 +325,7 @@ where
         if data.is_empty() {
             None
         } else {
-            println!("Loaded {} cached widget items from JSON", data.len());
+            info!("Loaded {} cached widget items from JSON", data.len());
             Some(data)
         }
     }
@@ -359,7 +359,7 @@ where
         }
         file.write(b"]").map_err(|_| CacheError::Write)?;
 
-        println!("Stored {} widget items to cache JSON", items.len());
+        info!("Stored {} widget items to cache JSON", items.len());
         Ok(())
     }
 
@@ -377,7 +377,7 @@ where
         file.read(&mut buf).ok()?;
 
         let orientation = Orientation::from_u8(buf[0]);
-        println!("Loaded orientation from cache: {:?}", orientation);
+        info!("Loaded orientation from cache: {:?}", orientation);
         Some(orientation)
     }
 
@@ -401,7 +401,7 @@ where
         file.write(&[orientation as u8])
             .map_err(|_| CacheError::Write)?;
 
-        println!("Stored orientation to cache: {:?}", orientation);
+        info!("Stored orientation to cache: {:?}", orientation);
         Ok(())
     }
 
@@ -465,7 +465,7 @@ where
             // Delete stale files from this orientation directory
             for filename in to_delete.iter() {
                 if orient_dir.delete_file_in_dir(filename.as_str()).is_ok() {
-                    println!("Removed stale cache: {}/{}/{}", ROOT_DIR, orient, filename);
+                    info!("Removed stale cache: {}/{}/{}", ROOT_DIR, orient, filename);
                     removed += 1;
                 }
             }

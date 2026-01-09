@@ -16,7 +16,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use embedded_io_async::Read;
 use embedded_nal_async::{Dns, TcpConnect};
-use esp_println::println;
+use log::info;
 use heapless::String;
 use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
 use reqwless::request::Method;
@@ -76,7 +76,7 @@ where
     framebuffer.clear(Color::White);
 
     let total_items = items.len();
-    println!(
+    info!(
         "Fetching images starting at index {} (connection reuse enabled)",
         start_index
     );
@@ -114,7 +114,7 @@ where
             400
         };
 
-        println!("Fetching image {}: {}", item_idx, item.as_str());
+        info!("Fetching image {}: {}", item_idx, item.as_str());
 
         // Build relative path for image (includes orientation)
         let mut path: String<256> = String::new();
@@ -127,7 +127,7 @@ where
         )
         .is_err()
         {
-            println!("Path too long, skipping image");
+            info!("Path too long, skipping image");
             fill_half(framebuffer, x_offset);
             continue;
         }
@@ -162,7 +162,7 @@ where
 
         match result {
             Ok(png_len) => {
-                println!("Received {} bytes of PNG data", png_len);
+                info!("Received {} bytes of PNG data", png_len);
                 if let Err(e) = decode_png_to_framebuffer(
                     &png_buf[..png_len],
                     framebuffer,
@@ -170,12 +170,12 @@ where
                     &mut *decode_buf,
                     orientation,
                 ) {
-                    println!("Error decoding PNG: {:?}", e);
+                    info!("Error decoding PNG: {:?}", e);
                     fill_half(framebuffer, x_offset);
                 }
             }
             Err(e) => {
-                println!("Error fetching image {}: {:?}", item_idx, e);
+                info!("Error fetching image {}: {:?}", item_idx, e);
                 fill_half(framebuffer, x_offset);
             }
         }
@@ -186,7 +186,7 @@ where
         framebuffer.fill_right_half(Color::White);
     }
 
-    println!("Framebuffer ready for display");
+    info!("Framebuffer ready for display");
     Ok(())
 }
 
@@ -222,7 +222,7 @@ where
     let x_offset = if slot == 0 { 0 } else { 400 };
     let item = &items[item_idx];
 
-    println!(
+    info!(
         "Fetching single image {} for slot {} (x_offset={})",
         item_idx, slot, x_offset
     );
@@ -253,7 +253,7 @@ where
     )
     .is_err()
     {
-        println!("Path too long, filling with white");
+        info!("Path too long, filling with white");
         fill_half(framebuffer, x_offset);
         return Ok(());
     }
@@ -288,7 +288,7 @@ where
 
     match result {
         Ok(png_len) => {
-            println!("Received {} bytes of PNG data", png_len);
+            info!("Received {} bytes of PNG data", png_len);
             if let Err(e) = decode_png_to_framebuffer(
                 &png_buf[..png_len],
                 framebuffer,
@@ -296,17 +296,17 @@ where
                 &mut *decode_buf,
                 Orientation::Horizontal,
             ) {
-                println!("Error decoding PNG: {:?}", e);
+                info!("Error decoding PNG: {:?}", e);
                 fill_half(framebuffer, x_offset);
             }
         }
         Err(e) => {
-            println!("Error fetching image {}: {:?}", item_idx, e);
+            info!("Error fetching image {}: {:?}", item_idx, e);
             fill_half(framebuffer, x_offset);
         }
     }
 
-    println!("Single image fetch complete for slot {}", slot);
+    info!("Single image fetch complete for slot {}", slot);
     Ok(())
 }
 
@@ -323,10 +323,10 @@ where
     RST: OutputPin,
     DELAY: DelayNs,
 {
-    println!("Updating display...");
+    info!("Updating display...");
     epd.display(framebuffer.as_slice(), delay)
         .map_err(|_| DisplayError::Network)?;
-    println!("Display updated!");
+    info!("Display updated!");
     Ok(())
 }
 
@@ -351,7 +351,7 @@ where
     let mut path: String<256> = String::new();
     write!(&mut path, "/{}", widget_name).map_err(|_| DisplayError::Network)?;
 
-    println!("Fetching widget data from {}{}", server_url, path.as_str());
+    info!("Fetching widget data from {}{}", server_url, path.as_str());
 
     // Establish connection and make request
     let mut resource = client
@@ -386,7 +386,7 @@ where
 
     let json_str = core::str::from_utf8(&json_buf[..json_len])
         .map_err(|_| DisplayError::Json("invalid utf8"))?;
-    println!("Received {} bytes of JSON", json_len);
+    info!("Received {} bytes of JSON", json_len);
 
     let items = parse_widget_data(json_str).map_err(DisplayError::Json)?;
 
@@ -394,7 +394,7 @@ where
         return Err(DisplayError::NoItems);
     }
 
-    println!("Got {} widget items", items.len());
+    info!("Got {} widget items", items.len());
     Ok(items)
 }
 
@@ -417,7 +417,7 @@ pub fn shuffle_items(items: &mut WidgetData, seed: u64) {
         items.swap(i, j);
     }
 
-    println!("Shuffled {} items", len);
+    info!("Shuffled {} items", len);
 }
 
 fn fill_half(framebuffer: &mut Framebuffer, x_offset: u32) {
@@ -441,7 +441,7 @@ fn decode_png_to_framebuffer(
     let header = minipng::decode_png_header(png_data)
         .map_err(|_| DisplayError::Png("invalid PNG header"))?;
 
-    println!(
+    info!(
         "PNG: {}x{} {:?}",
         header.width(),
         header.height(),
@@ -449,7 +449,7 @@ fn decode_png_to_framebuffer(
     );
 
     let image = minipng::decode_png(png_data, decode_buf).map_err(|e| {
-        println!("minipng error: {:?}", e);
+        info!("minipng error: {:?}", e);
         DisplayError::Png("PNG decode failed")
     })?;
 
@@ -495,7 +495,7 @@ fn decode_png_to_framebuffer(
         }
     }
 
-    println!("PNG decode complete, {}x{} processed", width, height);
+    info!("PNG decode complete, {}x{} processed", width, height);
 
     Ok(())
 }
@@ -575,7 +575,7 @@ where
         }
     }
 
-    println!("Fetched {} bytes from network", png_len);
+    info!("Fetched {} bytes from network", png_len);
     Ok(png_len)
 }
 

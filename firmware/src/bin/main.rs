@@ -13,6 +13,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use core::time::Duration as CoreDuration;
+use log::info;
 
 use embassy_executor::Spawner;
 use embassy_net::{
@@ -42,7 +43,6 @@ use esp_hal::{
     time::Rate,
     timer::timg::TimerGroup,
 };
-use esp_println::println;
 use esp_radio::{
     Controller,
     wifi::{ClientConfig, Config as WifiConfig, ModeConfig, WifiController, WifiDevice},
@@ -53,6 +53,7 @@ use sawthat_frame_firmware::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZ
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
 use sawthat_frame_firmware::widget::{Orientation, WidgetData};
+use sawthat_frame_firmware::TimestampLogger;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -212,8 +213,8 @@ fn stop_blink() {
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    // Init logger first so we can see any early crashes
-    esp_println::logger::init_logger_from_env();
+    // Init timestamped logger for all log crate output (including ESP libs)
+    TimestampLogger::init(log::LevelFilter::Info);
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -297,22 +298,22 @@ async fn main(spawner: Spawner) -> ! {
 
     // ==================== Normal Boot Sequence ====================
     // Now do the heavier initialization
-    println!("Boot! Wake reason: {:?}", wake_reason);
+    info!("Boot! Wake reason: {:?}", wake_reason);
 
     // Wait for USB serial to reconnect after deep sleep wake
     esp_hal::delay::Delay::new().delay_millis(2000);
 
     // Initialize internal RAM heap (for smaller allocations)
-    println!("Initializing heap...");
+    info!("Initializing heap...");
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 36 * 1024);
 
     // Initialize PSRAM for large allocations (framebuffer, PNG buffer)
-    println!("Initializing PSRAM...");
+    info!("Initializing PSRAM...");
     esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
-    println!("PSRAM initialized");
+    info!("PSRAM initialized");
 
-    println!("Starting RTOS...");
+    info!("Starting RTOS...");
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(
         timg0.timer0,
@@ -320,11 +321,11 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT)
             .software_interrupt0,
     );
-    println!("RTOS started");
+    info!("RTOS started");
 
     // ==================== SD Card Cache Initialization ====================
     // SD card SPI pins: CS=GPIO38, CLK=GPIO39, MISO=GPIO40, MOSI=GPIO41
-    println!("Initializing SD card cache...");
+    info!("Initializing SD card cache...");
 
     let sd_spi = Spi::new(
         peripherals.SPI2,
@@ -343,12 +344,12 @@ async fn main(spawner: Spawner) -> ! {
     let mut sd_cache = match SdCache::new(sd_spi_device, delay.clone()) {
         Ok(mut cache) => {
             if let Err(e) = cache.init() {
-                println!("SD cache init error: {:?}", e);
+                info!("SD cache init error: {:?}", e);
             }
             Some(cache)
         }
         Err(e) => {
-            println!("SD card init failed: {:?} (cache disabled)", e);
+            info!("SD card init failed: {:?} (cache disabled)", e);
             None
         }
     };
@@ -356,7 +357,7 @@ async fn main(spawner: Spawner) -> ! {
     // Try to load widget data from cache (for cache-first boot)
     let cached_items = sd_cache.as_mut().and_then(|c| c.load_widget_data());
     let has_cached_data = cached_items.is_some();
-    println!(
+    info!(
         "Cached widget data: {}",
         if has_cached_data { "found" } else { "not found" }
     );
@@ -366,19 +367,19 @@ async fn main(spawner: Spawner) -> ! {
         // Orientation was changed during boot button hold - save to SD card
         if let Some(cache) = sd_cache.as_mut() {
             if let Err(e) = cache.store_orientation(orientation) {
-                println!("Failed to store orientation: {:?}", e);
+                info!("Failed to store orientation: {:?}", e);
             }
         }
     } else if let Some(cached_orient) = sd_cache.as_mut().and_then(|c| c.load_orientation()) {
         // Load orientation from SD card (persistent across power cycles)
         orientation = cached_orient;
-        println!("Using cached orientation: {:?}", orientation);
+        info!("Using cached orientation: {:?}", orientation);
     }
 
     // ==================== Power Management (AXP2101) ====================
     // SawThat Frame uses AXP2101 PMIC to control display power
     // I2C: SDA=GPIO47, SCL=GPIO48, Address=0x34
-    println!("Initializing AXP2101 PMIC...");
+    info!("Initializing AXP2101 PMIC...");
 
     let mut i2c = I2c::new(
         peripherals.I2C0,
@@ -406,8 +407,8 @@ async fn main(spawner: Spawner) -> ! {
     })();
 
     match pmic_ok {
-        Ok(()) => println!("PMIC configured - ALDO3/ALDO4 enabled at 3.3V"),
-        Err(e) => println!("PMIC config skipped (may be pre-configured): {:?}", e),
+        Ok(()) => info!("PMIC configured - ALDO3/ALDO4 enabled at 3.3V"),
+        Err(e) => info!("PMIC config skipped (may be pre-configured): {:?}", e),
     }
 
     // Small delay for power rails to stabilize
@@ -439,13 +440,13 @@ async fn main(spawner: Spawner) -> ! {
     let mut rst = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
 
     // Debug: check BUSY pin state
-    println!(
+    info!(
         "BUSY pin initial state: {}",
         if busy.is_high() { "HIGH" } else { "LOW" }
     );
 
     // Manual hardware reset before init (matches C driver timing)
-    println!("Performing hardware reset...");
+    info!("Performing hardware reset...");
     rst.set_high();
     delay.delay_ms(50);
     rst.set_low();
@@ -453,15 +454,15 @@ async fn main(spawner: Spawner) -> ! {
     rst.set_high();
     delay.delay_ms(50);
 
-    println!(
+    info!(
         "BUSY pin after reset: {}",
         if busy.is_high() { "HIGH" } else { "LOW" }
     );
 
-    println!("Initializing e-paper display (fast mode)...");
+    info!("Initializing e-paper display (fast mode)...");
     let mut epd = Epd7in3e::new(spi_device, busy, dc, rst, &mut delay, RefreshMode::Fast)
         .expect("EPD init failed");
-    println!("EPD initialized!");
+    info!("EPD initialized!");
 
     // ==================== WiFi Setup (Deferred) ====================
     // Keep WiFi peripheral for lazy initialization - saves ~500-1000ms on cached boots
@@ -478,33 +479,33 @@ async fn main(spawner: Spawner) -> ! {
     let mut rtc = Rtc::new(peripherals.LPWR);
 
     // ==================== Main Display Logic ====================
-    println!("Starting display update...");
-    println!("Edge URL: {}", SERVER_URL);
-    println!("Refresh interval: {} seconds", REFRESH_INTERVAL_SECS);
+    info!("Starting display update...");
+    info!("Edge URL: {}", SERVER_URL);
+    info!("Refresh interval: {} seconds", REFRESH_INTERVAL_SECS);
 
     if button_wake {
         if advance_item {
-            println!("Button tap: will advance to next item");
+            info!("Button tap: will advance to next item");
         } else {
-            println!("Button hold: toggled orientation to {:?}", orientation);
+            info!("Button hold: toggled orientation to {:?}", orientation);
         }
     } else if resuming {
         let (index, total) = unsafe {
             let state = &raw const SLEEP_STATE;
             ((*state).index, (*state).total_items)
         };
-        println!(
+        info!(
             "Resuming from deep sleep: index={}, total={}, orientation={:?}",
             index, total, orientation
         );
     } else {
-        println!("Fresh boot (no valid sleep state)");
+        info!("Fresh boot (no valid sleep state)");
     }
 
     // Allocate framebuffer (uses PSRAM for the 192KB buffer)
-    println!("Allocating framebuffer...");
+    info!("Allocating framebuffer...");
     let mut framebuffer = Framebuffer::new();
-    println!("Framebuffer allocated!");
+    info!("Framebuffer allocated!");
 
     // Use RNG for shuffle seed
     let rng = Rng::new();
@@ -521,7 +522,7 @@ async fn main(spawner: Spawner) -> ! {
     macro_rules! ensure_wifi {
         () => {{
             if !wifi_connected {
-                println!("Initializing WiFi (deferred)...");
+                info!("Initializing WiFi (deferred)...");
                 start_fast_blink(); // Visual feedback during slow init
 
                 // Initialize esp-radio (this is the slow part ~500-1000ms)
@@ -557,16 +558,16 @@ async fn main(spawner: Spawner) -> ! {
                 wifi_connect(wifi_controller.as_mut().unwrap()).await;
                 wait_for_ip(*stk).await;
                 wifi_connected = true;
-                println!("WiFi ready!");
+                info!("WiFi ready!");
             }
         }};
     }
 
     // Fetch widget data (use cache if available, then refresh from network)
     // Keep boxed to avoid 6KB on stack
-    println!("Fetching widget data...");
+    info!("Fetching widget data...");
     let mut items: Box<WidgetData> = if let Some(cached) = cached_items {
-        println!("Using cached widget data ({} items)", cached.len());
+        info!("Using cached widget data ({} items)", cached.len());
         Box::new(cached)
     } else {
         // No cache - must fetch from network
@@ -590,13 +591,13 @@ async fn main(spawner: Spawner) -> ! {
                     // Store in cache for next boot
                     if let Some(cache) = sd_cache.as_mut() {
                         if let Err(e) = cache.store_widget_data(&data) {
-                            println!("Failed to cache widget data: {:?}", e);
+                            info!("Failed to cache widget data: {:?}", e);
                         }
                     }
                     break data;
                 }
                 Err(e) => {
-                    println!("Failed to fetch widget data: {:?}, retrying in 30s...", e);
+                    info!("Failed to fetch widget data: {:?}, retrying in 30s...", e);
                     Timer::after(Duration::from_secs(30)).await;
                 }
             }
@@ -640,21 +641,21 @@ async fn main(spawner: Spawner) -> ! {
         && saved_index >= 2; // At least one full refresh has happened
 
     let (mut index, mut next_slot, mut slot_items, mut use_partial) = if can_partial {
-        println!(
+        info!(
             "Resuming with partial update: slot={}, slot_items=[{}, {}], index={}",
             saved_next_slot, saved_slot_items[0], saved_slot_items[1], saved_index
         );
         (saved_index, saved_next_slot, saved_slot_items, true)
     } else if data_matches {
-        println!("Resuming from index {} (full refresh)", saved_index);
+        info!("Resuming from index {} (full refresh)", saved_index);
         (saved_index, 0u8, [0usize, 0usize], false)
     } else {
-        println!("Fresh start or data changed");
+        info!("Fresh start or data changed");
         (0, 0u8, [0usize, 0usize], false)
     };
 
     let total_items = items.len();
-    println!("Displaying {} items in shuffled order", total_items);
+    info!("Displaying {} items in shuffled order", total_items);
 
     // Buffer for partial updates (400x480 = 96000 bytes)
     const HALF_BUFFER_SIZE: usize = 400 * 480 / 2;
@@ -663,12 +664,12 @@ async fn main(spawner: Spawner) -> ! {
     loop {
         // If we've shown all items, start over
         if index >= total_items {
-            println!("All items shown, starting over");
+            info!("All items shown, starting over");
             index = 0;
         }
 
         // Wake up display
-        println!("Waking up display...");
+        info!("Waking up display...");
         epd.wake_up(&mut delay).expect("Failed to wake display");
 
         // Read battery percentage
@@ -676,11 +677,11 @@ async fn main(spawner: Spawner) -> ! {
             let mut buf = [0u8; 1];
             match i2c.write_read(AXP2101_ADDR, &[BAT_PERCENT_REG], &mut buf) {
                 Ok(()) => {
-                    println!("Battery: {}%", buf[0]);
+                    info!("Battery: {}%", buf[0]);
                     buf[0]
                 }
                 Err(e) => {
-                    println!("Failed to read battery: {:?}", e);
+                    info!("Failed to read battery: {:?}", e);
                     50 // Default to 50% on error
                 }
             }
@@ -691,7 +692,7 @@ async fn main(spawner: Spawner) -> ! {
             // Only update one half of the display with a single new item
             let item_idx = index % total_items;
             let item_path = items[item_idx].as_str();
-            println!(
+            info!(
                 "Partial update: slot={}, item={} of {}",
                 next_slot, item_idx, total_items
             );
@@ -705,12 +706,12 @@ async fn main(spawner: Spawner) -> ! {
             // Check cache first
             let cache_hit = sd_cache.as_mut().map_or(false, |c| c.has_image(item_path, Orientation::Horizontal));
             let png_len = if cache_hit {
-                println!("Cache HIT: {}", item_path);
+                info!("Cache HIT: {}", item_path);
                 sd_cache.as_mut()
                     .and_then(|c| c.read_image(item_path, Orientation::Horizontal, &mut *png_buf).ok())
                     .unwrap_or_default()
             } else {
-                println!("Cache MISS: {}", item_path);
+                info!("Cache MISS: {}", item_path);
                 // Initialize and connect WiFi if not already connected
                 ensure_wifi!();
                 match display::fetch_png(
@@ -729,13 +730,13 @@ async fn main(spawner: Spawner) -> ! {
                     Ok(len) => {
                         if let Some(cache) = sd_cache.as_mut() {
                             if let Err(e) = cache.write_image(item_path, Orientation::Horizontal, &png_buf[..len]) {
-                                println!("Cache store failed: {:?}", e);
+                                info!("Cache store failed: {:?}", e);
                             }
                         }
                         len
                     }
                     Err(e) => {
-                        println!("Fetch failed: {:?}", e);
+                        info!("Fetch failed: {:?}", e);
                         0
                     }
                 }
@@ -778,7 +779,7 @@ async fn main(spawner: Spawner) -> ! {
                     let x_offset = if next_slot == 0 { 0 } else { 400 };
                     let rect = Rect::new(x_offset, 0, 400, 480);
 
-                    println!("Partial refresh: x={}, w={}, h={}", x_offset, 400, 480);
+                    info!("Partial refresh: x={}, w={}, h={}", x_offset, 400, 480);
 
                     epd.partial_update_start(&rect, &half_buffer, &mut delay).is_ok()
                 }
@@ -802,7 +803,7 @@ async fn main(spawner: Spawner) -> ! {
                     let prefetch_idx = index % total_items;
                     let prefetch_path = items[prefetch_idx].as_str();
                     if !cache.has_image(prefetch_path, Orientation::Horizontal) {
-                        println!("Prefetching next image: {}", prefetch_path);
+                        info!("Prefetching next image: {}", prefetch_path);
                         let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
                         if let Ok(len) = display::fetch_png(
                             tcp_client.as_ref().unwrap(),
@@ -818,9 +819,9 @@ async fn main(spawner: Spawner) -> ! {
                         .await
                         {
                             if let Err(e) = cache.write_image(prefetch_path, Orientation::Horizontal, &prefetch_buf[..len]) {
-                                println!("Prefetch cache store failed: {:?}", e);
+                                info!("Prefetch cache store failed: {:?}", e);
                             } else {
-                                println!("Prefetched and cached: {}", prefetch_path);
+                                info!("Prefetched and cached: {}", prefetch_path);
                             }
                         }
                     }
@@ -828,7 +829,7 @@ async fn main(spawner: Spawner) -> ! {
 
                 // Refresh widget data from server if we used cached data
                 if has_cached_data {
-                    println!("Refreshing widget data from server...");
+                    info!("Refreshing widget data from server...");
                     if let Ok(fresh_items) = display::fetch_widget_data(
                         tcp_client.as_ref().unwrap(),
                         dns_socket.as_ref().unwrap(),
@@ -845,15 +846,15 @@ async fn main(spawner: Spawner) -> ! {
                                 .zip(items.iter())
                                 .any(|(a, b)| a.as_str() != b.as_str())
                         {
-                            println!("Widget data changed, updating cache");
+                            info!("Widget data changed, updating cache");
                             if let Some(cache) = sd_cache.as_mut() {
                                 if let Err(e) = cache.store_widget_data(&fresh_items) {
-                                    println!("Failed to update widget data cache: {:?}", e);
+                                    info!("Failed to update widget data cache: {:?}", e);
                                 }
                                 if let Ok(count) = cache.cleanup_stale(&fresh_items)
                                     && count > 0
                                 {
-                                    println!("Invalidated {} stale cache entries", count);
+                                    info!("Invalidated {} stale cache entries", count);
                                 }
                             }
                         }
@@ -878,7 +879,7 @@ async fn main(spawner: Spawner) -> ! {
         } else {
             // ==================== Full Refresh Mode (Cache-Aware) ====================
             // Update entire display with 2 items (horizontal) or 1 item (vertical)
-            println!(
+            info!(
                 "Full refresh: items {} and {} of {}",
                 index,
                 (index + 1).min(total_items - 1),
@@ -908,12 +909,12 @@ async fn main(spawner: Spawner) -> ! {
                 // Check cache first
                 let cache_hit = sd_cache.as_mut().map_or(false, |c| c.has_image(item_path, orientation));
                 let png_len = if cache_hit {
-                    println!("Cache HIT: {}", item_path);
+                    info!("Cache HIT: {}", item_path);
                     sd_cache.as_mut()
                         .and_then(|c| c.read_image(item_path, orientation, &mut *png_buf).ok())
                         .unwrap_or_default()
                 } else {
-                    println!("Cache MISS: {}", item_path);
+                    info!("Cache MISS: {}", item_path);
                     // Initialize and connect WiFi if not already connected
                     ensure_wifi!();
                     // Fetch from network
@@ -934,13 +935,13 @@ async fn main(spawner: Spawner) -> ! {
                             // Store in cache
                             if let Some(cache) = sd_cache.as_mut() {
                                 if let Err(e) = cache.write_image(item_path, orientation, &png_buf[..len]) {
-                                    println!("Cache store failed: {:?}", e);
+                                    info!("Cache store failed: {:?}", e);
                                 }
                             }
                             len
                         }
                         Err(e) => {
-                            println!("Fetch failed: {:?}", e);
+                            info!("Fetch failed: {:?}", e);
                             0
                         }
                     }
@@ -954,7 +955,7 @@ async fn main(spawner: Spawner) -> ! {
                         slot as u8,
                         orientation,
                     ) {
-                        println!("Render failed: {:?}", e);
+                        info!("Render failed: {:?}", e);
                         fetch_ok = false;
                     }
                 } else {
@@ -991,7 +992,7 @@ async fn main(spawner: Spawner) -> ! {
             // Start display update
             let display_started = match fetch_result {
                 Ok(()) => {
-                    println!("Updating display (full refresh)...");
+                    info!("Updating display (full refresh)...");
                     epd.display_start(framebuffer.as_slice(), &mut delay).is_ok()
                 }
                 Err(_) => false,
@@ -1018,7 +1019,7 @@ async fn main(spawner: Spawner) -> ! {
                     let prefetch_idx = index % total_items;
                     let prefetch_path = items[prefetch_idx].as_str();
                     if !cache.has_image(prefetch_path, orientation) {
-                        println!("Prefetching next image: {}", prefetch_path);
+                        info!("Prefetching next image: {}", prefetch_path);
                         let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
                         if let Ok(len) = display::fetch_png(
                             tcp_client.as_ref().unwrap(),
@@ -1034,9 +1035,9 @@ async fn main(spawner: Spawner) -> ! {
                         .await
                         {
                             if let Err(e) = cache.write_image(prefetch_path, orientation, &prefetch_buf[..len]) {
-                                println!("Prefetch cache store failed: {:?}", e);
+                                info!("Prefetch cache store failed: {:?}", e);
                             } else {
-                                println!("Prefetched and cached: {}", prefetch_path);
+                                info!("Prefetched and cached: {}", prefetch_path);
                             }
                         }
                     }
@@ -1044,7 +1045,7 @@ async fn main(spawner: Spawner) -> ! {
 
                 // Refresh widget data from server if we used cached data
                 if has_cached_data {
-                    println!("Refreshing widget data from server...");
+                    info!("Refreshing widget data from server...");
                     if let Ok(fresh_items) = display::fetch_widget_data(
                         tcp_client.as_ref().unwrap(),
                         dns_socket.as_ref().unwrap(),
@@ -1062,16 +1063,16 @@ async fn main(spawner: Spawner) -> ! {
                                 .zip(items.iter())
                                 .any(|(a, b)| a.as_str() != b.as_str())
                         {
-                            println!("Widget data changed, updating cache");
+                            info!("Widget data changed, updating cache");
                             if let Some(cache) = sd_cache.as_mut() {
                                 if let Err(e) = cache.store_widget_data(&fresh_items) {
-                                    println!("Failed to update widget data cache: {:?}", e);
+                                    info!("Failed to update widget data cache: {:?}", e);
                                 }
                                 // Invalidate stale image cache entries
                                 if let Ok(count) = cache.cleanup_stale(&fresh_items)
                                     && count > 0
                                 {
-                                    println!("Invalidated {} stale cache entries", count);
+                                    info!("Invalidated {} stale cache entries", count);
                                 }
                             }
                         }
@@ -1096,21 +1097,21 @@ async fn main(spawner: Spawner) -> ! {
         };
 
         match display_result {
-            Ok(()) => println!("Display refresh successful!"),
-            Err(e) => println!("Display refresh failed: {:?}", e),
+            Ok(()) => info!("Display refresh successful!"),
+            Err(e) => info!("Display refresh failed: {:?}", e),
         }
 
         // Put display to sleep
-        println!("Putting display to sleep...");
+        info!("Putting display to sleep...");
         epd.sleep(&mut delay).expect("Failed to sleep display");
 
         // Wait 10s for button input before deep sleep
-        println!("Press KEY within 10s (tap=next item, hold=rotate)...");
+        info!("Press KEY within 10s (tap=next item, hold=rotate)...");
         let mut should_redisplay = false;
         const HOLD_THRESHOLD_MS: u32 = 500;
         for _ in 0..100 {
             if key_input.is_low() {
-                println!("KEY pressed, polling for hold...");
+                info!("KEY pressed, polling for hold...");
 
                 // Poll every 50ms to detect hold vs tap
                 let mut hold_time_ms: u32 = 0;
@@ -1124,12 +1125,12 @@ async fn main(spawner: Spawner) -> ! {
 
                 if hold_time_ms >= HOLD_THRESHOLD_MS {
                     // Button held >= 500ms - toggle orientation
-                    println!("Button held! Toggling orientation...");
+                    info!("Button held! Toggling orientation...");
                     orientation = orientation.toggle();
                     // Save to SD card
                     if let Some(cache) = sd_cache.as_mut() {
                         if let Err(e) = cache.store_orientation(orientation) {
-                            println!("Failed to store orientation: {:?}", e);
+                            info!("Failed to store orientation: {:?}", e);
                         }
                     }
                     // Reset partial mode on orientation change
@@ -1150,10 +1151,10 @@ async fn main(spawner: Spawner) -> ! {
                         delay.delay_ms(50);
                     }
 
-                    println!("Re-displaying with orientation: {:?}", orientation);
+                    info!("Re-displaying with orientation: {:?}", orientation);
                 } else {
                     // Button released before 500ms - show next item
-                    println!("Button tap, next item (index={})", index);
+                    info!("Button tap, next item (index={})", index);
 
                     // Flash LED2 1 time to confirm next item
                     led_green.set_low(); // ON
@@ -1187,24 +1188,24 @@ async fn main(spawner: Spawner) -> ! {
             &items,
         );
     }
-    println!(
+    info!(
         "Saved state: index={}, total={}, orientation={:?}, next_slot={}, slot_items=[{}, {}]",
         index, total_items, orientation, next_slot, slot_items[0], slot_items[1]
     );
 
     // Disconnect WiFi before deep sleep (only if it was initialized)
     if let Some(ctrl) = wifi_controller.as_mut() {
-        println!("Disconnecting WiFi for deep sleep...");
+        info!("Disconnecting WiFi for deep sleep...");
         wifi_disconnect(ctrl).await;
     } else {
-        println!("WiFi was never initialized, skipping disconnect");
+        info!("WiFi was never initialized, skipping disconnect");
     }
 
     // Reclaim GPIO4 for deep sleep wake source
     let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
 
     // Enter deep sleep
-    println!(
+    info!(
         "Entering deep sleep for {} seconds (press button to wake early)...",
         REFRESH_INTERVAL_SECS
     );
@@ -1238,7 +1239,7 @@ fn enter_deep_sleep<P: esp_hal::gpio::RtcPinWithResistors>(
 /// Connect to WiFi network
 async fn wifi_connect(controller: &mut WifiController<'static>) {
     start_fast_blink();
-    println!("Device capabilities: {:?}", controller.capabilities());
+    info!("Device capabilities: {:?}", controller.capabilities());
 
     if !matches!(controller.is_started(), Ok(true)) {
         let client_config = ModeConfig::Client(
@@ -1247,21 +1248,21 @@ async fn wifi_connect(controller: &mut WifiController<'static>) {
                 .with_password(PASSWORD.into()),
         );
         controller.set_config(&client_config).unwrap();
-        println!("Starting WiFi...");
+        info!("Starting WiFi...");
         controller.start_async().await.unwrap();
-        println!("WiFi started!");
+        info!("WiFi started!");
     }
 
-    println!("Connecting to {}...", SSID);
+    info!("Connecting to {}...", SSID);
     loop {
         match controller.connect_async().await {
             Ok(_) => {
-                println!("WiFi connected!");
+                info!("WiFi connected!");
                 stop_blink();
                 break;
             }
             Err(e) => {
-                println!("Failed to connect: {e:?}, retrying...");
+                info!("Failed to connect: {e:?}, retrying...");
                 Timer::after(Duration::from_secs(5)).await;
             }
         }
@@ -1271,29 +1272,29 @@ async fn wifi_connect(controller: &mut WifiController<'static>) {
 /// Disconnect and stop WiFi to save power
 async fn wifi_disconnect(controller: &mut WifiController<'static>) {
     if let Err(e) = controller.disconnect_async().await {
-        println!("Disconnect error (may already be disconnected): {:?}", e);
+        info!("Disconnect error (may already be disconnected): {:?}", e);
     }
     if let Err(e) = controller.stop_async().await {
-        println!("Stop error: {:?}", e);
+        info!("Stop error: {:?}", e);
     }
-    println!("WiFi stopped");
+    info!("WiFi stopped");
 }
 
 /// Wait for network stack to get an IP address
 async fn wait_for_ip(stack: Stack<'static>) {
-    println!("Waiting for link...");
+    info!("Waiting for link...");
     loop {
         if stack.is_link_up() {
             break;
         }
         Timer::after(Duration::from_millis(500)).await;
     }
-    println!("Link up!");
+    info!("Link up!");
 
-    println!("Waiting for IP...");
+    info!("Waiting for IP...");
     loop {
         if let Some(config) = stack.config_v4() {
-            println!("Got IP: {}", config.address);
+            info!("Got IP: {}", config.address);
             break;
         }
         Timer::after(Duration::from_millis(500)).await;
