@@ -1,14 +1,14 @@
 //! SD card-based image cache
 //!
 //! Stores PNG images directly on the SD card's FAT filesystem.
-//! Filenames encode the item path and orientation for easy lookup.
+//! Directory structure mirrors the API paths:
 //!
-//! Directory structure:
-//! /cache/
-//!   YYYY-MM-DD-horiz-band-id.png   - horizontal orientation image
-//!   YYYY-MM-DD-vert-band-id.png    - vertical orientation image
-//!
-//! Item paths can be reconstructed from filenames by removing orientation suffix.
+//! /concerts/
+//!   widget.json              - JSON array of item paths
+//!   horiz/
+//!     {item-path}.png        - horizontal orientation images
+//!   vert/
+//!     {item-path}.png        - vertical orientation images
 
 use core::fmt::Write as FmtWrite;
 
@@ -19,8 +19,14 @@ use heapless::String;
 
 use crate::widget::{Orientation, WidgetData, MAX_PATH_LEN};
 
-/// Cache directory name
-const CACHE_DIR: &str = "cache";
+/// Root directory (mirrors API path)
+const ROOT_DIR: &str = "concerts";
+
+/// Horizontal orientation subdirectory
+const HORIZ_DIR: &str = "horiz";
+
+/// Vertical orientation subdirectory
+const VERT_DIR: &str = "vert";
 
 /// Widget data filename (JSON array of item paths)
 const WIDGET_FILE: &str = "widget.json";
@@ -59,53 +65,33 @@ pub enum CacheError {
 }
 
 /// Generate cache filename for an image
-/// Format: {item_path}-{orientation}.png
-/// Example: 2024-06-15-horiz-band-id.png
-fn cache_filename(path: &str, orientation: Orientation) -> String<64> {
-    let suffix = match orientation {
-        Orientation::Horizontal => "horiz",
-        Orientation::Vertical => "vert",
-    };
+/// Format: {item_path}.png (orientation is in directory path)
+/// Example: 2024-06-15-band-id.png
+fn cache_filename(path: &str) -> String<64> {
     let mut name: String<64> = String::new();
-    // Insert orientation before band-id: YYYY-MM-DD-{orientation}-band-id.png
-    // Path format: YYYY-MM-DD-band-id
-    // We need to insert orientation after the date part (first 10 chars)
-    if path.len() >= 10 {
-        let _ = write!(name, "{}-{}-{}.png", &path[..10], suffix, &path[11..]);
-    } else {
-        let _ = write!(name, "{}-{}.png", path, suffix);
-    }
+    let _ = write!(name, "{}.png", path);
     name
 }
 
+/// Get orientation subdirectory name
+fn orientation_dir(orientation: Orientation) -> &'static str {
+    match orientation {
+        Orientation::Horizontal => HORIZ_DIR,
+        Orientation::Vertical => VERT_DIR,
+    }
+}
+
 /// Parse cache filename to extract item path
-/// Input: 2024-06-15-horiz-band-id.png
+/// Input: 2024-06-15-band-id.png
 /// Output: 2024-06-15-band-id
 fn parse_cache_filename(filename: &str) -> Option<String<MAX_PATH_LEN>> {
-    // Remove .png suffix
-    let name = filename.strip_suffix(".PNG").or_else(|| filename.strip_suffix(".png"))?;
+    // Remove .png suffix (FAT filesystems uppercase extensions)
+    let name = filename
+        .strip_suffix(".PNG")
+        .or_else(|| filename.strip_suffix(".png"))?;
 
-    // Find orientation in the middle (after YYYY-MM-DD-)
-    // Format: YYYY-MM-DD-{horiz|vert}-band-id
-    if name.len() < 16 {
-        return None;
-    }
-
-    let date_part = &name[..10]; // YYYY-MM-DD
-    let rest = &name[11..]; // {horiz|vert}-band-id
-
-    // Find orientation and extract band-id
-    let band_id = if let Some(stripped) = rest.strip_prefix("horiz-") {
-        stripped
-    } else if let Some(stripped) = rest.strip_prefix("vert-") {
-        stripped
-    } else {
-        return None;
-    };
-
-    // Reconstruct item path: YYYY-MM-DD-band-id
     let mut path: String<MAX_PATH_LEN> = String::new();
-    if write!(path, "{}-{}", date_part, band_id).is_ok() {
+    if path.push_str(name).is_ok() {
         Some(path)
     } else {
         None
@@ -140,7 +126,7 @@ where
         Ok(Self { volume_mgr })
     }
 
-    /// Initialize cache directory
+    /// Initialize cache directory structure: /concerts/horiz/ and /concerts/vert/
     pub fn init(&mut self) -> Result<(), CacheError> {
         // Open volume (partition 0)
         let mut volume = self
@@ -151,26 +137,42 @@ where
         // Open root directory
         let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
-        // Check if cache directory exists by trying to open it
-        let dir_exists = root_dir.open_dir(CACHE_DIR).is_ok();
-
-        if dir_exists {
-            println!("Cache directory found");
-        } else {
-            // Create cache directory
+        // Create /concerts/ if it doesn't exist
+        if root_dir.open_dir(ROOT_DIR).is_err() {
             root_dir
-                .make_dir_in_dir(CACHE_DIR)
+                .make_dir_in_dir(ROOT_DIR)
                 .map_err(|_| CacheError::Filesystem)?;
-            println!("Created cache directory");
+            println!("Created {} directory", ROOT_DIR);
         }
 
-        // Volume, dirs are dropped automatically
+        // Open concerts directory
+        let mut concerts_dir = root_dir
+            .open_dir(ROOT_DIR)
+            .map_err(|_| CacheError::Filesystem)?;
+
+        // Create /concerts/horiz/ if it doesn't exist
+        if concerts_dir.open_dir(HORIZ_DIR).is_err() {
+            concerts_dir
+                .make_dir_in_dir(HORIZ_DIR)
+                .map_err(|_| CacheError::Filesystem)?;
+            println!("Created {}/{} directory", ROOT_DIR, HORIZ_DIR);
+        }
+
+        // Create /concerts/vert/ if it doesn't exist
+        if concerts_dir.open_dir(VERT_DIR).is_err() {
+            concerts_dir
+                .make_dir_in_dir(VERT_DIR)
+                .map_err(|_| CacheError::Filesystem)?;
+            println!("Created {}/{} directory", ROOT_DIR, VERT_DIR);
+        }
+
+        println!("Cache directory structure ready");
         Ok(())
     }
 
     /// Check if an image is cached
     pub fn has_image(&mut self, path: &str, orientation: Orientation) -> bool {
-        let filename = cache_filename(path, orientation);
+        let filename = cache_filename(path);
 
         let Ok(mut volume) = self.volume_mgr.open_volume(VolumeIdx(0)) else {
             return false;
@@ -180,12 +182,16 @@ where
             return false;
         };
 
-        let Ok(mut cache_dir) = root_dir.open_dir(CACHE_DIR) else {
+        let Ok(mut concerts_dir) = root_dir.open_dir(ROOT_DIR) else {
+            return false;
+        };
+
+        let Ok(mut orient_dir) = concerts_dir.open_dir(orientation_dir(orientation)) else {
             return false;
         };
 
         // Try to open the file - if it succeeds, it exists
-        cache_dir
+        orient_dir
             .open_file_in_dir(filename.as_str(), Mode::ReadOnly)
             .is_ok()
     }
@@ -197,7 +203,8 @@ where
         orientation: Orientation,
         buf: &mut [u8],
     ) -> Result<usize, CacheError> {
-        let filename = cache_filename(path, orientation);
+        let filename = cache_filename(path);
+        let orient = orientation_dir(orientation);
 
         let mut volume = self
             .volume_mgr
@@ -206,11 +213,15 @@ where
 
         let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
-        let mut cache_dir = root_dir
-            .open_dir(CACHE_DIR)
+        let mut concerts_dir = root_dir
+            .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut file = cache_dir
+        let mut orient_dir = concerts_dir
+            .open_dir(orient)
+            .map_err(|_| CacheError::Filesystem)?;
+
+        let mut file = orient_dir
             .open_file_in_dir(filename.as_str(), Mode::ReadOnly)
             .map_err(|_| CacheError::NotFound)?;
 
@@ -223,7 +234,10 @@ where
             }
         }
 
-        println!("Read {} bytes from cache: {}", total_read, filename);
+        println!(
+            "Read {} bytes from cache: {}/{}/{}",
+            total_read, ROOT_DIR, orient, filename
+        );
         Ok(total_read)
     }
 
@@ -234,7 +248,8 @@ where
         orientation: Orientation,
         data: &[u8],
     ) -> Result<(), CacheError> {
-        let filename = cache_filename(path, orientation);
+        let filename = cache_filename(path);
+        let orient = orientation_dir(orientation);
 
         let mut volume = self
             .volume_mgr
@@ -243,19 +258,29 @@ where
 
         let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
-        let mut cache_dir = root_dir
-            .open_dir(CACHE_DIR)
+        let mut concerts_dir = root_dir
+            .open_dir(ROOT_DIR)
+            .map_err(|_| CacheError::Filesystem)?;
+
+        let mut orient_dir = concerts_dir
+            .open_dir(orient)
             .map_err(|_| CacheError::Filesystem)?;
 
         // Create/truncate file
-        let mut file = cache_dir
+        let mut file = orient_dir
             .open_file_in_dir(filename.as_str(), Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| CacheError::Write)?;
 
         // Write data
         file.write(data).map_err(|_| CacheError::Write)?;
 
-        println!("Wrote {} bytes to cache: {}", data.len(), filename);
+        println!(
+            "Wrote {} bytes to cache: {}/{}/{}",
+            data.len(),
+            ROOT_DIR,
+            orient,
+            filename
+        );
         Ok(())
     }
 
@@ -263,9 +288,9 @@ where
     pub fn load_widget_data(&mut self) -> Option<WidgetData> {
         let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
         let mut root_dir = volume.open_root_dir().ok()?;
-        let mut cache_dir = root_dir.open_dir(CACHE_DIR).ok()?;
+        let mut concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
 
-        let mut file = cache_dir
+        let mut file = concerts_dir
             .open_file_in_dir(WIDGET_FILE, Mode::ReadOnly)
             .ok()?;
 
@@ -301,11 +326,11 @@ where
 
         let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
-        let mut cache_dir = root_dir
-            .open_dir(CACHE_DIR)
+        let mut concerts_dir = root_dir
+            .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut file = cache_dir
+        let mut file = concerts_dir
             .open_file_in_dir(WIDGET_FILE, Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| CacheError::Write)?;
 
@@ -325,56 +350,6 @@ where
         Ok(())
     }
 
-    /// List all cached items (unique item paths from directory listing)
-    pub fn list_cached_items(&mut self) -> WidgetData {
-        let mut items = WidgetData::new();
-
-        let Ok(mut volume) = self.volume_mgr.open_volume(VolumeIdx(0)) else {
-            return items;
-        };
-
-        let Ok(mut root_dir) = volume.open_root_dir() else {
-            return items;
-        };
-
-        let Ok(mut cache_dir) = root_dir.open_dir(CACHE_DIR) else {
-            return items;
-        };
-
-        // Collect unique item paths from cache files
-        cache_dir
-            .iterate_dir(|entry| {
-                if entry.attributes.is_archive() {
-                    // Convert ShortFileName to string
-                    let name = entry.name.base_name();
-                    if let Ok(name_str) = core::str::from_utf8(name) {
-                        // Get full filename including extension
-                        let ext = entry.name.extension();
-                        let mut full_name: String<64> = String::new();
-                        if let Ok(ext_str) = core::str::from_utf8(ext) {
-                            if !ext_str.is_empty() && ext_str.trim() != "" {
-                                let _ = write!(full_name, "{}.{}", name_str.trim(), ext_str.trim());
-                            } else {
-                                let _ = write!(full_name, "{}", name_str.trim());
-                            }
-                        }
-
-                        // Parse filename to extract item path
-                        if let Some(path) = parse_cache_filename(full_name.as_str()) {
-                            // Check if we already have this path (avoid duplicates from horiz/vert)
-                            if !items.iter().any(|p| p.as_str() == path.as_str()) {
-                                let _ = items.push(path);
-                            }
-                        }
-                    }
-                }
-            })
-            .ok();
-
-        println!("Found {} cached items", items.len());
-        items
-    }
-
     /// Remove cache entries not in the valid items list
     pub fn cleanup_stale(&mut self, valid_items: &WidgetData) -> Result<u32, CacheError> {
         let mut volume = self
@@ -384,45 +359,53 @@ where
 
         let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
-        let mut cache_dir = root_dir
-            .open_dir(CACHE_DIR)
+        let mut concerts_dir = root_dir
+            .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
 
         let mut removed = 0u32;
-        let mut to_delete: heapless::Vec<heapless::String<64>, 64> = heapless::Vec::new();
 
-        // Find stale files
-        cache_dir
-            .iterate_dir(|entry| {
-                if entry.attributes.is_archive() {
-                    let name = entry.name.base_name();
-                    if let Ok(name_str) = core::str::from_utf8(name) {
-                        let ext = entry.name.extension();
-                        let mut full_name: heapless::String<64> = heapless::String::new();
-                        if let Ok(ext_str) = core::str::from_utf8(ext) {
-                            if !ext_str.is_empty() && ext_str.trim() != "" {
-                                let _ = write!(full_name, "{}.{}", name_str.trim(), ext_str.trim());
-                            } else {
-                                let _ = write!(full_name, "{}", name_str.trim());
-                            }
-                        }
+        // Clean up stale files in both orientation directories
+        for orient in [HORIZ_DIR, VERT_DIR] {
+            let Ok(mut orient_dir) = concerts_dir.open_dir(orient) else {
+                continue;
+            };
 
-                        // Parse to get item path and check if valid
-                        if let Some(path) = parse_cache_filename(full_name.as_str()) {
-                            if !valid_items.iter().any(|p| p.as_str() == path.as_str()) {
-                                let _ = to_delete.push(full_name);
+            let mut to_delete: heapless::Vec<heapless::String<64>, 64> = heapless::Vec::new();
+
+            // Find stale files
+            orient_dir
+                .iterate_dir(|entry| {
+                    if entry.attributes.is_archive() {
+                        let name = entry.name.base_name();
+                        if let Ok(name_str) = core::str::from_utf8(name) {
+                            let ext = entry.name.extension();
+                            let mut full_name: heapless::String<64> = heapless::String::new();
+                            if let Ok(ext_str) = core::str::from_utf8(ext) {
+                                if !ext_str.is_empty() && ext_str.trim() != "" {
+                                    let _ =
+                                        write!(full_name, "{}.{}", name_str.trim(), ext_str.trim());
+                                } else {
+                                    let _ = write!(full_name, "{}", name_str.trim());
+                                }
                             }
+
+                            // Parse to get item path and check if valid
+                            if let Some(path) = parse_cache_filename(full_name.as_str())
+                                && !valid_items.iter().any(|p| p.as_str() == path.as_str()) {
+                                    let _ = to_delete.push(full_name);
+                                }
                         }
                     }
-                }
-            })
-            .ok();
+                })
+                .ok();
 
-        // Delete stale files
-        for filename in to_delete.iter() {
-            if cache_dir.delete_file_in_dir(filename.as_str()).is_ok() {
-                println!("Removed stale cache: {}", filename);
-                removed += 1;
+            // Delete stale files from this orientation directory
+            for filename in to_delete.iter() {
+                if orient_dir.delete_file_in_dir(filename.as_str()).is_ok() {
+                    println!("Removed stale cache: {}/{}/{}", ROOT_DIR, orient, filename);
+                    removed += 1;
+                }
             }
         }
 

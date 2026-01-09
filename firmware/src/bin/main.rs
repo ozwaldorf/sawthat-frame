@@ -235,9 +235,9 @@ async fn main(spawner: Spawner) -> ! {
     let mut delay = Delay;
 
     // Check sleep state to get current orientation
-    let resuming = unsafe { (*(&raw const SLEEP_STATE)).is_valid() };
+    let resuming = unsafe { (SLEEP_STATE).is_valid() };
     let mut orientation = if resuming {
-        unsafe { (*(&raw const SLEEP_STATE)).get_orientation() }
+        unsafe { (SLEEP_STATE).get_orientation() }
     } else {
         Orientation::default()
     };
@@ -558,11 +558,11 @@ async fn main(spawner: Spawner) -> ! {
     display::shuffle_items(&mut items, shuffle_seed);
 
     // Now check if data matches (after shuffling, so cache_keys are in same order)
-    let data_matches = resuming && unsafe { (*(&raw const SLEEP_STATE)).matches_data(&items) };
+    let data_matches = resuming && unsafe { (SLEEP_STATE).matches_data(&items) };
 
     // Determine if we can use partial refresh
     let saved_orientation = if resuming {
-        unsafe { (*(&raw const SLEEP_STATE)).get_orientation() }
+        unsafe { (SLEEP_STATE).get_orientation() }
     } else {
         Orientation::Horizontal
     };
@@ -939,11 +939,10 @@ async fn main(spawner: Spawner) -> ! {
                         println!("Failed to update widget data cache: {:?}", e);
                     }
                     // Invalidate stale image cache entries
-                    if let Ok(count) = sd_cache.cleanup_stale(&fresh_items) {
-                        if count > 0 {
+                    if let Ok(count) = sd_cache.cleanup_stale(&fresh_items)
+                        && count > 0 {
                             println!("Invalidated {} stale cache entries", count);
                         }
-                    }
                     // Note: items is not updated here since we're about to sleep
                     // Next boot will use the fresh cached data
                 }
