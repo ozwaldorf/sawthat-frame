@@ -35,6 +35,15 @@ impl Orientation {
     }
 }
 
+impl std::fmt::Display for Orientation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Orientation::Horiz => write!(f, "horiz"),
+            Orientation::Vert => write!(f, "vert"),
+        }
+    }
+}
+
 /// Widget item width
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(into = "u8", try_from = "u8")]

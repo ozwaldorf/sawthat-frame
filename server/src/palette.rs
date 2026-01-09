@@ -17,7 +17,7 @@ impl Rgb {
     }
 
     /// Convert to OKLab color space
-    pub fn to_oklab(&self) -> Oklab {
+    pub fn to_oklab(self) -> Oklab {
         Oklab::from_rgb(self.r, self.g, self.b)
     }
 }
@@ -30,6 +30,7 @@ pub struct Oklab {
     pub b: f32,
 }
 
+#[allow(clippy::excessive_precision)]
 impl Oklab {
     pub fn new(l: f32, a: f32, b: f32) -> Self {
         Self { l, a, b }
@@ -79,7 +80,7 @@ impl Oklab {
     }
 
     /// Convert from OKLab to RGB
-    pub fn to_rgb(&self) -> Rgb {
+    pub fn to_rgb(self) -> Rgb {
         let l_ = self.l + 0.3963377774 * self.a + 0.2158037573 * self.b;
         let m_ = self.l - 0.1055613458 * self.a - 0.0638541728 * self.b;
         let s_ = self.l - 0.0894841775 * self.a - 1.2914855480 * self.b;

@@ -142,6 +142,7 @@ fn draw_text_indexed_centered(
 }
 
 /// Draw text at a specific position onto indexed buffer
+#[allow(clippy::too_many_arguments)]
 fn draw_text_indexed(
     indexed: &mut [u8],
     width: u32,
