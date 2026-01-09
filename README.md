@@ -18,14 +18,14 @@ Built on the [Waveshare ESP32-S3-PhotoPainter](https://www.amazon.com/dp/B0FWRJD
 
 ### API Outputs
 
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/fec53b02-4f2d-4364-ad80-8443322e50a5" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/3dbf4be8-1f17-4b98-9662-7f4bce0b97fc" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/e2c4833c-266f-46f2-b716-da079fed40f7" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/b8f79071-ebb0-491a-8b84-938f8ac5e284" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/9e0b9d28-fed3-40e7-9b57-fdd8d0cd8f3e" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/48ae1261-95dd-44bf-af56-65e42f56e4da" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/4260845a-4886-47f9-b77b-dbe3d43cd809" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/1ebe5b9b-870c-4f64-808d-cf5b9c026a80" />
+<img width="180" alt="image" src="https://github.com/user-attachments/assets/fec53b02-4f2d-4364-ad80-8443322e50a5" />
+<img width="180" alt="image" src="https://github.com/user-attachments/assets/3dbf4be8-1f17-4b98-9662-7f4bce0b97fc" />
+<img width="180" alt="image" src="https://github.com/user-attachments/assets/e2c4833c-266f-46f2-b716-da079fed40f7" />
+<img width="180" alt="image" src="https://github.com/user-attachments/assets/b8f79071-ebb0-491a-8b84-938f8ac5e284" />
+<img width="180" alt="image" src="https://github.com/user-attachments/assets/9e0b9d28-fed3-40e7-9b57-fdd8d0cd8f3e" />
+<img width="180" alt="image" src="https://github.com/user-attachments/assets/48ae1261-95dd-44bf-af56-65e42f56e4da" />
+<img width="180" alt="image" src="https://github.com/user-attachments/assets/4260845a-4886-47f9-b77b-dbe3d43cd809" />
+<img width="180" alt="image" src="https://github.com/user-attachments/assets/1ebe5b9b-870c-4f64-808d-cf5b9c026a80" />
 
 ## Usage
 
