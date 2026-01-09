@@ -119,6 +119,57 @@ cd firmware
 cargo run --release
 ```
 
+#### Button Controls
+
+The KEY button (GPIO4) controls navigation and orientation:
+
+| Action | Duration | Effect |
+|--------|----------|--------|
+| Tap | < 500ms | Next item |
+| Hold | >= 500ms | Toggle orientation (horizontal/vertical) |
+
+Button input is detected in two places:
+- **On wake**: Immediately after waking from deep sleep (button or timer)
+- **Post-display**: 10-second window after each display refresh
+
+LED feedback:
+- **Green LED**: 1 flash = next item, 3 flashes = orientation changed
+- **Red LED**: Solid = idle, blinking = network activity, fast blink = WiFi connecting
+
+### SD Card Cache
+
+The firmware uses an optional SD card for caching. If no SD card is present, the firmware falls back to fetching everything from the network on each boot.
+
+#### Directory Structure
+
+```
+/concerts/
+  WIDGET.JSN          # JSON array of item paths
+  ORIENT.DAT          # Orientation state (1 byte: 0=horizontal, 1=vertical)
+  horiz/
+    {hash}.PNG        # Horizontal orientation images (400x480 each)
+  vert/
+    {hash}.PNG        # Vertical orientation images (480x800)
+```
+
+Image filenames are 8-character hex hashes of the item path (FAT 8.3 compatible).
+
+#### What Gets Cached
+
+| Data | File | Purpose |
+|------|------|---------|
+| Widget items | `WIDGET.JSN` | List of concert IDs to display |
+| Orientation | `ORIENT.DAT` | Persists orientation across power cycles |
+| Images | `horiz/*.PNG`, `vert/*.PNG` | Pre-rendered e-paper images |
+
+#### Cache Behavior
+
+- **Boot**: Load widget data and orientation from SD card if available
+- **Cache hit**: Read PNG directly from SD card (skips WiFi entirely)
+- **Cache miss**: Fetch from server, store to SD card for next time
+- **Background sync**: While display refreshes, fetch fresh widget data and prefetch next image
+- **Cleanup**: When widget data changes, stale images are automatically deleted
+
 ## Specifications
 
 ### Firmware Lifecycle
