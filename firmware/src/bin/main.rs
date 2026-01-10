@@ -11,7 +11,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use core::time::Duration as CoreDuration;
 use log::info;
 
@@ -47,13 +47,13 @@ use esp_radio::{
     Controller,
     wifi::{ClientConfig, Config as WifiConfig, ModeConfig, WifiController, WifiDevice},
 };
+use sawthat_frame_firmware::TimestampLogger;
 use sawthat_frame_firmware::battery;
 use sawthat_frame_firmware::cache::SdCache;
 use sawthat_frame_firmware::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
 use sawthat_frame_firmware::widget::{Orientation, WidgetData};
-use sawthat_frame_firmware::TimestampLogger;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -67,27 +67,23 @@ macro_rules! mk_static {
     }};
 }
 
+// Environment configuration
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASS");
 const SERVER_URL: &str = env!("SERVER_URL");
 
 /// Refresh interval between display updates (15 minutes)
 const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
-
+/// Button hold threshold in milliseconds
+const HOLD_THRESHOLD_MS: u32 = 500;
+/// Button polling interval in milliseconds
+const BUTTON_POLL_MS: u64 = 50;
 /// Magic number to validate RTC memory state
 const SLEEP_STATE_MAGIC: u32 = 0xCAFE_F00D;
 
-/// Compute a single hash for all widget data
-fn hash_data(items: &WidgetData) -> u32 {
-    let mut hash: u32 = 5381;
-    for item in items.iter() {
-        for byte in item.as_bytes() {
-            hash = hash.wrapping_mul(33).wrapping_add(*byte as u32);
-        }
-        hash = hash.wrapping_mul(33).wrapping_add(0); // separator
-    }
-    hash
-}
+/// RTC fast memory state - persists across deep sleep
+#[esp_hal::ram(unstable(rtc_fast))]
+static mut SLEEP_STATE: SleepState = SleepState::new();
 
 /// State persisted in RTC memory across deep sleep
 #[repr(C)]
@@ -171,44 +167,124 @@ impl SleepState {
     }
 }
 
-/// RTC fast memory state - persists across deep sleep
-#[esp_hal::ram(unstable(rtc_fast))]
-static mut SLEEP_STATE: SleepState = SleepState::new();
+/// Button monitor state
+static BUTTON_STATE: AtomicU8 = AtomicU8::new(BUTTON_CANCELLED);
+const BUTTON_CANCELLED: u8 = 0;
+const BUTTON_POLLING: u8 = 1;
+const BUTTON_NEXT: u8 = 2;
+const BUTTON_FLIP: u8 = 3;
 
-/// Flag to control red LED blinking from blink task
-static BLINK_ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Blink interval in milliseconds (100 = fast, 500 = normal)
-static BLINK_INTERVAL_MS: AtomicU16 = AtomicU16::new(500);
+/// Green LED flash request (0 = none, 1 = one flash, 3 = three flashes)
+static LED_GREEN_FLASH: AtomicU8 = AtomicU8::new(0);
+/// Flag to control red LED blinking
+static LED_RED_BLINK: AtomicBool = AtomicBool::new(false);
+/// Red LED blink interval in milliseconds (100 = fast, 500 = normal)
+static LED_RED_INTERVAL: AtomicU16 = AtomicU16::new(500);
 
-/// Red LED blink task - blinks when BLINK_ACTIVE is true, solid on otherwise
+/// Combined LED task - handles red LED blinking and green LED flash requests
 #[embassy_executor::task]
-async fn blink_task(led: &'static mut Output<'static>) {
+async fn led_task(led_red: &'static mut Output<'static>, led_green: &'static mut Output<'static>) {
+    let mut last_blink = embassy_time::Instant::now();
+
     loop {
-        if BLINK_ACTIVE.load(Ordering::Relaxed) {
-            led.toggle();
-        } else {
-            led.set_low(); // ON (active low)
+        // Handle green LED flash requests (priority)
+        let flash_count = LED_GREEN_FLASH.swap(0, Ordering::Relaxed);
+        if flash_count > 0 {
+            for _ in 0..flash_count {
+                led_green.set_low(); // ON
+                Timer::after(Duration::from_millis(100)).await;
+                led_green.set_high(); // OFF
+                Timer::after(Duration::from_millis(100)).await;
+            }
         }
-        let interval = BLINK_INTERVAL_MS.load(Ordering::Relaxed) as u64;
-        Timer::after(Duration::from_millis(interval)).await;
+
+        // Handle red LED blinking
+        let interval = LED_RED_INTERVAL.load(Ordering::Relaxed) as u64;
+        if last_blink.elapsed() >= Duration::from_millis(interval) {
+            if LED_RED_BLINK.load(Ordering::Relaxed) {
+                led_red.toggle();
+            } else {
+                led_red.set_low(); // ON (active low)
+            }
+            last_blink = embassy_time::Instant::now();
+        }
+
+        Timer::after(Duration::from_millis(50)).await;
     }
 }
 
 /// Start blinking the red LED (normal speed - 500ms)
 fn start_blink() {
-    BLINK_INTERVAL_MS.store(500, Ordering::Relaxed);
-    BLINK_ACTIVE.store(true, Ordering::Relaxed);
+    LED_RED_INTERVAL.store(500, Ordering::Relaxed);
+    LED_RED_BLINK.store(true, Ordering::Relaxed);
 }
 
 /// Start fast blinking the red LED (100ms)
 fn start_fast_blink() {
-    BLINK_INTERVAL_MS.store(100, Ordering::Relaxed);
-    BLINK_ACTIVE.store(true, Ordering::Relaxed);
+    LED_RED_INTERVAL.store(100, Ordering::Relaxed);
+    LED_RED_BLINK.store(true, Ordering::Relaxed);
 }
 
 /// Stop blinking and keep red LED solid on
 fn stop_blink() {
-    BLINK_ACTIVE.store(false, Ordering::Relaxed);
+    LED_RED_BLINK.store(false, Ordering::Relaxed);
+}
+
+/// Button monitor task - polls button every 50ms and sets state when action detected
+/// Signals LED flash via atomic when action is detected
+#[embassy_executor::task(pool_size = 4)]
+async fn button_monitor_task(key_input: &'static Input<'static>) {
+    loop {
+        // Check if we should stop
+        if BUTTON_STATE.load(Ordering::Relaxed) != BUTTON_POLLING {
+            return;
+        }
+
+        // Check if button is pressed
+        if key_input.is_low() {
+            let mut hold_time: u32 = 0;
+
+            // Button hold check
+            while key_input.is_low() {
+                if hold_time >= HOLD_THRESHOLD_MS {
+                    // Button was held past the threshold, set the action state
+                    if BUTTON_STATE
+                        .compare_exchange(
+                            BUTTON_POLLING,
+                            BUTTON_FLIP,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        // Request 3 flashes for flip
+                        LED_GREEN_FLASH.store(3, Ordering::Relaxed);
+                    }
+                    return;
+                }
+
+                hold_time += BUTTON_POLL_MS as u32;
+                Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+            }
+
+            // Otherwise, tap detected, set the action state
+            if BUTTON_STATE
+                .compare_exchange(
+                    BUTTON_POLLING,
+                    BUTTON_NEXT,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                // Request 1 flash for next
+                LED_GREEN_FLASH.store(1, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+    }
 }
 
 #[esp_rtos::main]
@@ -229,13 +305,16 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO4,
         InputConfig::default().with_pull(Pull::Up),
     );
-    let mut led_green = Output::new(peripherals.GPIO42, Level::High, OutputConfig::default());
+    let led_green = Output::new(peripherals.GPIO42, Level::High, OutputConfig::default());
     let led_red = Output::new(peripherals.GPIO45, Level::Low, OutputConfig::default()); // ON by default
 
-    // Spawn red LED blink task (needs 'static lifetime)
-    let led_red_static: &'static mut Output<'static> = mk_static!(Output<'static>, led_red);
-    spawner.spawn(blink_task(led_red_static)).ok();
-    let mut delay = Delay;
+    // Make LEDs static and spawn combined LED task
+    let led_red: &'static mut Output<'static> = mk_static!(Output<'static>, led_red);
+    let led_green: &'static mut Output<'static> = mk_static!(Output<'static>, led_green);
+    spawner.spawn(led_task(led_red, led_green)).ok();
+
+    // Make key_input static for use in spawned button monitor task
+    let key_input: &'static Input<'static> = mk_static!(Input<'static>, key_input);
 
     // Check sleep state to get current orientation
     let (resuming, mut orientation) = unsafe {
@@ -249,20 +328,14 @@ async fn main(spawner: Spawner) -> ! {
         (valid, orient)
     };
 
-    // Track if we should advance to next item (button tap without hold)
-    let mut advance_item = false;
-    // Track if orientation was changed during boot (to save to SD card later)
-    let mut orientation_changed = false;
-
     if button_wake {
         // Button caused wake - poll every 50ms to detect hold vs tap
         let mut hold_time_ms: u32 = 0;
-        const HOLD_THRESHOLD_MS: u32 = 500;
 
-        // Poll button state every 50ms
+        // Poll button state every 50ms (async to let LED task run)
         while key_input.is_low() {
-            delay.delay_ms(50);
-            hold_time_ms += 50;
+            Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+            hold_time_ms += BUTTON_POLL_MS as u32;
             if hold_time_ms >= HOLD_THRESHOLD_MS {
                 break;
             }
@@ -271,28 +344,14 @@ async fn main(spawner: Spawner) -> ! {
         if hold_time_ms >= HOLD_THRESHOLD_MS {
             // Button held >= 500ms - toggle orientation
             orientation = orientation.toggle();
-            orientation_changed = true;
-
-            // Flash LED 3 times for rotation
-            for _ in 0..3 {
-                led_green.set_low(); // ON
-                delay.delay_ms(100);
-                led_green.set_high(); // OFF
-                delay.delay_ms(100);
-            }
-
-            // Wait for button release
-            while key_input.is_low() {
-                delay.delay_ms(50);
-            }
+            BUTTON_STATE.store(BUTTON_FLIP, Ordering::Relaxed);
+            // Request 3 flashes for rotation
+            LED_GREEN_FLASH.store(3, Ordering::Relaxed);
         } else {
             // Button released before 500ms - advance to next item
-            advance_item = true;
-
-            // Flash LED 1 time for next item
-            led_green.set_low(); // ON
-            delay.delay_ms(100);
-            led_green.set_high(); // OFF
+            BUTTON_STATE.store(BUTTON_NEXT, Ordering::Relaxed);
+            // Request 1 flash for next item
+            LED_GREEN_FLASH.store(1, Ordering::Relaxed);
         }
     }
 
@@ -319,6 +378,8 @@ async fn main(spawner: Spawner) -> ! {
             .software_interrupt0,
     );
     info!("RTOS started");
+
+    let mut delay = Delay;
 
     // ==================== SD Card Cache Initialization ====================
     // SD card SPI pins: CS=GPIO38, CLK=GPIO39, MISO=GPIO40, MOSI=GPIO41
@@ -356,17 +417,26 @@ async fn main(spawner: Spawner) -> ! {
     let has_cached_data = cached_items.is_some();
     info!(
         "Cached widget data: {}",
-        if has_cached_data { "found" } else { "not found" }
+        if has_cached_data {
+            "found"
+        } else {
+            "not found"
+        }
     );
 
     // Handle orientation persistence
-    if orientation_changed {
+    if BUTTON_STATE.load(Ordering::Relaxed) == BUTTON_FLIP {
         // Orientation was changed during boot button hold - save to SD card
-        if let Some(cache) = sd_cache.as_mut() {
-            if let Err(e) = cache.store_orientation(orientation) {
-                info!("Failed to store orientation: {:?}", e);
-            }
+        if let Some(cache) = sd_cache.as_mut()
+            && let Err(e) = cache.store_orientation(orientation)
+        {
+            info!("Failed to store orientation: {:?}", e);
         }
+        // Reset button state after handling so display loop starts fresh
+        BUTTON_STATE.store(BUTTON_CANCELLED, Ordering::Relaxed);
+    } else if BUTTON_STATE.load(Ordering::Relaxed) == BUTTON_NEXT {
+        // Button tap detected during boot - reset state, display loop will show next item
+        BUTTON_STATE.store(BUTTON_CANCELLED, Ordering::Relaxed);
     } else if let Some(cached_orient) = sd_cache.as_mut().and_then(|c| c.load_orientation()) {
         // Load orientation from SD card (persistent across power cycles)
         orientation = cached_orient;
@@ -412,10 +482,11 @@ async fn main(spawner: Spawner) -> ! {
     delay.delay_ms(100);
 
     // ==================== E-Paper Display Setup ====================
-    // PhotoPainter GPIO pins for 7.3" e-paper display
+    // PhotoPainter GPIO pins for 7.3" e-paper display (SPI3)
     // DC=GPIO8, CS=GPIO9, SCK=GPIO10, MOSI=GPIO11, RST=GPIO12, BUSY=GPIO13
 
-    // SawThat Frame uses SPI3 (not SPI2)
+    info!("Initializing e-paper display (fast mode)...");
+
     let spi = Spi::new(
         peripherals.SPI3,
         SpiConfig::default()
@@ -436,14 +507,7 @@ async fn main(spawner: Spawner) -> ! {
     let dc = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default());
     let mut rst = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
 
-    // Debug: check BUSY pin state
-    info!(
-        "BUSY pin initial state: {}",
-        if busy.is_high() { "HIGH" } else { "LOW" }
-    );
-
     // Manual hardware reset before init (matches C driver timing)
-    info!("Performing hardware reset...");
     rst.set_high();
     delay.delay_ms(50);
     rst.set_low();
@@ -451,12 +515,6 @@ async fn main(spawner: Spawner) -> ! {
     rst.set_high();
     delay.delay_ms(50);
 
-    info!(
-        "BUSY pin after reset: {}",
-        if busy.is_high() { "HIGH" } else { "LOW" }
-    );
-
-    info!("Initializing e-paper display (fast mode)...");
     let mut epd = Epd7in3e::new(spi_device, busy, dc, rst, &mut delay, RefreshMode::Fast)
         .expect("EPD init failed");
     info!("EPD initialized!");
@@ -477,27 +535,8 @@ async fn main(spawner: Spawner) -> ! {
 
     // ==================== Main Display Logic ====================
     info!("Starting display update...");
-    info!("Edge URL: {}", SERVER_URL);
+    info!("Server URL: {}", SERVER_URL);
     info!("Refresh interval: {} seconds", REFRESH_INTERVAL_SECS);
-
-    if button_wake {
-        if advance_item {
-            info!("Button tap: will advance to next item");
-        } else {
-            info!("Button hold: toggled orientation to {:?}", orientation);
-        }
-    } else if resuming {
-        let (index, total) = unsafe {
-            let state = &raw const SLEEP_STATE;
-            ((*state).index, (*state).total_items)
-        };
-        info!(
-            "Resuming from deep sleep: index={}, total={}, orientation={:?}",
-            index, total, orientation
-        );
-    } else {
-        info!("Fresh boot (no valid sleep state)");
-    }
 
     // Allocate framebuffer (uses PSRAM for the 192KB buffer)
     info!("Allocating framebuffer...");
@@ -586,10 +625,10 @@ async fn main(spawner: Spawner) -> ! {
             match result {
                 Ok(data) => {
                     // Store in cache for next boot
-                    if let Some(cache) = sd_cache.as_mut() {
-                        if let Err(e) = cache.store_widget_data(&data) {
-                            info!("Failed to cache widget data: {:?}", e);
-                        }
+                    if let Some(cache) = sd_cache.as_mut()
+                        && let Err(e) = cache.store_widget_data(&data)
+                    {
+                        info!("Failed to cache widget data: {:?}", e);
                     }
                     break data;
                 }
@@ -701,11 +740,17 @@ async fn main(spawner: Spawner) -> ! {
             start_blink();
 
             // Check cache first
-            let cache_hit = sd_cache.as_mut().map_or(false, |c| c.has_image(item_path, Orientation::Horizontal));
+            let cache_hit = sd_cache
+                .as_mut()
+                .is_some_and(|c| c.has_image(item_path, Orientation::Horizontal));
             let png_len = if cache_hit {
                 info!("Cache HIT: {}", item_path);
-                sd_cache.as_mut()
-                    .and_then(|c| c.read_image(item_path, Orientation::Horizontal, &mut *png_buf).ok())
+                sd_cache
+                    .as_mut()
+                    .and_then(|c| {
+                        c.read_image(item_path, Orientation::Horizontal, &mut *png_buf)
+                            .ok()
+                    })
                     .unwrap_or_default()
             } else {
                 info!("Cache MISS: {}", item_path);
@@ -725,10 +770,14 @@ async fn main(spawner: Spawner) -> ! {
                 .await
                 {
                     Ok(len) => {
-                        if let Some(cache) = sd_cache.as_mut() {
-                            if let Err(e) = cache.write_image(item_path, Orientation::Horizontal, &png_buf[..len]) {
-                                info!("Cache store failed: {:?}", e);
-                            }
+                        if let Some(cache) = sd_cache.as_mut()
+                            && let Err(e) = cache.write_image(
+                                item_path,
+                                Orientation::Horizontal,
+                                &png_buf[..len],
+                            )
+                        {
+                            info!("Cache store failed: {:?}", e);
                         }
                         len
                     }
@@ -778,7 +827,8 @@ async fn main(spawner: Spawner) -> ! {
 
                     info!("Partial refresh: x={}, w={}, h={}", x_offset, 400, 480);
 
-                    epd.partial_update_start(&rect, &half_buffer, &mut delay).is_ok()
+                    epd.partial_update_start(&rect, &half_buffer, &mut delay)
+                        .is_ok()
                 }
                 Err(_) => false,
             };
@@ -790,8 +840,12 @@ async fn main(spawner: Spawner) -> ! {
                 index += 1; // Advance by 1 for partial updates
             }
 
-            // Prefetch next image and refresh widget data while display is refreshing
+            // Spawn button monitor task and do work while it runs
             if display_started {
+                // Start button monitoring
+                BUTTON_STATE.store(BUTTON_POLLING, Ordering::Relaxed);
+                spawner.spawn(button_monitor_task(key_input)).ok();
+
                 // Initialize and connect WiFi now if we deferred it
                 ensure_wifi!();
 
@@ -815,7 +869,11 @@ async fn main(spawner: Spawner) -> ! {
                         )
                         .await
                         {
-                            if let Err(e) = cache.write_image(prefetch_path, Orientation::Horizontal, &prefetch_buf[..len]) {
+                            if let Err(e) = cache.write_image(
+                                prefetch_path,
+                                Orientation::Horizontal,
+                                &prefetch_buf[..len],
+                            ) {
                                 info!("Prefetch cache store failed: {:?}", e);
                             } else {
                                 info!("Prefetched and cached: {}", prefetch_path);
@@ -836,34 +894,34 @@ async fn main(spawner: Spawner) -> ! {
                         "concerts",
                     )
                     .await
-                    {
-                        if fresh_items.len() != items.len()
+                        && (fresh_items.len() != items.len()
                             || fresh_items
                                 .iter()
                                 .zip(items.iter())
-                                .any(|(a, b)| a.as_str() != b.as_str())
-                        {
-                            info!("Widget data changed, updating cache");
-                            if let Some(cache) = sd_cache.as_mut() {
-                                if let Err(e) = cache.store_widget_data(&fresh_items) {
-                                    info!("Failed to update widget data cache: {:?}", e);
-                                }
-                                if let Ok(count) = cache.cleanup_stale(&fresh_items)
-                                    && count > 0
-                                {
-                                    info!("Invalidated {} stale cache entries", count);
-                                }
+                                .any(|(a, b)| a.as_str() != b.as_str()))
+                    {
+                        info!("Widget data changed, updating cache");
+                        if let Some(cache) = sd_cache.as_mut() {
+                            if let Err(e) = cache.store_widget_data(&fresh_items) {
+                                info!("Failed to update widget data cache: {:?}", e);
+                            }
+                            if let Ok(count) = cache.cleanup_stale(&fresh_items)
+                                && count > 0
+                            {
+                                info!("Invalidated {} stale cache entries", count);
                             }
                         }
                     }
                 }
+
+                // Wait for display busy
+                while epd.is_busy() {
+                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+                }
             }
 
-            // Now wait for display to finish
+            // Finish display
             let result = if display_started {
-                while epd.is_busy() {
-                    Timer::after(Duration::from_millis(50)).await;
-                }
                 epd.refresh_wait(&mut delay)
                     .map_err(|_| display::DisplayError::Network)
             } else {
@@ -904,10 +962,13 @@ async fn main(spawner: Spawner) -> ! {
                 let item_path = items[item_idx].as_str();
 
                 // Check cache first
-                let cache_hit = sd_cache.as_mut().map_or(false, |c| c.has_image(item_path, orientation));
+                let cache_hit = sd_cache
+                    .as_mut()
+                    .is_some_and(|c| c.has_image(item_path, orientation));
                 let png_len = if cache_hit {
                     info!("Cache HIT: {}", item_path);
-                    sd_cache.as_mut()
+                    sd_cache
+                        .as_mut()
                         .and_then(|c| c.read_image(item_path, orientation, &mut *png_buf).ok())
                         .unwrap_or_default()
                 } else {
@@ -930,10 +991,11 @@ async fn main(spawner: Spawner) -> ! {
                     {
                         Ok(len) => {
                             // Store in cache
-                            if let Some(cache) = sd_cache.as_mut() {
-                                if let Err(e) = cache.write_image(item_path, orientation, &png_buf[..len]) {
-                                    info!("Cache store failed: {:?}", e);
-                                }
+                            if let Some(cache) = sd_cache.as_mut()
+                                && let Err(e) =
+                                    cache.write_image(item_path, orientation, &png_buf[..len])
+                            {
+                                info!("Cache store failed: {:?}", e);
                             }
                             len
                         }
@@ -990,7 +1052,8 @@ async fn main(spawner: Spawner) -> ! {
             let display_started = match fetch_result {
                 Ok(()) => {
                     info!("Updating display (full refresh)...");
-                    epd.display_start(framebuffer.as_slice(), &mut delay).is_ok()
+                    epd.display_start(framebuffer.as_slice(), &mut delay)
+                        .is_ok()
                 }
                 Err(_) => false,
             };
@@ -1006,8 +1069,12 @@ async fn main(spawner: Spawner) -> ! {
                 index += 1; // Vertical mode: advance by 1
             }
 
-            // Prefetch next image and refresh widget data while display is refreshing
+            // Spawn button monitor task and do work while it runs
             if display_started {
+                // Start button monitoring
+                BUTTON_STATE.store(BUTTON_POLLING, Ordering::Relaxed);
+                spawner.spawn(button_monitor_task(key_input)).ok();
+
                 // Initialize and connect WiFi now if we deferred it (using cached data path)
                 ensure_wifi!();
 
@@ -1031,7 +1098,9 @@ async fn main(spawner: Spawner) -> ! {
                         )
                         .await
                         {
-                            if let Err(e) = cache.write_image(prefetch_path, orientation, &prefetch_buf[..len]) {
+                            if let Err(e) =
+                                cache.write_image(prefetch_path, orientation, &prefetch_buf[..len])
+                            {
                                 info!("Prefetch cache store failed: {:?}", e);
                             } else {
                                 info!("Prefetched and cached: {}", prefetch_path);
@@ -1039,6 +1108,7 @@ async fn main(spawner: Spawner) -> ! {
                         }
                     }
                 }
+                embassy_futures::yield_now().await;
 
                 // Refresh widget data from server if we used cached data
                 if has_cached_data {
@@ -1075,19 +1145,22 @@ async fn main(spawner: Spawner) -> ! {
                         }
                     }
                 }
+                stop_blink();
+
+                // Wait for display busy
+                while epd.is_busy() {
+                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+                }
             }
 
-            // Now wait for display to finish
+            // Finish display
             let result = if display_started {
-                while epd.is_busy() {
-                    Timer::after(Duration::from_millis(50)).await;
-                }
                 epd.finish_display(&mut delay)
                     .map_err(|_| display::DisplayError::Network)
             } else {
                 Err(display::DisplayError::Network)
             };
-            stop_blink();
+
             embassy_futures::yield_now().await;
 
             result
@@ -1102,72 +1175,38 @@ async fn main(spawner: Spawner) -> ! {
         info!("Putting display to sleep...");
         epd.sleep(&mut delay).expect("Failed to sleep display");
 
-        // Wait 10s for button input before deep sleep
-        info!("Press KEY within 10s (tap=next item, hold=rotate)...");
-        let mut should_redisplay = false;
-        const HOLD_THRESHOLD_MS: u32 = 500;
-        for _ in 0..100 {
-            if key_input.is_low() {
-                info!("KEY pressed, polling for hold...");
+        // Check button state and cancel task if still polling
+        let button_state = BUTTON_STATE.swap(BUTTON_CANCELLED, Ordering::Relaxed);
 
-                // Poll every 50ms to detect hold vs tap
-                let mut hold_time_ms: u32 = 0;
-                while key_input.is_low() {
-                    Timer::after(Duration::from_millis(50)).await;
-                    hold_time_ms += 50;
-                    if hold_time_ms >= HOLD_THRESHOLD_MS {
-                        break;
-                    }
+        // Handle button action detected during display update
+        // (LED feedback already provided by button monitor task)
+        match button_state {
+            BUTTON_FLIP => {
+                info!("Button held during update! Toggling orientation...");
+                orientation = orientation.toggle();
+                // Save to SD card
+                if let Some(cache) = sd_cache.as_mut()
+                    && let Err(e) = cache.store_orientation(orientation)
+                {
+                    info!("Failed to store orientation: {:?}", e);
                 }
+                // Reset partial mode on orientation change
+                use_partial = false;
+                slot_items = [0, 0];
+                next_slot = 0;
 
-                if hold_time_ms >= HOLD_THRESHOLD_MS {
-                    // Button held >= 500ms - toggle orientation
-                    info!("Button held! Toggling orientation...");
-                    orientation = orientation.toggle();
-                    // Save to SD card
-                    if let Some(cache) = sd_cache.as_mut() {
-                        if let Err(e) = cache.store_orientation(orientation) {
-                            info!("Failed to store orientation: {:?}", e);
-                        }
-                    }
-                    // Reset partial mode on orientation change
-                    use_partial = false;
-                    slot_items = [0, 0];
-                    next_slot = 0;
-
-                    // Flash LED2 3 times to confirm rotation
-                    for _ in 0..3 {
-                        led_green.set_low(); // ON
-                        delay.delay_ms(100);
-                        led_green.set_high(); // OFF
-                        delay.delay_ms(100);
-                    }
-
-                    // Wait for button release
-                    while key_input.is_low() {
-                        delay.delay_ms(50);
-                    }
-
-                    info!("Re-displaying with orientation: {:?}", orientation);
-                } else {
-                    // Button released before 500ms - show next item
-                    info!("Button tap, next item (index={})", index);
-
-                    // Flash LED2 1 time to confirm next item
-                    led_green.set_low(); // ON
-                    delay.delay_ms(100);
-                    led_green.set_high(); // OFF
-                }
-
-                should_redisplay = true;
+                info!("Re-displaying with orientation: {:?}", orientation);
+                // Continue loop to re-display
+            }
+            BUTTON_NEXT => {
+                info!("Button tap during update, next item (index={})", index);
+                // Continue loop to show next item
+            }
+            _ => {
+                // No button press (POLLING or CANCELLED), exit loop and go to deep sleep
+                info!("No button press, entering deep sleep");
                 break;
             }
-            Timer::after(Duration::from_millis(100)).await; // Async yield lets blink task run
-        }
-
-        if !should_redisplay {
-            // No button press, exit loop and go to sleep
-            break;
         }
         // Loop back to re-display
     }
@@ -1209,6 +1248,18 @@ async fn main(spawner: Spawner) -> ! {
     enter_deep_sleep(&mut rtc, key_pin, &mut delay, REFRESH_INTERVAL_SECS);
 }
 
+/// Compute a single hash for all widget data
+fn hash_data(items: &WidgetData) -> u32 {
+    let mut hash: u32 = 5381;
+    for item in items.iter() {
+        for byte in item.as_bytes() {
+            hash = hash.wrapping_mul(33).wrapping_add(*byte as u32);
+        }
+        hash = hash.wrapping_mul(33).wrapping_add(0); // separator
+    }
+    hash
+}
+
 /// Enter deep sleep with timer and KEY button (GPIO4) wake sources
 fn enter_deep_sleep<P: esp_hal::gpio::RtcPinWithResistors>(
     rtc: &mut Rtc,
@@ -1231,6 +1282,11 @@ fn enter_deep_sleep<P: esp_hal::gpio::RtcPinWithResistors>(
 
     // Enter deep sleep (never returns - device reboots on wake)
     rtc.sleep_deep(&[&timer, &ext0])
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+    runner.run().await
 }
 
 /// Connect to WiFi network
@@ -1296,9 +1352,4 @@ async fn wait_for_ip(stack: Stack<'static>) {
         }
         Timer::after(Duration::from_millis(500)).await;
     }
-}
-
-#[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
-    runner.run().await
 }
