@@ -214,7 +214,7 @@ pub struct DominantColor {
     pub is_light: bool,
 }
 
-/// Extract dominant color from the bottom 20% of an image.
+/// Extract dominant color from the bottom 10% of an image.
 /// Finds the top 3 most common colors and averages them in OKLab space.
 pub fn extract_dominant_color(img: &image::RgbImage) -> DominantColor {
     use image::imageops::FilterType;
@@ -223,10 +223,10 @@ pub fn extract_dominant_color(img: &image::RgbImage) -> DominantColor {
     // Resize to 100x100 using bilinear (Triangle) filter
     let small = image::imageops::resize(img, 100, 100, FilterType::Triangle);
 
-    // Count colors in bottom 20% (last 20 rows)
+    // Count colors in bottom 10% (last 10 rows)
     let mut color_counts: HashMap<u32, (Oklab, u32)> = HashMap::new();
 
-    for y in 80..100 {
+    for y in 90..100 {
         for x in 0..100 {
             let pixel = small.get_pixel(x, y);
             let rgb_key = ((pixel[0] as u32) << 16) | ((pixel[1] as u32) << 8) | (pixel[2] as u32);
