@@ -279,60 +279,75 @@ fn flash_green(count: u8) {
     LED_SIGNAL.signal(LedCommand::GreenFlash(count));
 }
 
-/// Button monitor task - polls button every 50ms and sets state when action detected
-/// Signals LED flash via atomic when action is detected
-#[embassy_executor::task(pool_size = 4)]
+/// Signal to wake button monitor task
+static BUTTON_MONITOR_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Start button monitoring (signals the persistent task)
+fn start_button_monitor() {
+    BUTTON_STATE.store(BUTTON_POLLING, Ordering::Relaxed);
+    BUTTON_MONITOR_SIGNAL.signal(());
+}
+
+/// Button monitor task - persistent task that monitors button when signaled
+/// Waits for signal when inactive (no polling), monitors button when active
+#[embassy_executor::task]
 async fn button_monitor_task(key_input: &'static Input<'static>) {
     loop {
-        // Check if we should stop
-        if BUTTON_STATE.load(Ordering::Relaxed) != BUTTON_POLLING {
-            return;
-        }
+        // Wait for signal to start monitoring (no polling when inactive)
+        BUTTON_MONITOR_SIGNAL.wait().await;
 
-        // Check if button is pressed
-        if key_input.is_low() {
-            let mut hold_time: u32 = 0;
+        // Monitor button until state changes from BUTTON_POLLING
+        while BUTTON_STATE.load(Ordering::Relaxed) == BUTTON_POLLING {
+            // Check if button is pressed
+            if key_input.is_low() {
+                let mut hold_time: u32 = 0;
 
-            // Button hold check
-            while key_input.is_low() {
-                if hold_time >= HOLD_THRESHOLD_MS {
-                    // Button was held past the threshold, set the action state
-                    if BUTTON_STATE
-                        .compare_exchange(
-                            BUTTON_POLLING,
-                            BUTTON_FLIP,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        // Request 3 flashes for flip
-                        flash_green(3);
+                // Button hold check
+                while key_input.is_low() {
+                    if hold_time >= HOLD_THRESHOLD_MS {
+                        // Button was held past the threshold, set the action state
+                        if BUTTON_STATE
+                            .compare_exchange(
+                                BUTTON_POLLING,
+                                BUTTON_FLIP,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            // Request 3 flashes for flip
+                            flash_green(3);
+                        }
+                        break;
                     }
-                    return;
+
+                    hold_time += BUTTON_POLL_MS as u32;
+                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
                 }
 
-                hold_time += BUTTON_POLL_MS as u32;
-                Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+                // If we detected a hold, go back to waiting
+                if BUTTON_STATE.load(Ordering::Relaxed) != BUTTON_POLLING {
+                    break;
+                }
+
+                // Otherwise, tap detected, set the action state
+                if BUTTON_STATE
+                    .compare_exchange(
+                        BUTTON_POLLING,
+                        BUTTON_NEXT,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    // Request 1 flash for next
+                    flash_green(1);
+                }
+                break;
             }
 
-            // Otherwise, tap detected, set the action state
-            if BUTTON_STATE
-                .compare_exchange(
-                    BUTTON_POLLING,
-                    BUTTON_NEXT,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                // Request 1 flash for next
-                flash_green(1);
-            }
-            return;
+            Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
         }
-
-        Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
     }
 }
 
@@ -362,8 +377,11 @@ async fn main(spawner: Spawner) -> ! {
     let led_green: &'static mut Output<'static> = mk_static!(Output<'static>, led_green);
     spawner.spawn(led_task(led_red, led_green)).ok();
 
-    // Make key_input static for use in spawned button monitor task
+    // Make key_input static for use in button monitor task
     let key_input: &'static Input<'static> = mk_static!(Input<'static>, key_input);
+
+    // Spawn persistent button monitor task (waits on signal when inactive)
+    spawner.spawn(button_monitor_task(key_input)).ok();
 
     // Check sleep state to get current orientation
     let (resuming, mut orientation) = unsafe {
@@ -892,8 +910,7 @@ async fn main(spawner: Spawner) -> ! {
             // Spawn button monitor task and do work while it runs
             if display_started {
                 // Start button monitoring
-                BUTTON_STATE.store(BUTTON_POLLING, Ordering::Relaxed);
-                spawner.spawn(button_monitor_task(key_input)).ok();
+                start_button_monitor();
 
                 // Initialize and connect WiFi now if we deferred it
                 ensure_wifi!();
@@ -1130,8 +1147,7 @@ async fn main(spawner: Spawner) -> ! {
             // Spawn button monitor task and do work while it runs
             if display_started {
                 // Start button monitoring
-                BUTTON_STATE.store(BUTTON_POLLING, Ordering::Relaxed);
-                spawner.spawn(button_monitor_task(key_input)).ok();
+                start_button_monitor();
 
                 // Initialize and connect WiFi now if we deferred it (using cached data path)
                 ensure_wifi!();
