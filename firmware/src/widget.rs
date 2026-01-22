@@ -94,12 +94,12 @@ pub fn parse_widget_data(json: &str) -> Result<Box<WidgetData>, &'static str> {
     }
 
     // Last item
-    if start < inner.len() {
-        if let Some(s) = parse_string_value(&inner[start..]) {
-            let mut item = String::new();
-            if item.push_str(s).is_ok() {
-                let _ = data.push(item);
-            }
+    if start < inner.len()
+        && let Some(s) = parse_string_value(&inner[start..])
+    {
+        let mut item = String::new();
+        if item.push_str(s).is_ok() {
+            let _ = data.push(item);
         }
     }
 

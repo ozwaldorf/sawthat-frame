@@ -452,10 +452,10 @@ where
                             }
 
                             // Parse to get hash and check if valid
-                            if let Some(file_hash) = parse_cache_filename(full_name.as_str()) {
-                                if !valid_hashes.contains(&file_hash) {
-                                    let _ = to_delete.push(full_name);
-                                }
+                            if let Some(file_hash) = parse_cache_filename(full_name.as_str())
+                                && !valid_hashes.contains(&file_hash)
+                            {
+                                let _ = to_delete.push(full_name);
                             }
                         }
                     }

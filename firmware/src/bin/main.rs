@@ -11,7 +11,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::time::Duration as CoreDuration;
 use log::info;
 
@@ -21,6 +21,7 @@ use embassy_net::{
     dns::DnsSocket,
     tcp::client::{TcpClient, TcpClientState},
 };
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -176,60 +177,106 @@ const BUTTON_POLLING: u8 = 1;
 const BUTTON_NEXT: u8 = 2;
 const BUTTON_FLIP: u8 = 3;
 
-/// Green LED flash request (0 = none, 1 = one flash, 3 = three flashes)
-static LED_GREEN_FLASH: AtomicU8 = AtomicU8::new(0);
-/// Flag to control red LED blinking
-static LED_RED_BLINK: AtomicBool = AtomicBool::new(false);
-/// Red LED blink interval in milliseconds (100 = fast, 500 = normal)
-static LED_RED_INTERVAL: AtomicU16 = AtomicU16::new(500);
+/// LED command sent via signal
+#[derive(Clone, Copy)]
+enum LedCommand {
+    /// Flash green LED N times
+    GreenFlash(u8),
+    /// Start red LED blinking at interval (ms)
+    RedBlink(u16),
+    /// Stop red LED blinking (keep LED on)
+    RedSolid,
+}
+
+/// Signal to wake LED task when commands are sent
+static LED_SIGNAL: Signal<CriticalSectionRawMutex, LedCommand> = Signal::new();
 
 /// Combined LED task - handles red LED blinking and green LED flash requests
+/// Uses signal-based waking to avoid continuous polling
 #[embassy_executor::task]
 async fn led_task(led_red: &'static mut Output<'static>, led_green: &'static mut Output<'static>) {
-    let mut last_blink = embassy_time::Instant::now();
+    let mut blink_enabled = false;
+    let mut blink_interval_ms: u64 = 500;
 
     loop {
-        // Handle green LED flash requests (priority)
-        let flash_count = LED_GREEN_FLASH.swap(0, Ordering::Relaxed);
-        if flash_count > 0 {
-            for _ in 0..flash_count {
-                led_green.set_low(); // ON
-                Timer::after(Duration::from_millis(100)).await;
-                led_green.set_high(); // OFF
-                Timer::after(Duration::from_millis(100)).await;
+        if blink_enabled {
+            // When blinking, use select to handle either signal or blink timer
+            use embassy_futures::select::{select, Either};
+
+            match select(
+                LED_SIGNAL.wait(),
+                Timer::after(Duration::from_millis(blink_interval_ms)),
+            )
+            .await
+            {
+                Either::First(cmd) => {
+                    // Process command
+                    match cmd {
+                        LedCommand::GreenFlash(count) => {
+                            for _ in 0..count {
+                                led_green.set_low(); // ON
+                                Timer::after(Duration::from_millis(100)).await;
+                                led_green.set_high(); // OFF
+                                Timer::after(Duration::from_millis(100)).await;
+                            }
+                        }
+                        LedCommand::RedBlink(interval) => {
+                            blink_enabled = true;
+                            blink_interval_ms = interval as u64;
+                        }
+                        LedCommand::RedSolid => {
+                            blink_enabled = false;
+                            led_red.set_low(); // ON (active low)
+                        }
+                    }
+                }
+                Either::Second(()) => {
+                    // Blink timer fired - toggle LED
+                    led_red.toggle();
+                }
+            }
+        } else {
+            // Not blinking - just wait for signal (no polling!)
+            let cmd = LED_SIGNAL.wait().await;
+            match cmd {
+                LedCommand::GreenFlash(count) => {
+                    for _ in 0..count {
+                        led_green.set_low(); // ON
+                        Timer::after(Duration::from_millis(100)).await;
+                        led_green.set_high(); // OFF
+                        Timer::after(Duration::from_millis(100)).await;
+                    }
+                }
+                LedCommand::RedBlink(interval) => {
+                    blink_enabled = true;
+                    blink_interval_ms = interval as u64;
+                }
+                LedCommand::RedSolid => {
+                    led_red.set_low(); // ON (active low)
+                }
             }
         }
-
-        // Handle red LED blinking
-        let interval = LED_RED_INTERVAL.load(Ordering::Relaxed) as u64;
-        if last_blink.elapsed() >= Duration::from_millis(interval) {
-            if LED_RED_BLINK.load(Ordering::Relaxed) {
-                led_red.toggle();
-            } else {
-                led_red.set_low(); // ON (active low)
-            }
-            last_blink = embassy_time::Instant::now();
-        }
-
-        Timer::after(Duration::from_millis(50)).await;
     }
 }
 
 /// Start blinking the red LED (normal speed - 500ms)
 fn start_blink() {
-    LED_RED_INTERVAL.store(500, Ordering::Relaxed);
-    LED_RED_BLINK.store(true, Ordering::Relaxed);
+    LED_SIGNAL.signal(LedCommand::RedBlink(500));
 }
 
 /// Start fast blinking the red LED (100ms)
 fn start_fast_blink() {
-    LED_RED_INTERVAL.store(100, Ordering::Relaxed);
-    LED_RED_BLINK.store(true, Ordering::Relaxed);
+    LED_SIGNAL.signal(LedCommand::RedBlink(100));
 }
 
 /// Stop blinking and keep red LED solid on
 fn stop_blink() {
-    LED_RED_BLINK.store(false, Ordering::Relaxed);
+    LED_SIGNAL.signal(LedCommand::RedSolid);
+}
+
+/// Flash green LED the specified number of times
+fn flash_green(count: u8) {
+    LED_SIGNAL.signal(LedCommand::GreenFlash(count));
 }
 
 /// Button monitor task - polls button every 50ms and sets state when action detected
@@ -260,7 +307,7 @@ async fn button_monitor_task(key_input: &'static Input<'static>) {
                         .is_ok()
                     {
                         // Request 3 flashes for flip
-                        LED_GREEN_FLASH.store(3, Ordering::Relaxed);
+                        flash_green(3);
                     }
                     return;
                 }
@@ -280,7 +327,7 @@ async fn button_monitor_task(key_input: &'static Input<'static>) {
                 .is_ok()
             {
                 // Request 1 flash for next
-                LED_GREEN_FLASH.store(1, Ordering::Relaxed);
+                flash_green(1);
             }
             return;
         }
@@ -348,12 +395,12 @@ async fn main(spawner: Spawner) -> ! {
             orientation = orientation.toggle();
             BUTTON_STATE.store(BUTTON_FLIP, Ordering::Relaxed);
             // Request 3 flashes for rotation
-            LED_GREEN_FLASH.store(3, Ordering::Relaxed);
+            flash_green(3);
         } else {
             // Button released before 500ms - advance to next item
             BUTTON_STATE.store(BUTTON_NEXT, Ordering::Relaxed);
             // Request 1 flash for next item
-            LED_GREEN_FLASH.store(1, Ordering::Relaxed);
+            flash_green(1);
         }
     }
 
