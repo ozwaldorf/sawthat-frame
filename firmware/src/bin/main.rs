@@ -963,6 +963,15 @@ async fn main(spawner: Spawner) -> ! {
                     }
                 }
 
+                // Disconnect WiFi to save power during display refresh wait
+                if wifi_connected {
+                    if let Some(ctrl) = wifi_controller.as_mut() {
+                        info!("Disconnecting WiFi (display refreshing)...");
+                        wifi_disconnect(ctrl).await;
+                    }
+                    wifi_connected = false;
+                }
+
                 // Wait for display busy (button task handles button detection separately)
                 while epd.is_busy() {
                     Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
@@ -1196,6 +1205,15 @@ async fn main(spawner: Spawner) -> ! {
                 }
                 stop_blink();
 
+                // Disconnect WiFi to save power during display refresh wait
+                if wifi_connected {
+                    if let Some(ctrl) = wifi_controller.as_mut() {
+                        info!("Disconnecting WiFi (display refreshing)...");
+                        wifi_disconnect(ctrl).await;
+                    }
+                    wifi_connected = false;
+                }
+
                 // Wait for display busy (button task handles button detection separately)
                 while epd.is_busy() {
                     Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
@@ -1278,12 +1296,14 @@ async fn main(spawner: Spawner) -> ! {
         index, total_items, orientation, next_slot, slot_items[0], slot_items[1]
     );
 
-    // Disconnect WiFi before deep sleep (only if it was initialized)
-    if let Some(ctrl) = wifi_controller.as_mut() {
-        info!("Disconnecting WiFi for deep sleep...");
-        wifi_disconnect(ctrl).await;
+    // Disconnect WiFi before deep sleep (only if still connected)
+    if wifi_connected {
+        if let Some(ctrl) = wifi_controller.as_mut() {
+            info!("Disconnecting WiFi for deep sleep...");
+            wifi_disconnect(ctrl).await;
+        }
     } else {
-        info!("WiFi was never initialized, skipping disconnect");
+        info!("WiFi already disconnected, skipping");
     }
 
     // Reclaim GPIO4 for deep sleep wake source
