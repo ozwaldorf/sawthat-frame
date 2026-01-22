@@ -275,7 +275,10 @@ mod tests {
                 .expect("Failed to fetch image");
 
             if !response.status().is_success() {
-                eprintln!("  Error: Failed to fetch image, status {}", response.status());
+                eprintln!(
+                    "  Error: Failed to fetch image, status {}",
+                    response.status()
+                );
                 continue;
             }
 
@@ -287,7 +290,8 @@ mod tests {
 
             println!("  Downloaded {} bytes", image_data.len());
 
-            let primary_color = extract_primary_color(&image_data).expect("Failed to extract color");
+            let primary_color =
+                extract_primary_color(&image_data).expect("Failed to extract color");
             println!(
                 "  Primary color: RGB({}, {}, {}), light: {}",
                 primary_color.r, primary_color.g, primary_color.b, primary_color.is_light
@@ -332,6 +336,9 @@ mod tests {
             println!();
         }
 
-        println!("Done! Generated {} example images.", EXAMPLE_CONCERTS.len() * 2);
+        println!(
+            "Done! Generated {} example images.",
+            EXAMPLE_CONCERTS.len() * 2
+        );
     }
 }

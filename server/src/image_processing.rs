@@ -145,11 +145,17 @@ fn apply_adjustments(img: &mut RgbImage) {
 /// Extract primary color from image bytes
 ///
 /// Returns the dominant color from the bottom of the image (for text background).
+/// Applies image adjustments (exposure, saturation, s-curve) before extracting
+/// the dominant color so the color matches the final processed image.
 pub fn extract_primary_color(image_data: &[u8]) -> Result<PrimaryColor, AppError> {
     let img = image::load_from_memory(image_data)
         .map_err(|e| AppError::ImageProcessing(format!("Failed to decode image: {}", e)))?;
 
-    let dominant = extract_dominant_color(&img.to_rgb8());
+    // Apply filters first so color extraction matches the final processed image
+    let mut rgb_img = img.to_rgb8();
+    apply_adjustments(&mut rgb_img);
+
+    let dominant = extract_dominant_color(&rgb_img);
 
     Ok(PrimaryColor {
         r: dominant.r,
