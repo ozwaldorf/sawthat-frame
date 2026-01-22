@@ -351,11 +351,8 @@ where
 
     /// Start display refresh (non-blocking)
     /// Call `refresh_wait()` to complete the refresh before the next operation.
+    /// Note: Display must already be powered on via init() before calling this.
     fn refresh_start<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<(), SPI::Error> {
-        // Power on (required before refresh - display may be off from previous operation)
-        self.send_command(Command::PON)?;
-        self.wait_until_idle(delay);
-
         // For standard mode, need to set BTST2 before refresh
         if self.refresh_mode == RefreshMode::Standard {
             self.cmd_with_data(Command::BTST2, &[0x6F, 0x1F, 0x17, 0x49])?;
@@ -535,14 +532,11 @@ where
     }
 
     /// Start refresh after partial data transmission (non-blocking).
+    /// Note: Display must already be powered on via init() before calling this.
     fn partial_refresh_start<DELAY: DelayNs>(
         &mut self,
         delay: &mut DELAY,
     ) -> Result<(), SPI::Error> {
-        self.wait_until_idle(delay);
-
-        // Power on
-        self.send_command(Command::PON)?;
         self.wait_until_idle(delay);
 
         // Booster settings (same as standard refresh)

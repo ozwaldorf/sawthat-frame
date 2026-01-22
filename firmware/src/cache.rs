@@ -14,8 +14,8 @@ use core::fmt::Write as FmtWrite;
 
 use embedded_hal::spi::SpiDevice;
 use embedded_sdmmc::{Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
-use log::info;
 use heapless::String;
+use log::info;
 
 use crate::widget::{Orientation, WidgetData};
 

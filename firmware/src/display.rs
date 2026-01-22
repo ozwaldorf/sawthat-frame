@@ -16,8 +16,8 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use embedded_io_async::Read;
 use embedded_nal_async::{Dns, TcpConnect};
-use log::info;
 use heapless::String;
+use log::info;
 use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
 use reqwless::request::Method;
 
@@ -598,5 +598,11 @@ pub fn render_png_to_framebuffer(
         400
     };
 
-    decode_png_to_framebuffer(png_data, framebuffer, x_offset, &mut *decode_buf, orientation)
+    decode_png_to_framebuffer(
+        png_data,
+        framebuffer,
+        x_offset,
+        &mut *decode_buf,
+        orientation,
+    )
 }

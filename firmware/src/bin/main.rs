@@ -78,6 +78,8 @@ const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
 const HOLD_THRESHOLD_MS: u32 = 500;
 /// Button polling interval in milliseconds
 const BUTTON_POLL_MS: u64 = 50;
+/// Display busy polling interval in milliseconds (display refresh takes seconds)
+const DISPLAY_BUSY_POLL_MS: u64 = 200;
 /// Magic number to validate RTC memory state
 const SLEEP_STATE_MAGIC: u32 = 0xCAFE_F00D;
 
@@ -914,9 +916,9 @@ async fn main(spawner: Spawner) -> ! {
                     }
                 }
 
-                // Wait for display busy
+                // Wait for display busy (button task handles button detection separately)
                 while epd.is_busy() {
-                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
                 }
             }
 
@@ -1147,9 +1149,9 @@ async fn main(spawner: Spawner) -> ! {
                 }
                 stop_blink();
 
-                // Wait for display busy
+                // Wait for display busy (button task handles button detection separately)
                 while epd.is_busy() {
-                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
                 }
             }
 
@@ -1340,7 +1342,8 @@ async fn wait_for_ip(stack: Stack<'static>) {
         if stack.is_link_up() {
             break;
         }
-        Timer::after(Duration::from_millis(500)).await;
+        // 1500ms polling is sufficient - link up is not time-critical
+        Timer::after(Duration::from_millis(1500)).await;
     }
     info!("Link up!");
 
@@ -1350,6 +1353,7 @@ async fn wait_for_ip(stack: Stack<'static>) {
             info!("Got IP: {}", config.address);
             break;
         }
-        Timer::after(Duration::from_millis(500)).await;
+        // 1500ms polling is sufficient - DHCP takes seconds anyway
+        Timer::after(Duration::from_millis(1500)).await;
     }
 }
