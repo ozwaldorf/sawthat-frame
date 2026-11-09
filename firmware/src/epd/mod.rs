@@ -290,6 +290,7 @@ where
     ) -> Result<(), SPI::Error> {
         let color_byte = color.to_dual_pixel();
 
+        self.set_full_window()?;
         self.send_command(Command::DTM)?;
         let _ = self.dc.set_high();
 
@@ -313,6 +314,7 @@ where
         buffer: &[u8],
         delay: &mut DELAY,
     ) -> Result<(), SPI::Error> {
+        self.set_full_window()?;
         self.send_command(Command::DTM)?;
         self.send_data(buffer)?;
         self.refresh(delay)
@@ -325,6 +327,7 @@ where
         buffer: &[u8],
         delay: &mut DELAY,
     ) -> Result<(), SPI::Error> {
+        self.set_full_window()?;
         self.send_command(Command::DTM)?;
         self.send_data(buffer)?;
         self.refresh_start(delay)
@@ -432,6 +435,14 @@ where
         self.send_data(&[(y_end & 0xFF) as u8])?;
         // Enable partial window mode
         self.send_data(&[0x01])
+    }
+
+    /// Reset the window to the full screen.
+    ///
+    /// The partial window stays active after a partial update, so a full-screen transfer
+    /// without this would only fill the last partial region.
+    fn set_full_window(&mut self) -> Result<(), SPI::Error> {
+        self.set_partial_window(&Rect::new(0, 0, WIDTH as u16, HEIGHT as u16))
     }
 
     /// Perform a partial update on a rectangular region (blocking).
@@ -602,6 +613,7 @@ where
             colors[idx] = color;
         }
 
+        self.set_full_window()?;
         self.send_command(Command::DTM)?;
         let _ = self.dc.set_high();
 
