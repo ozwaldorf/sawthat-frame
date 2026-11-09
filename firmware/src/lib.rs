@@ -4,11 +4,14 @@ extern crate alloc;
 
 pub mod battery;
 pub mod cache;
+pub mod config;
 pub mod display;
 pub mod epd;
+pub mod fat_label;
 pub mod framebuffer;
 pub mod progress;
 pub mod sync;
+pub mod usb_drive;
 pub mod widget;
 
 /// Timestamped logger for the `log` crate - adds timestamps to all log messages

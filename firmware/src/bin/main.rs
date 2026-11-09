@@ -1,12 +1,8 @@
 //! SawThat Frame Firmware - ESP32-S3 E-Paper Photo Frame
 //!
-//! Environment variables required:
-//! - WIFI_SSID: WiFi network name
-//! - WIFI_PASS: WiFi password
-//!
-//! Optional:
-//! - SAWTHAT_USER_ID: SawThat user whose concerts are shown
-//! - SAWTHAT_FONT (render crate): font file for artwork text
+//! Configuration is read at boot from `CONFIG.TXT` on the SD card root (see
+//! `sawthat_frame_firmware::config`). Without a usable config the frame shows a setup screen
+//! and sleeps until KEY is pressed.
 
 #![no_std]
 #![no_main]
@@ -15,7 +11,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration as CoreDuration;
 use log::info;
 
@@ -40,6 +36,7 @@ use esp_hal::{
     clock::CpuClock,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull, RtcPinWithResistors},
     i2c::master::{Config as I2cConfig, I2c},
+    otg_fs::Usb,
     ram,
     rng::Rng,
     rtc_cntl::{
@@ -53,19 +50,24 @@ use esp_hal::{
     time::Rate,
     timer::timg::TimerGroup,
 };
+use esp_radio::wifi::event::{EventExt, StaDisconnected};
 use esp_radio::{
     Controller,
-    wifi::{ClientConfig, Config as WifiConfig, ModeConfig, WifiController, WifiDevice},
+    wifi::{
+        AuthMethod, ClientConfig, Config as WifiConfig, ModeConfig, WifiController, WifiDevice,
+    },
 };
 use esp_rtos::embassy::Executor;
 use sawthat_frame_firmware::TimestampLogger;
 use sawthat_frame_firmware::battery;
-use sawthat_frame_firmware::cache::SdCache;
+use sawthat_frame_firmware::cache::{CacheError, SdCache};
+use sawthat_frame_firmware::config::{self, Config, ConfigError, WifiCause};
 use sawthat_frame_firmware::display;
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
 use sawthat_frame_firmware::progress;
 use sawthat_frame_firmware::sync::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
+use sawthat_frame_firmware::usb_drive;
 use sawthat_frame_firmware::widget::{Orientation, WidgetData};
 use sawthat_render::Renderer;
 use sawthat_render::concerts::Concert;
@@ -82,17 +84,10 @@ macro_rules! mk_static {
     }};
 }
 
-// Environment configuration
-const SSID: &str = env!("WIFI_SSID");
-const PASSWORD: &str = env!("WIFI_PASS");
-/// SawThat user whose concerts are shown
-const SAWTHAT_USER_ID: &str = match option_env!("SAWTHAT_USER_ID") {
-    Some(id) => id,
-    None => "a320940a-b493-4515-9f25-d393ebb540e6",
-};
-
 /// Maximum time to connect to WiFi and obtain an IP
 const WIFI_TIMEOUT: Duration = Duration::from_secs(60);
+/// Delay between WiFi connection attempts
+const WIFI_RETRY_SECS: u64 = 5;
 /// TCP socket buffer sizes (allocated in PSRAM, see `alloc_tcp_state`)
 const TCP_RX_SIZE: usize = 8192;
 const TCP_TX_SIZE: usize = 1024;
@@ -101,8 +96,10 @@ const IMAGE_BUF_SIZE: usize = 480 * 800 / 2 + sawthat_render::IMAGE_HEADER;
 /// Half-screen partial update buffer (400x480 at 4bpp)
 const HALF_BUFFER_SIZE: usize = 400 * 480 / 2;
 
-/// Refresh interval between display updates (15 minutes)
-const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
+/// Concert text font files on the SD root, in order of preference
+const FONT_FILES: [&str; 2] = ["FONT.TTF", "FONT.OTF"];
+/// Largest accepted font file on the SD card
+const MAX_FONT: usize = 4 * 1024 * 1024;
 /// Button hold threshold in milliseconds
 const HOLD_THRESHOLD_MS: u32 = 500;
 /// Button polling interval in milliseconds
@@ -124,6 +121,14 @@ static mut SLEEP_STATE: SleepState = SleepState::new();
 /// RTC time (us) of the next timer wake, so a charger wake does not postpone it
 #[esp_hal::ram(unstable(rtc_fast))]
 static mut NEXT_WAKE_US: u64 = 0;
+
+/// Set while sleeping on the setup screen, so the wake after it syncs like a power-on
+#[esp_hal::ram(unstable(rtc_fast))]
+static mut SETUP_PENDING: bool = false;
+
+/// Hash of the setup screen on the panel (see `message_hash`), so an unchanged one is not redrawn
+#[esp_hal::ram(unstable(rtc_fast))]
+static mut SETUP_SHOWN: u32 = 0;
 
 /// State persisted in RTC memory across deep sleep
 #[repr(C)]
@@ -209,6 +214,12 @@ impl SleepState {
 
 /// Button monitor state
 static BUTTON_STATE: AtomicU8 = AtomicU8::new(BUTTON_CANCELLED);
+
+/// Last ESP-IDF station disconnect reason, and whether the station joined the network
+static WIFI_REASON: AtomicU8 = AtomicU8::new(0);
+static WIFI_LINKED: AtomicBool = AtomicBool::new(false);
+/// Whether an attempt in the current connection failed authentication
+static WIFI_AUTH_FAILED: AtomicBool = AtomicBool::new(false);
 const BUTTON_CANCELLED: u8 = 0;
 const BUTTON_POLLING: u8 = 1;
 const BUTTON_NEXT: u8 = 2;
@@ -248,11 +259,20 @@ struct RenderResult {
 
 static RENDER_JOBS: Channel<CriticalSectionRawMutex, RenderJob, 1> = Channel::new();
 static RENDER_RESULTS: Channel<CriticalSectionRawMutex, RenderResult, 4> = Channel::new();
+/// Concert text font from the SD card, or `None` for the embedded font; sent before the first job
+static RENDER_FONT: Signal<CriticalSectionRawMutex, Option<&'static [u8]>> = Signal::new();
 
 /// Renders covers on the second core so downloads continue on the first
 #[embassy_executor::task]
 async fn render_task() {
-    let renderer = Renderer::new();
+    let font = RENDER_FONT.wait().await.and_then(|data| {
+        let font = sawthat_render::text::parse_font(data);
+        if font.is_none() {
+            info!("SD card font is invalid, using the embedded font");
+        }
+        font
+    });
+    let renderer = font.map_or_else(Renderer::new, Renderer::with_font);
     loop {
         let job = RENDER_JOBS.receive().await;
         let image = sync::render_cover(&renderer, &job.jpeg, &job.concert, job.size);
@@ -483,7 +503,10 @@ async fn main(spawner: Spawner) -> ! {
         (valid, orient)
     };
 
-    if button_wake {
+    // A KEY press on the setup screen only retries, so it is not read as a tap or hold
+    let setup_pending = unsafe { core::ptr::replace(&raw mut SETUP_PENDING, false) };
+
+    if button_wake && !setup_pending {
         // Button caused wake - poll every 50ms to detect hold vs tap
         let mut hold_time_ms: u32 = 0;
 
@@ -524,12 +547,13 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     let mut delay = Delay;
-    let cold_boot = !matches!(
-        wake_reason,
-        esp_hal::system::SleepSource::Timer
-            | esp_hal::system::SleepSource::Ext0
-            | esp_hal::system::SleepSource::Ext1
-    );
+    let cold_boot = setup_pending
+        || !matches!(
+            wake_reason,
+            esp_hal::system::SleepSource::Timer
+                | esp_hal::system::SleepSource::Ext0
+                | esp_hal::system::SleepSource::Ext1
+        );
 
     // ==================== SD Card Initialization ====================
     // SD card SPI pins: CS=GPIO38, CLK=GPIO39, MISO=GPIO40, MOSI=GPIO41
@@ -560,6 +584,11 @@ async fn main(spawner: Spawner) -> ! {
             info!("SD card init failed: {:?} (artwork storage unavailable)", e);
             None
         }
+    };
+
+    let config = match sd_cache.as_mut() {
+        None => Err(ConfigError::NoSdCard),
+        Some(cache) => load_config(cache),
     };
 
     // Handle orientation persistence
@@ -667,10 +696,50 @@ async fn main(spawner: Spawner) -> ! {
     // ==================== RTC for Deep Sleep ====================
     let mut rtc = Rtc::new(peripherals.LPWR);
 
-    info!("Refresh interval: {} seconds", REFRESH_INTERVAL_SECS);
-
     // Framebuffer (192KB, PSRAM)
     let mut framebuffer = Framebuffer::new();
+
+    // Show the setup screen for `$error`, expose the card to a connected computer (rebooting
+    // afterwards to read the new config), then sleep until KEY, USB, or the `$retry` timer
+    macro_rules! enter_setup {
+        ($error:expr, $retry:expr) => {{
+            let error: ConfigError = $error;
+            info!("Setup needed: {:?}", error);
+            let message = error.message();
+            // Skip the refresh when the same setup screen is already shown
+            let shown = message_hash(&message, orientation);
+            if !(setup_pending && unsafe { SETUP_SHOWN } == shown) {
+                framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
+                progress::draw_setup(&mut framebuffer, orientation, &message);
+                match epd.display(framebuffer.as_slice(), &mut delay) {
+                    Ok(()) => unsafe { SETUP_SHOWN = shown },
+                    Err(e) => info!("Setup screen refresh failed: {:?}", e),
+                }
+            }
+            epd.sleep(&mut delay).ok();
+
+            if let Some(cache) = sd_cache.take()
+                && usb_host_connected().await
+            {
+                start_button_monitor();
+                let usb = Usb::new(peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19);
+                let exit = usb_drive::serve(cache.into_card(), usb, button_pending).await;
+                info!("USB drive mode ended: {:?}", exit);
+                usb_drive::restore_phy();
+                if exit != usb_drive::Exit::NoHost {
+                    delay.delay_ms(100);
+                    esp_hal::system::software_reset();
+                }
+            }
+            sleep_on_setup(&mut rtc, &mut i2c, &mut delay, $retry)
+        }};
+    }
+
+    let config = match config {
+        Ok(config) => config,
+        Err(e) => enter_setup!(e, None),
+    };
+    info!("Refresh interval: {} minutes", config.refresh_minutes);
 
     // Charger plugged, unplugged, started or finished during sleep: redraw only the battery
     // body, then sleep until the timer wake that was already scheduled
@@ -723,6 +792,9 @@ async fn main(spawner: Spawner) -> ! {
                     let wifi = wifi_peripheral.take().unwrap();
                     let (wifi_ctrl, ifaces) =
                         esp_radio::wifi::new(ctrl, wifi, WifiConfig::default()).unwrap();
+                    StaDisconnected::update_handler(|event| {
+                        WIFI_REASON.store(event.reason(), Ordering::Relaxed)
+                    });
 
                     let (stk, runner) = embassy_net::new(
                         ifaces.sta,
@@ -742,17 +814,23 @@ async fn main(spawner: Spawner) -> ! {
 
                 let stack = net_stack.unwrap();
                 let ctrl = wifi_controller.as_mut().unwrap();
+                WIFI_REASON.store(0, Ordering::Relaxed);
+                WIFI_LINKED.store(false, Ordering::Relaxed);
+                WIFI_AUTH_FAILED.store(false, Ordering::Relaxed);
                 wifi_connected = with_timeout(WIFI_TIMEOUT, async {
-                    wifi_connect(ctrl).await;
-                    wait_for_ip(stack).await;
+                    let joined = wifi_connect(ctrl, &config).await;
+                    if joined {
+                        wait_for_ip(stack).await;
+                    }
+                    joined
                 })
                 .await
-                .is_ok();
+                .unwrap_or(false);
 
                 if wifi_connected {
                     info!("WiFi ready!");
                 } else {
-                    info!("WiFi connection timed out");
+                    info!("WiFi connection failed");
                     wifi_disconnect(ctrl).await;
                 }
             }
@@ -836,6 +914,8 @@ async fn main(spawner: Spawner) -> ! {
         };
 
         let mut failures = 0usize;
+        // Whether the render task has been sent its font
+        let mut font_sent = false;
 
         // Track the items shown by a full refresh starting at `index`
         macro_rules! advance_full {
@@ -879,8 +959,21 @@ async fn main(spawner: Spawner) -> ! {
                         )
                     });
 
+                if sd_cache.is_some() && !ensure_wifi!() {
+                    enter_setup!(
+                        ConfigError::WifiFailed(
+                            config.wifi_ssid.clone(),
+                            WifiCause::classify(
+                                WIFI_REASON.load(Ordering::Relaxed),
+                                WIFI_LINKED.load(Ordering::Relaxed),
+                                WIFI_AUTH_FAILED.load(Ordering::Relaxed)
+                            )
+                        ),
+                        Some(config.refresh_secs())
+                    );
+                }
                 if let Some(cache) = sd_cache.as_mut()
-                    && ensure_wifi!()
+                    && wifi_connected
                 {
                     start_blink();
                     let mut net = sync::Net {
@@ -892,7 +985,7 @@ async fn main(spawner: Spawner) -> ! {
                         cover_tls_write: &mut *cover_tls_write_buf,
                     };
 
-                    let concerts = match sync::fetch_bands(&mut net, SAWTHAT_USER_ID)
+                    let concerts = match sync::fetch_bands(&mut net, &config.user_id)
                         .await
                         .ok()
                         .and_then(|json| Some((sync::parse_concerts(&json)?, json)))
@@ -1018,6 +1111,7 @@ async fn main(spawner: Spawner) -> ! {
                                 orientation,
                                 total,
                                 rssi,
+                                config.refresh_minutes,
                             ));
                             framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
                             draw_battery_icon(&mut framebuffer, orientation, $battery);
@@ -1029,6 +1123,11 @@ async fn main(spawner: Spawner) -> ! {
                                 p.confirm();
                                 start_button_monitor();
                             }
+                        }
+
+                        if total > 0 && !font_sent {
+                            RENDER_FONT.signal(load_font(cache).map(|data| &*Vec::leak(data)));
+                            font_sent = true;
                         }
 
                         let mut albums = sync::AlbumCache::new();
@@ -1420,9 +1519,9 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     unsafe {
-        NEXT_WAKE_US = rtc.time_since_boot().as_micros() as u64 + REFRESH_INTERVAL_SECS * 1_000_000;
+        NEXT_WAKE_US = rtc.time_since_boot().as_micros() as u64 + config.refresh_secs() * 1_000_000;
     }
-    sleep_until_wake(&mut rtc, &mut i2c, &mut delay, REFRESH_INTERVAL_SECS);
+    sleep_until_wake(&mut rtc, &mut i2c, &mut delay, config.refresh_secs());
 }
 
 /// Approximate Li-ion state of charge from resting cell voltage
@@ -1575,6 +1674,106 @@ fn hash_data(items: &WidgetData) -> u32 {
     hash
 }
 
+/// Read `CONFIG.TXT` from the SD root
+fn load_config<S: SpiDevice, D: DelayNs>(cache: &mut SdCache<S, D>) -> Result<Config, ConfigError> {
+    let read =
+        |cache: &mut SdCache<S, D>| cache.read_root_file(config::CONFIG_FILE, config::MAX_CONFIG);
+    let data = match read(cache) {
+        // Write a template to fill in, so the setup screen names the first missing key
+        Err(CacheError::NotFound) => {
+            match cache.write_root_file(config::CONFIG_FILE, config::TEMPLATE.as_bytes()) {
+                Ok(()) => {
+                    info!("Wrote a {} template", config::CONFIG_FILE);
+                    read(cache)
+                }
+                Err(_) => Err(CacheError::NotFound),
+            }
+        }
+        result => result,
+    };
+    let data = data.map_err(|e| match e {
+        CacheError::NotFound => ConfigError::Missing,
+        CacheError::Filesystem => ConfigError::BadFormat,
+        _ => ConfigError::Unreadable,
+    })?;
+    config::parse(&data)
+}
+
+/// Read the first of `FONT_FILES` on the SD root, if any
+fn load_font<S: SpiDevice, D: DelayNs>(cache: &mut SdCache<S, D>) -> Option<Vec<u8>> {
+    FONT_FILES
+        .iter()
+        .find_map(|&name| match cache.read_root_file(name, MAX_FONT) {
+            Ok(data) => {
+                info!("Using font {} ({} bytes)", name, data.len());
+                Some(data)
+            }
+            Err(CacheError::NotFound) => None,
+            Err(e) => {
+                info!("Failed to read font {}: {:?}", name, e);
+                None
+            }
+        })
+}
+
+/// KEY button (GPIO4, active low) as a deep sleep wake source
+fn key_wakeup() -> Ext0WakeupSource<esp_hal::peripherals::GPIO4<'static>> {
+    // Reclaim the pin for the RTC domain; the pull-up keeps it from floating
+    let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
+    key_pin.rtcio_pullup(true);
+    key_pin.rtcio_pulldown(false);
+    Ext0WakeupSource::new(key_pin, WakeupLevel::Low)
+}
+
+/// Deep sleep on the setup screen until KEY, a USB plug, or `retry_secs` (if any), then boot
+/// like a power-on
+fn sleep_on_setup(
+    rtc: &mut Rtc,
+    i2c: &mut I2c<'_, esp_hal::Blocking>,
+    delay: &mut Delay,
+    retry_secs: Option<u64>,
+) -> ! {
+    unsafe {
+        let state = &raw mut SLEEP_STATE;
+        (*state).invalidate();
+        SETUP_PENDING = true;
+    }
+    arm_charger_irq(i2c);
+    let ext0 = key_wakeup();
+    let mut irq_pin = charger_irq_pin();
+    let mut irq_pins: [&mut dyn esp_hal::gpio::RtcPin; 1] = [&mut irq_pin];
+    let ext1 = Ext1WakeupSource::new(&mut irq_pins, WakeupLevel::Low);
+    info!(
+        "Entering deep sleep until KEY, USB, or retry in {:?} s...",
+        retry_secs
+    );
+    // Let serial output flush
+    delay.delay_ms(100);
+    match retry_secs {
+        Some(secs) => {
+            let timer = TimerWakeupSource::new(CoreDuration::from_secs(secs));
+            rtc.sleep_deep(&[&ext0, &ext1, &timer])
+        }
+        None => rtc.sleep_deep(&[&ext0, &ext1]),
+    }
+}
+
+/// Identifies a setup screen by its message and orientation
+fn message_hash(message: &str, orientation: Orientation) -> u32 {
+    message
+        .bytes()
+        .chain([orientation as u8])
+        .fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32))
+}
+
+/// AXP2101 IRQ line (GPIO21, active low), reclaimed for the RTC domain with a pull-up
+fn charger_irq_pin() -> esp_hal::peripherals::GPIO21<'static> {
+    let irq_pin = unsafe { esp_hal::peripherals::GPIO21::steal() };
+    irq_pin.rtcio_pullup(true);
+    irq_pin.rtcio_pulldown(false);
+    irq_pin
+}
+
 /// Arm the charger wake and deep sleep for `seconds`, or until KEY or a charger change.
 ///
 /// Wake sources: the timer, the KEY button (GPIO4, active low), and the AXP2101 IRQ line
@@ -1589,15 +1788,8 @@ fn sleep_until_wake(
 
     let timer = TimerWakeupSource::new(CoreDuration::from_secs(seconds));
 
-    // Reclaim the pins for the RTC domain; pull-ups keep them from floating
-    let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
-    key_pin.rtcio_pullup(true);
-    key_pin.rtcio_pulldown(false);
-    let ext0 = Ext0WakeupSource::new(key_pin, WakeupLevel::Low);
-
-    let mut irq_pin = unsafe { esp_hal::peripherals::GPIO21::steal() };
-    irq_pin.rtcio_pullup(true);
-    irq_pin.rtcio_pulldown(false);
+    let ext0 = key_wakeup();
+    let mut irq_pin = charger_irq_pin();
     let mut irq_pins: [&mut dyn esp_hal::gpio::RtcPin; 1] = [&mut irq_pin];
     let ext1 = Ext1WakeupSource::new(&mut irq_pins, WakeupLevel::Low);
 
@@ -1629,23 +1821,30 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
 }
 
 /// Connect to WiFi network
-async fn wifi_connect(controller: &mut WifiController<'static>) {
+/// Connect to the configured network, retrying until it joins (true) or fails the same
+/// definite way twice (false)
+async fn wifi_connect(controller: &mut WifiController<'static>, config: &Config) -> bool {
     start_fast_blink();
     info!("Device capabilities: {:?}", controller.capabilities());
 
     if !matches!(controller.is_started(), Ok(true)) {
-        let client_config = ModeConfig::Client(
-            ClientConfig::default()
-                .with_ssid(SSID.into())
-                .with_password(PASSWORD.into()),
-        );
+        let client = ClientConfig::default()
+            .with_ssid(config.wifi_ssid.clone())
+            .with_password(config.wifi_pass.clone());
+        // An empty password means an open network
+        let client_config = ModeConfig::Client(if config.wifi_pass.is_empty() {
+            client.with_auth_method(AuthMethod::None)
+        } else {
+            client
+        });
         controller.set_config(&client_config).unwrap();
         info!("Starting WiFi...");
         controller.start_async().await.unwrap();
         info!("WiFi started!");
     }
 
-    info!("Connecting to {}...", SSID);
+    info!("Connecting to {}...", config.wifi_ssid);
+    let mut last: Option<WifiCause> = None;
     loop {
         match controller.connect_async().await {
             Ok(_) => {
@@ -1653,12 +1852,25 @@ async fn wifi_connect(controller: &mut WifiController<'static>) {
                     Ok(rssi) => info!("WiFi connected (RSSI {} dBm)", rssi),
                     Err(_) => info!("WiFi connected!"),
                 }
+                WIFI_LINKED.store(true, Ordering::Relaxed);
                 stop_blink();
-                break;
+                return true;
             }
             Err(e) => {
-                info!("Failed to connect: {e:?}, retrying...");
-                Timer::after(Duration::from_secs(5)).await;
+                let reason = WIFI_REASON.load(Ordering::Relaxed);
+                let cause =
+                    WifiCause::classify(reason, false, WIFI_AUTH_FAILED.load(Ordering::Relaxed));
+                if cause == WifiCause::Auth {
+                    WIFI_AUTH_FAILED.store(true, Ordering::Relaxed);
+                }
+                info!("Failed to connect: {e:?} (reason {})", reason);
+                // A missing network or rejected password twice in a row will not fix itself
+                if matches!(cause, WifiCause::NotFound | WifiCause::Auth) && last == Some(cause) {
+                    info!("Giving up: {:?}", cause);
+                    return false;
+                }
+                last = Some(cause);
+                Timer::after(Duration::from_secs(WIFI_RETRY_SECS)).await;
             }
         }
     }

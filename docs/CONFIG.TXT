@@ -1,0 +1,14 @@
+# SawThat Frame configuration
+# Fill in the values below. The frame reads this file from the SD card root at every boot.
+
+# WiFi network (leave WIFI_PASS empty for an open network)
+WIFI_SSID=
+WIFI_PASS=
+
+# SawThat user whose concerts are shown
+SAWTHAT_USER_ID=
+
+# Minutes between artwork changes (1-1440)
+REFRESH_MINUTES=15
+
+# To use a custom font for the concert text, put FONT.TTF or FONT.OTF in the SD card root

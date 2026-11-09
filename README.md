@@ -32,6 +32,17 @@ on Deezer, renders it for the 6-color display, and caches the result on the SD c
 
 ## Usage
 
+Installation:
+
+1. Prepare a FAT32 SD card with a `CONFIG.TXT` in its root (see [Configuration](#configuration))
+2. Insert the SD card into the frame
+3. Flash the firmware (see [Build and flash](#build-and-flash)) and wait for the first sync
+   to finish on the device
+
+Step 1 can also be done on the device: with a blank FAT32 card, the frame writes a
+`CONFIG.TXT` template and appears as a USB drive to fill it in (see [USB drive
+mode](#usb-drive-mode)).
+
 ### Requirements
 
 - Rustup
@@ -53,19 +64,51 @@ source ~/export-esp.sh
 
 ### Configuration
 
-Set WiFi credentials via environment variables:
+The frame reads `CONFIG.TXT` from the SD card root at every boot, so nothing is configured at
+build time. Copy [`docs/CONFIG.TXT`](docs/CONFIG.TXT) to the card and fill it in:
 
-```bash
-export WIFI_SSID="your-ssid"
-export WIFI_PASS="your-password"
+```ini
+WIFI_SSID=your-ssid
+WIFI_PASS=your-password
+SAWTHAT_USER_ID=your-sawthat-user-id
 ```
 
-Optional:
+| Key | Required | Default | Purpose |
+|-----|----------|---------|---------|
+| `WIFI_SSID` | yes | | WiFi network name |
+| `WIFI_PASS` | no | open network | WiFi password (8-64 characters) |
+| `SAWTHAT_USER_ID` | yes | | SawThat user whose concerts are shown |
+| `REFRESH_MINUTES` | no | 15 | Minutes between artwork changes (1-1440) |
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `SAWTHAT_USER_ID` | built-in user | SawThat user whose concerts are shown |
-| `SAWTHAT_FONT` | IBM Plex Mono Bold | Path to a TTF/OTF used for the concert text |
+Lines are `KEY=VALUE`; blank lines and lines starting with `#` are ignored.
+
+To use a custom font for the concert text instead of IBM Plex Mono Bold, put `FONT.TTF` or
+`FONT.OTF` in the SD card root. An invalid font falls back to the built-in one. A new font only
+applies to artwork rendered after the change.
+
+If the card or `CONFIG.TXT` is missing, or a value is invalid, the frame shows a setup screen
+describing the problem. A missing `CONFIG.TXT` is replaced with the template. The next boot
+after the config is fixed syncs like a power-on.
+
+A sync that cannot connect to WiFi also shows the setup screen, replacing any artwork, with
+the cause as the problem: network not found, wrong password, no IP address, or the ESP-IDF
+reason code. A missing network or rejected password fails after two attempts (about 10
+seconds); other failures retry for up to 60 seconds. The frame retries every
+`REFRESH_MINUTES`, so it recovers by itself once the network is back.
+
+### USB drive mode
+
+On the setup screen, if the frame is connected to a computer, the whole SD card appears as a
+USB drive, including the artwork cache. Edit `CONFIG.TXT` (or add a font), then eject the
+drive; the frame restarts and reads the new config. Pressing KEY or unplugging also restarts
+it, but eject first so the computer finishes writing.
+
+Without a computer connected, the frame sleeps until KEY is pressed or USB is plugged in (or
+the retry timer, for a WiFi failure).
+
+The drive uses the same USB port as the serial console, so the console disconnects while the
+drive is shown. Flashing works again after the frame restarts, or by holding BOOT while
+pressing RESET.
 
 ### Build and flash
 
@@ -133,6 +176,8 @@ If SawThat is unreachable, the last successful response stored on the SD card is
 ### SD Card Layout
 
 ```
+/CONFIG.TXT           # Runtime configuration, written by the user
+/FONT.TTF             # Optional concert text font (or FONT.OTF)
 /concerts/
   BANDS.JSN           # Last SawThat bands response
   HORIZ.JSN           # Items with horizontal artwork
@@ -156,14 +201,19 @@ sync.
 ```mermaid
 stateDiagram-v2
     PowerOn --> Boot
-    Wake --> Boot: 15min timer or button
+    Wake --> Boot: Refresh timer or button
 
     state Boot {
         direction LR
         InitSD: Init SD card
-        InitSD --> LoadList: Load item list for orientation
+        InitSD --> LoadConfig: Read CONFIG.TXT
+        LoadConfig --> LoadList: Load item list for orientation
     }
 
+    Boot --> Setup: Missing or invalid config
+    Setup --> UsbDrive: Computer connected
+    UsbDrive --> PowerOn: Eject, unplug, or button
+    Setup --> Wake: Sleep until button, USB plug,\nor retry timer (WiFi failure)
     Boot --> NeedSync
 
     state NeedSync <<choice>>
@@ -184,6 +234,7 @@ stateDiagram-v2
         Read --> Refresh: E-paper refresh
     }
 
+    Sync --> Setup: WiFi failed
     Sync --> Input
     Display --> Input
 

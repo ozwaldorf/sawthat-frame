@@ -1,5 +1,6 @@
 //! Sync progress dialogs: a small box in the top-left screen corner, or a larger centered
-//! welcome box with usage instructions for a first sync.
+//! welcome box with usage instructions for a first sync, and a setup box for a missing or
+//! invalid configuration.
 //!
 //! The dialog ("Syncing N concerts..." and a progress bar) is drawn once, either as part of a
 //! full refresh or as its own partial refresh. Later updates only refresh the newly filled
@@ -12,7 +13,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use sawthat_render::palette::{BLACK, GREEN, WHITE};
+use sawthat_render::palette::{BLACK, GREEN, RED, WHITE};
 use sawthat_render::text::{Canvas, draw_text, font, text_width};
 
 use crate::epd::{HEIGHT, Rect, WIDTH};
@@ -34,12 +35,25 @@ const NOTE_SIZE: f32 = 18.0;
 const LINE_GAP: u32 = 6;
 const SECTION_GAP: u32 = 18;
 
-/// Usage instructions on the welcome box
-const INSTRUCTIONS: [&str; 4] = [
+/// Usage instructions on the welcome box, around the refresh interval line
+const INSTRUCTIONS: [&str; 2] = [
     "Tap KEY for the next concert",
     "Hold KEY to rotate the screen",
-    "Artwork changes every 15 minutes and",
-    "resyncs after every concert is shown",
+];
+const RESYNC_NOTE: &str = "resyncs after every concert is shown";
+
+/// Setup box contents after the error line
+const SETUP_LINES: [&str; 10] = [
+    "Set these in CONFIG.TXT on the SD card:",
+    "",
+    "WIFI_SSID=your network",
+    "WIFI_PASS=your password",
+    "SAWTHAT_USER_ID=your user id",
+    "",
+    "Connect USB to a computer to edit the",
+    "card as a drive, then eject it.",
+    "Or edit the file on the SD card, then",
+    "press KEY to retry.",
 ];
 
 /// Panel partial window alignment in framebuffer x
@@ -125,6 +139,71 @@ fn framebuffer_rect(orientation: Orientation, x: u32, y: u32, w: u32, h: u32) ->
     )
 }
 
+/// 2px black border around a canvas
+fn draw_border(canvas: &mut Canvas) {
+    let (w, h) = (canvas.width, canvas.height);
+    for x in 0..w {
+        for y in [0, 1, h - 2, h - 1] {
+            canvas.set(x, y, BLACK);
+        }
+    }
+    for y in 0..h {
+        for x in [0, 1, w - 2, w - 1] {
+            canvas.set(x, y, BLACK);
+        }
+    }
+}
+
+/// Draw a centered setup box explaining `error` and the expected config file
+pub fn draw_setup(framebuffer: &mut Framebuffer, orientation: Orientation, error: &str) {
+    let font = font();
+    let mut lines = Vec::new();
+    let mut y = PADDING;
+    lines.push((String::from("SawThat Frame Setup"), TITLE_SIZE, BLACK, y));
+    y += line_h(TITLE_SIZE) + SECTION_GAP / 2;
+    lines.push((String::from(error), NOTE_SIZE, RED, y));
+    y += line_h(NOTE_SIZE) + SECTION_GAP - LINE_GAP;
+    for text in SETUP_LINES {
+        lines.push((String::from(text), NOTE_SIZE, BLACK, y));
+        y += line_h(NOTE_SIZE);
+    }
+    let box_h = y + PADDING - LINE_GAP;
+
+    let content_w = lines
+        .iter()
+        .map(|(text, size, _, _)| text_width(&font, text, *size) as u32)
+        .max()
+        .unwrap_or(0);
+    let (sw, sh) = screen_size(orientation);
+    let box_w = ((content_w + 2 * PADDING).div_ceil(ALIGN) * ALIGN).min(sw);
+
+    let mut data = vec![(WHITE << 4) | WHITE; Canvas::len(box_w, box_h)];
+    let mut canvas = Canvas {
+        data: &mut data,
+        width: box_w,
+        height: box_h,
+    };
+    draw_border(&mut canvas);
+    for (text, size, color, y) in &lines {
+        draw_text(
+            &mut canvas,
+            &font,
+            text,
+            *size,
+            (PADDING as f32, *y as f32 - 3.0),
+            *color,
+        );
+    }
+
+    let origin = (sw.saturating_sub(box_w) / 2, sh.saturating_sub(box_h) / 2);
+    for y in 0..box_h {
+        for x in 0..box_w {
+            let (fx, fy) = to_framebuffer(orientation, origin.0 + x, origin.1 + y);
+            framebuffer.set_pixel_indexed(fx, fy, canvas.get(x, y));
+        }
+    }
+}
+
 /// A line of text in the dialog: text, size, and top in box coordinates
 struct Line {
     text: String,
@@ -167,21 +246,32 @@ impl Progress {
     ///
     /// `rssi` is the WiFi signal strength in dBm, shown as an icon before the label.
     pub fn new(orientation: Orientation, total: usize, rssi: Option<i32>) -> Self {
-        Self::build(orientation, total, rssi, false)
+        Self::build(orientation, total, rssi, None)
     }
 
     /// Larger centered box with a welcome title and usage instructions
-    pub fn welcome(orientation: Orientation, total: usize, rssi: Option<i32>) -> Self {
-        Self::build(orientation, total, rssi, true)
+    pub fn welcome(
+        orientation: Orientation,
+        total: usize,
+        rssi: Option<i32>,
+        refresh_minutes: u32,
+    ) -> Self {
+        Self::build(orientation, total, rssi, Some(refresh_minutes))
     }
 
-    fn build(orientation: Orientation, total: usize, rssi: Option<i32>, welcome: bool) -> Self {
+    /// `welcome` holds the refresh interval for a welcome box
+    fn build(
+        orientation: Orientation,
+        total: usize,
+        rssi: Option<i32>,
+        welcome: Option<u32>,
+    ) -> Self {
         let font = font();
         let wifi_bars = rssi.map(signal_bars);
         let mut lines = Vec::new();
         let mut y = PADDING;
 
-        if welcome {
+        if welcome.is_some() {
             lines.push(Line {
                 text: String::from("Welcome to SawThat Frame"),
                 size: TITLE_SIZE,
@@ -204,11 +294,20 @@ impl Progress {
         let bar_y = y;
         y += BAR_H + PADDING;
 
-        if welcome {
+        if let Some(minutes) = welcome {
             y += SECTION_GAP - PADDING;
-            for text in INSTRUCTIONS {
+            let interval = format!(
+                "Artwork changes every {} minute{} and",
+                minutes,
+                if minutes == 1 { "" } else { "s" }
+            );
+            let notes = INSTRUCTIONS
+                .iter()
+                .map(|&text| String::from(text))
+                .chain([interval, String::from(RESYNC_NOTE)]);
+            for text in notes {
                 lines.push(Line {
-                    text: String::from(text),
+                    text,
                     size: NOTE_SIZE,
                     y,
                 });
@@ -233,7 +332,7 @@ impl Progress {
         let box_w = (content_w + 2 * PADDING).div_ceil(ALIGN) * ALIGN;
         let box_h = y;
 
-        let origin = if welcome {
+        let origin = if welcome.is_some() {
             let (sw, sh) = screen_size(orientation);
             (sw.saturating_sub(box_w) / 2, sh.saturating_sub(box_h) / 2)
         } else {
@@ -341,17 +440,7 @@ impl Progress {
             height: box_h,
         };
 
-        // 2px box border
-        for x in 0..box_w {
-            for y in [0, 1, box_h - 2, box_h - 1] {
-                canvas.set(x, y, BLACK);
-            }
-        }
-        for y in 0..box_h {
-            for x in [0, 1, box_w - 2, box_w - 1] {
-                canvas.set(x, y, BLACK);
-            }
-        }
+        draw_border(&mut canvas);
 
         // Bar outline and fill
         for y in bar_y..bar_y + BAR_H {

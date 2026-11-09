@@ -120,6 +120,26 @@ fn parse_cache_filename(filename: &str) -> Option<u32> {
     u32::from_str_radix(name.trim(), 16).ok()
 }
 
+/// Read the rest of an open file
+fn read_all<D, T, const A: usize, const B: usize, const C: usize>(
+    file: &mut embedded_sdmmc::File<'_, D, T, A, B, C>,
+) -> Result<alloc::vec::Vec<u8>, CacheError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut buf = alloc::vec![0u8; file.length() as usize];
+    let mut total = 0;
+    while total < buf.len() {
+        match file.read(&mut buf[total..]).map_err(|_| CacheError::Read)? {
+            0 => break,
+            n => total += n,
+        }
+    }
+    buf.truncate(total);
+    Ok(buf)
+}
+
 /// SD card image cache
 pub struct SdCache<SPI: SpiDevice, DELAY: embedded_hal::delay::DelayNs> {
     volume_mgr: VolumeManager<SdCard<SPI, DELAY>, DummyTimesource>,
@@ -420,18 +440,47 @@ where
         let mut file = concerts_dir
             .open_file_in_dir(BANDS_FILE, Mode::ReadOnly)
             .ok()?;
-
-        let mut buf = alloc::vec![0u8; file.length() as usize];
-        let mut total = 0;
-        while total < buf.len() {
-            match file.read(&mut buf[total..]).ok()? {
-                0 => break,
-                n => total += n,
-            }
-        }
-        buf.truncate(total);
-        info!("Loaded {} bytes of stored band data", total);
+        let buf = read_all(&mut file).ok()?;
+        info!("Loaded {} bytes of stored band data", buf.len());
         Some(buf)
+    }
+
+    /// Release the SD card for raw block access
+    pub fn into_card(self) -> SdCard<SPI, DELAY> {
+        self.volume_mgr.free().0
+    }
+
+    /// Create or replace a file on the SD root
+    pub fn write_root_file(&mut self, name: &str, data: &[u8]) -> Result<(), CacheError> {
+        let mut volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| CacheError::Filesystem)?;
+        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let mut file = root_dir
+            .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
+            .map_err(|_| CacheError::Write)?;
+        file.write(data).map_err(|_| CacheError::Write)
+    }
+
+    /// Read a file on the SD root, up to `max` bytes
+    pub fn read_root_file(
+        &mut self,
+        name: &str,
+        max: usize,
+    ) -> Result<alloc::vec::Vec<u8>, CacheError> {
+        let mut volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| CacheError::Filesystem)?;
+        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let mut file = root_dir
+            .open_file_in_dir(name, Mode::ReadOnly)
+            .map_err(|_| CacheError::NotFound)?;
+        if file.length() as usize > max {
+            return Err(CacheError::TooLarge);
+        }
+        read_all(&mut file)
     }
 
     /// Load orientation from cache

@@ -88,6 +88,10 @@ sawthat-render = { path = "../render" }
 # SD card storage for caching
 embedded-sdmmc = "0.8"
 
+# USB drive mode for setup: exposes the SD card over USB OTG
+usb-device   = "0.3"
+usbd-storage = { version = "2", features = ["bbb", "scsi"] }
+
 # HTTP client with TLS support (use git for embedded-nal-async 0.9 compatibility)
 reqwless = { git = "https://github.com/drogue-iot/reqwless", default-features = false, features = ["embedded-tls", "alloc"] }
 embedded-nal-async = "0.9"
