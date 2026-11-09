@@ -219,9 +219,6 @@ enum LedCommand {
 /// Signal to wake LED task when commands are sent
 static LED_SIGNAL: Signal<CriticalSectionRawMutex, LedCommand> = Signal::new();
 
-/// Concerts per sync batch; Deezer lookups and cover downloads each reuse one connection
-const COVER_BATCH: usize = 8;
-
 /// Stack for the second core, which renders artwork during sync
 const RENDER_CORE_STACK_SIZE: usize = 96 * 1024;
 static mut RENDER_CORE_STACK: CoreStack<RENDER_CORE_STACK_SIZE> = CoreStack::new();
@@ -686,9 +683,13 @@ async fn main(spawner: Spawner) -> ! {
     // TLS buffers for HTTPS
     let mut tls_read_buf: Box<[u8; TLS_READ_BUF_SIZE]> = Box::new([0u8; TLS_READ_BUF_SIZE]);
     let mut tls_write_buf: Box<[u8; TLS_WRITE_BUF_SIZE]> = Box::new([0u8; TLS_WRITE_BUF_SIZE]);
+    // Second pair keeps a cover connection open alongside the Deezer API one
+    let mut cover_tls_read_buf: Box<[u8; TLS_READ_BUF_SIZE]> = Box::new([0u8; TLS_READ_BUF_SIZE]);
+    let mut cover_tls_write_buf: Box<[u8; TLS_WRITE_BUF_SIZE]> =
+        Box::new([0u8; TLS_WRITE_BUF_SIZE]);
 
     // Network resources - created on first WiFi init
-    let mut tcp_client: Option<TcpClient<'static, 1, TCP_RX_SIZE, TCP_TX_SIZE>> = None;
+    let mut tcp_client: Option<TcpClient<'static, 2, TCP_RX_SIZE, TCP_TX_SIZE>> = None;
     let mut dns_socket: Option<DnsSocket<'static>> = None;
     let mut net_stack: Option<Stack<'static>> = None;
 
@@ -710,13 +711,13 @@ async fn main(spawner: Spawner) -> ! {
                     let (stk, runner) = embassy_net::new(
                         ifaces.sta,
                         embassy_net::Config::dhcpv4(Default::default()),
-                        mk_static!(StackResources<3>, StackResources::<3>::new()),
+                        mk_static!(StackResources<4>, StackResources::<4>::new()),
                         rng.random() as u64,
                     );
                     spawner.spawn(net_task(runner)).ok();
 
                     let tcp_state = mk_static!(
-                        TcpClientState<1, TCP_RX_SIZE, TCP_TX_SIZE>,
+                        TcpClientState<2, TCP_RX_SIZE, TCP_TX_SIZE>,
                         TcpClientState::new()
                     );
                     tcp_client = Some(TcpClient::new(stk, tcp_state));
@@ -872,6 +873,8 @@ async fn main(spawner: Spawner) -> ! {
                         dns: dns_socket.as_ref().unwrap(),
                         tls_read: &mut *tls_read_buf,
                         tls_write: &mut *tls_write_buf,
+                        cover_tls_read: &mut *cover_tls_read_buf,
+                        cover_tls_write: &mut *cover_tls_write_buf,
                     };
 
                     let concerts = match sync::fetch_bands(&mut net, SAWTHAT_USER_ID)
@@ -1038,40 +1041,37 @@ async fn main(spawner: Spawner) -> ! {
                             }};
                         }
 
-                        // Download covers on this core while the second core renders,
-                        // reusing connections within each batch
-                        for batch in missing.chunks(COVER_BATCH) {
-                            sync::fetch_covers(
-                                &mut net,
-                                &mut albums,
-                                &concerts,
-                                batch,
-                                layout_size(orientation),
-                                async |i, cover| {
-                                    match cover {
-                                        Ok(jpeg) => {
-                                            RENDER_JOBS
-                                                .send(RenderJob {
-                                                    index: i,
-                                                    concert: concerts[i].clone(),
-                                                    jpeg,
-                                                    size: layout_size(orientation),
-                                                })
-                                                .await;
-                                            in_flight += 1;
-                                        }
-                                        Err(e) => {
-                                            info!("Skipping {}: {:?}", concerts[i].path, e);
-                                            completed += 1;
-                                        }
+                        // Download covers on this core while the second core renders
+                        sync::fetch_covers(
+                            &mut net,
+                            &mut albums,
+                            &concerts,
+                            &missing,
+                            layout_size(orientation),
+                            async |i, cover| {
+                                match cover {
+                                    Ok(jpeg) => {
+                                        RENDER_JOBS
+                                            .send(RenderJob {
+                                                index: i,
+                                                concert: concerts[i].clone(),
+                                                jpeg,
+                                                size: layout_size(orientation),
+                                            })
+                                            .await;
+                                        in_flight += 1;
                                     }
-                                    while let Ok(result) = RENDER_RESULTS.try_receive() {
-                                        finish_render!(result);
+                                    Err(e) => {
+                                        info!("Skipping {}: {:?}", concerts[i].path, e);
+                                        completed += 1;
                                     }
-                                },
-                            )
-                            .await;
-                        }
+                                }
+                                while let Ok(result) = RENDER_RESULTS.try_receive() {
+                                    finish_render!(result);
+                                }
+                            },
+                        )
+                        .await;
                         while in_flight > 0 {
                             finish_render!(RENDER_RESULTS.receive().await);
                         }

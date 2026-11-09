@@ -9,6 +9,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use embassy_futures::join::join;
 use embassy_time::{Duration, Instant, with_timeout};
 use embedded_io_async::{Read, Write};
 use embedded_nal_async::{Dns, TcpConnect};
@@ -59,6 +60,9 @@ pub struct Net<'a, T, D> {
     pub dns: &'a D,
     pub tls_read: &'a mut [u8],
     pub tls_write: &'a mut [u8],
+    /// Second TLS buffer pair, for a cover connection open alongside the API one
+    pub cover_tls_read: &'a mut [u8],
+    pub cover_tls_write: &'a mut [u8],
 }
 
 impl<T: TcpConnect, D: Dns> Net<'_, T, D> {
@@ -216,50 +220,6 @@ async fn lookup_band<C: Read + Write>(
     Ok(concerts::parse_albums(&body))
 }
 
-/// Look up Deezer albums for `bands` over one api.deezer.com connection
-async fn lookup_albums<T: TcpConnect, D: Dns>(
-    net: &mut Net<'_, T, D>,
-    albums: &mut AlbumCache,
-    bands: &[&str],
-) {
-    let (mut k, mut failures) = (0, 0);
-    while k < bands.len() {
-        let tls = TlsConfig::new(TLS_SEED, net.tls_read, net.tls_write, TlsVerify::None);
-        let mut client = HttpClient::new_with_tls(net.tcp, net.dns, tls);
-        let mut resource = match stage(client.resource(concerts::DEEZER_API)).await {
-            Ok(Ok(resource)) => resource,
-            _ => {
-                failures += 1;
-                if failures >= ATTEMPTS {
-                    info!("Deezer unreachable, skipping lookup for {}", bands[k]);
-                    albums.insert(String::from(bands[k]), Vec::new());
-                    (k, failures) = (k + 1, 0);
-                }
-                continue;
-            }
-        };
-
-        while k < bands.len() {
-            match lookup_band(&mut resource, bands[k]).await {
-                Ok(list) => {
-                    albums.insert(String::from(bands[k]), list);
-                    (k, failures) = (k + 1, 0);
-                }
-                Err(e) => {
-                    failures += 1;
-                    if !retryable(&e) || failures >= ATTEMPTS {
-                        info!("Deezer lookup failed for {}: {:?}", bands[k], e);
-                        albums.insert(String::from(bands[k]), Vec::new());
-                        (k, failures) = (k + 1, 0);
-                    }
-                    // Reconnect for the next attempt
-                    break;
-                }
-            }
-        }
-    }
-}
-
 /// Cover URL for a concert: the album closest to (not after) the concert date, or the
 /// artist picture; Deezer covers are requested at the layout's covering size
 fn cover_url(albums: &AlbumCache, concert: &Concert, size: (u32, u32)) -> Option<String> {
@@ -271,80 +231,165 @@ fn cover_url(albums: &AlbumCache, concert: &Concert, size: (u32, u32)) -> Option
         .map(|url| concerts::sized_cover_url(&url, cover_size(size)))
 }
 
-/// Download covers for `batch` (indices into `concerts`), reusing connections.
+/// Download covers for `order` (indices into `concerts`) one concert at a time.
 ///
-/// Deezer lookups for the batch share one api.deezer.com connection; covers are then
-/// downloaded over a connection kept open while consecutive covers share a host.
-/// `on_cover` receives each concert index with its JPEG or the failure, in order.
+/// Two connections stay open: one to api.deezer.com for band lookups and one for cover
+/// downloads, reopened only when the cover host changes or a request fails. Each cover
+/// downloads while the next concert's band is looked up on the other connection.
+/// `on_cover` receives each concert index with its JPEG or the failure, in order, as soon
+/// as it downloads.
 pub async fn fetch_covers<T: TcpConnect, D: Dns>(
     net: &mut Net<'_, T, D>,
     albums: &mut AlbumCache,
     concerts: &[Concert],
-    batch: &[usize],
+    order: &[usize],
     size: (u32, u32),
     mut on_cover: impl AsyncFnMut(usize, Result<Vec<u8>, SyncError>),
 ) {
-    let mut bands: Vec<&str> = Vec::new();
-    for &i in batch {
-        let band = concerts[i].band_name.as_str();
-        if !albums.contains_key(band) && !bands.contains(&band) {
-            bands.push(band);
-        }
-    }
-    lookup_albums(net, albums, &bands).await;
+    let (mut k, mut failures, mut api_down) = (0, 0, false);
 
-    let covers: Vec<(usize, Option<String>)> = batch
-        .iter()
-        .map(|&i| (i, cover_url(albums, &concerts[i], size)))
-        .collect();
-
-    let (mut k, mut failures) = (0, 0);
-    while k < covers.len() {
-        let (i, Some(url)) = &covers[k] else {
-            on_cover(covers[k].0, Err(SyncError::NoImage)).await;
-            k += 1;
-            continue;
-        };
-        let origin = split_url(url).0;
-
+    // Deezer API connection, reopened after a failed lookup
+    'api: while k < order.len() {
         let tls = TlsConfig::new(TLS_SEED, net.tls_read, net.tls_write, TlsVerify::None);
-        let mut client = HttpClient::new_with_tls(net.tcp, net.dns, tls);
-        let mut resource = match stage(client.resource(origin)).await {
-            Ok(Ok(resource)) => resource,
-            _ => {
-                failures += 1;
-                if failures >= ATTEMPTS {
-                    on_cover(*i, Err(SyncError::Network)).await;
-                    (k, failures) = (k + 1, 0);
-                }
-                continue;
-            }
-        };
-
-        // Download consecutive covers from this host over the open connection
-        while let Some((i, url)) = covers.get(k) {
-            let Some(url) = url else {
-                on_cover(*i, Err(SyncError::NoImage)).await;
-                k += 1;
-                continue;
-            };
-            let (url_origin, path) = split_url(url);
-            if url_origin != origin {
-                break;
-            }
-            match resource_get(&mut resource, path, MAX_IMAGE).await {
-                Ok(jpeg) => {
-                    on_cover(*i, Ok(jpeg)).await;
-                    (k, failures) = (k + 1, 0);
-                }
-                Err(e) => {
+        let mut api_client = HttpClient::new_with_tls(net.tcp, net.dns, tls);
+        let mut api = None;
+        if !api_down {
+            match stage(api_client.resource(concerts::DEEZER_API)).await {
+                Ok(Ok(resource)) => api = Some(resource),
+                _ => {
                     failures += 1;
-                    if !retryable(&e) || failures >= ATTEMPTS {
-                        on_cover(*i, Err(e)).await;
+                    if failures >= ATTEMPTS {
+                        info!("Deezer unreachable, using artist pictures");
+                        (api_down, failures) = (true, 0);
+                    }
+                    continue 'api;
+                }
+            }
+        }
+
+        // Look up the band of `order[k]`; evaluates to false when the API connection
+        // must be reopened before retrying
+        macro_rules! lookup {
+            () => {{
+                let band = &concerts[order[k]].band_name;
+                if albums.contains_key(band) {
+                    true
+                } else {
+                    let result = match api.as_mut() {
+                        Some(api) => lookup_band(api, band).await,
+                        None => Ok(Vec::new()),
+                    };
+                    match result {
+                        Ok(list) => {
+                            albums.insert(band.clone(), list);
+                            failures = 0;
+                            true
+                        }
+                        Err(e) if retryable(&e) && failures + 1 < ATTEMPTS => {
+                            failures += 1;
+                            false
+                        }
+                        Err(e) => {
+                            info!("Deezer lookup failed for {}: {:?}", band, e);
+                            albums.insert(band.clone(), Vec::new());
+                            failures = 0;
+                            true
+                        }
+                    }
+                }
+            }};
+        }
+
+        // Cover connection, reopened when the host changes or a download fails
+        'cover: while k < order.len() {
+            if !lookup!() {
+                continue 'api;
+            }
+            let Some(mut url) = cover_url(albums, &concerts[order[k]], size) else {
+                on_cover(order[k], Err(SyncError::NoImage)).await;
+                k += 1;
+                continue 'cover;
+            };
+
+            let origin = String::from(split_url(&url).0);
+            let tls = TlsConfig::new(
+                TLS_SEED,
+                net.cover_tls_read,
+                net.cover_tls_write,
+                TlsVerify::None,
+            );
+            let mut cover_client = HttpClient::new_with_tls(net.tcp, net.dns, tls);
+            let mut cover = match stage(cover_client.resource(&origin)).await {
+                Ok(Ok(resource)) => resource,
+                _ => {
+                    failures += 1;
+                    if failures >= ATTEMPTS {
+                        on_cover(order[k], Err(SyncError::Network)).await;
                         (k, failures) = (k + 1, 0);
                     }
-                    // Reconnect for the next attempt
-                    break;
+                    continue 'cover;
+                }
+            };
+
+            loop {
+                // Download this cover while looking up the next concert's band on the
+                // API connection; a failed lookup is retried by `lookup!` before use
+                let next_band = order
+                    .get(k + 1)
+                    .map(|&i| &concerts[i].band_name)
+                    .filter(|band| !albums.contains_key(*band));
+                let (download, prefetched) = join(
+                    resource_get(&mut cover, split_url(&url).1, MAX_IMAGE),
+                    async {
+                        match (next_band, api.as_mut()) {
+                            (Some(band), Some(api)) => Some(lookup_band(api, band).await),
+                            _ => None,
+                        }
+                    },
+                )
+                .await;
+                if let (Some(band), Some(Ok(list))) = (next_band, prefetched) {
+                    albums.insert(band.clone(), list);
+                }
+
+                match download {
+                    Ok(jpeg) => {
+                        on_cover(order[k], Ok(jpeg)).await;
+                        (k, failures) = (k + 1, 0);
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        if !retryable(&e) || failures >= ATTEMPTS {
+                            on_cover(order[k], Err(e)).await;
+                            (k, failures) = (k + 1, 0);
+                        }
+                        continue 'cover;
+                    }
+                }
+
+                // Advance to the next concert that has a cover
+                loop {
+                    if k >= order.len() {
+                        break 'api;
+                    }
+                    if !lookup!() {
+                        continue 'api;
+                    }
+                    match cover_url(albums, &concerts[order[k]], size) {
+                        Some(next) => {
+                            url = next;
+                            break;
+                        }
+                        None => {
+                            on_cover(order[k], Err(SyncError::NoImage)).await;
+                            k += 1;
+                        }
+                    }
+                }
+
+                // Keep the connection only while covers come from the same host
+                if split_url(&url).0 != origin {
+                    continue 'cover;
                 }
             }
         }
