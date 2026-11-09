@@ -11,6 +11,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::fmt::Write as FmtWrite;
+use embassy_time::{Duration, with_timeout};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
@@ -45,6 +46,75 @@ pub enum DisplayError {
     Png(&'static str),
     Json(&'static str),
     NoItems,
+    Timeout,
+}
+
+/// Upper bound for a single HTTP request (connect, send, and body read)
+const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Fetch widget data from edge service
+pub async fn fetch_widget_data<T, D>(
+    tcp: &T,
+    dns: &D,
+    tls_read_buf: &mut [u8],
+    tls_write_buf: &mut [u8],
+    server_url: &str,
+    widget_name: &str,
+) -> Result<Box<WidgetData>, DisplayError>
+where
+    T: TcpConnect,
+    D: Dns,
+{
+    with_timeout(
+        HTTP_TIMEOUT,
+        fetch_widget_data_inner(
+            tcp,
+            dns,
+            tls_read_buf,
+            tls_write_buf,
+            server_url,
+            widget_name,
+        ),
+    )
+    .await
+    .map_err(|_| DisplayError::Timeout)?
+}
+
+/// Fetch a single PNG image from the network (for caching).
+///
+/// Returns the number of bytes written to `png_buf`.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_png<T, D>(
+    tcp: &T,
+    dns: &D,
+    tls_read_buf: &mut [u8],
+    tls_write_buf: &mut [u8],
+    png_buf: &mut [u8],
+    server_url: &str,
+    widget_name: &str,
+    item_path: &str,
+    orientation: Orientation,
+) -> Result<usize, DisplayError>
+where
+    T: TcpConnect,
+    D: Dns,
+{
+    with_timeout(
+        HTTP_TIMEOUT,
+        fetch_png_inner(
+            tcp,
+            dns,
+            tls_read_buf,
+            tls_write_buf,
+            png_buf,
+            server_url,
+            widget_name,
+            item_path,
+            orientation,
+        ),
+    )
+    .await
+    .map_err(|_| DisplayError::Timeout)?
 }
 
 /// Fetch images and render to framebuffer (no display update).
@@ -331,7 +401,7 @@ where
 }
 
 /// Fetch widget data from edge service
-pub async fn fetch_widget_data<T, D>(
+async fn fetch_widget_data_inner<T, D>(
     tcp: &T,
     dns: &D,
     tls_read_buf: &mut [u8],
@@ -513,7 +583,7 @@ pub const fn tls_write_buffer_size() -> usize {
 ///
 /// Returns the number of bytes written to `png_buf`.
 #[allow(clippy::too_many_arguments)]
-pub async fn fetch_png<T, D>(
+async fn fetch_png_inner<T, D>(
     tcp: &T,
     dns: &D,
     tls_read_buf: &mut [u8],
