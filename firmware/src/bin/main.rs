@@ -201,7 +201,7 @@ async fn led_task(led_red: &'static mut Output<'static>, led_green: &'static mut
     loop {
         if blink_enabled {
             // When blinking, use select to handle either signal or blink timer
-            use embassy_futures::select::{select, Either};
+            use embassy_futures::select::{Either, select};
 
             match select(
                 LED_SIGNAL.wait(),
@@ -363,6 +363,22 @@ async fn main(spawner: Spawner) -> ! {
     let wake_reason = esp_hal::rtc_cntl::wakeup_cause();
     let button_wake = matches!(wake_reason, esp_hal::system::SleepSource::Ext0);
 
+    // Initialize internal RAM heap (for smaller allocations)
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 36 * 1024);
+
+    // Initialize PSRAM for large allocations (framebuffer, PNG buffer)
+    esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
+
+    // RTOS provides the embassy time driver, so it must start before any Timer is awaited
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(
+        timg0.timer0,
+        #[cfg(target_arch = "riscv32")]
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT)
+            .software_interrupt0,
+    );
+
     // ==================== Early Button Check (before heavy init) ====================
     // Set up button and LED GPIOs first for fast response to button wake
     let key_input = Input::new(
@@ -425,26 +441,6 @@ async fn main(spawner: Spawner) -> ! {
     // ==================== Normal Boot Sequence ====================
     // Now do the heavier initialization
     info!("Boot! Wake reason: {:?}", wake_reason);
-
-    // Initialize internal RAM heap (for smaller allocations)
-    info!("Initializing heap...");
-    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 36 * 1024);
-
-    // Initialize PSRAM for large allocations (framebuffer, PNG buffer)
-    info!("Initializing PSRAM...");
-    esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
-    info!("PSRAM initialized");
-
-    info!("Starting RTOS...");
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(
-        timg0.timer0,
-        #[cfg(target_arch = "riscv32")]
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT)
-            .software_interrupt0,
-    );
-    info!("RTOS started");
 
     let mut delay = Delay;
 
