@@ -6,7 +6,7 @@ use std::{env, fs, io::BufWriter, time::Instant};
 
 use sawthat_render::{
     ConcertInfo, HORIZ_SIZE, PackedImage, Renderer, VERT_SIZE, concerts::format_date, decode_jpeg,
-    pack_image, palette::PALETTE, primary_color,
+    palette::PALETTE, primary_color,
 };
 
 fn main() {
@@ -34,17 +34,14 @@ fn main() {
 
     for (name, (w, h)) in [("horiz", HORIZ_SIZE), ("vert", VERT_SIZE)] {
         let t = Instant::now();
-        let pixels = renderer.render(&src, &color, &info, w, h);
+        let stored = renderer.render(&src, &color, &info, w, h);
         println!("render {}: {:?}", name, t.elapsed());
 
-        // Round-trip through the stored format
-        let packed = pack_image(&pixels, w, h);
-        let img = PackedImage::parse(&packed).expect("packed image");
-        let unpacked: Vec<u8> = (0..h)
+        let img = PackedImage::parse(&stored).expect("stored image");
+        let pixels: Vec<u8> = (0..h)
             .flat_map(|y| (0..w).map(move |x| (x, y)))
             .map(|(x, y)| img.get(x, y))
             .collect();
-        assert_eq!(unpacked, pixels);
 
         let file = fs::File::create(format!("{}_{}.png", out, name)).unwrap();
         let mut enc = png::Encoder::new(BufWriter::new(file), w, h);

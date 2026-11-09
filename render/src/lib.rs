@@ -19,6 +19,8 @@ pub mod palette;
 pub mod resize;
 pub mod text;
 
+use ab_glyph::FontRef;
+use alloc::vec;
 use alloc::vec::Vec;
 
 pub use adjust::Adjuster;
@@ -74,6 +76,7 @@ pub fn decode_jpeg(data: &[u8]) -> Result<RgbImage, RenderError> {
 pub struct Renderer {
     pub adjuster: Adjuster,
     pub palette: OklabPalette,
+    pub font: FontRef<'static>,
 }
 
 impl Renderer {
@@ -81,10 +84,11 @@ impl Renderer {
         Self {
             adjuster: Adjuster::new(),
             palette: OklabPalette::new(),
+            font: text::font(),
         }
     }
 
-    /// Render `src` at `width` x `height` to palette indices (one byte per pixel)
+    /// Render `src` at `width` x `height` in the stored image format (see [`PackedImage`])
     pub fn render(
         &self,
         src: &RgbImage,
@@ -97,20 +101,19 @@ impl Renderer {
         let mut img = resize::resize_cover(src, width, image_height);
         self.adjuster.apply_rgb(&mut img.data);
 
-        let mut pixels = dither::compose_and_dither(&img, color.rgb, height, &self.palette);
-        drop(img);
+        let mut out = vec![0u8; IMAGE_HEADER + Canvas::len(width, height)];
+        out[0..2].copy_from_slice(&(width as u16).to_le_bytes());
+        out[2..4].copy_from_slice(&(height as u16).to_le_bytes());
+        let mut canvas = Canvas {
+            data: &mut out[IMAGE_HEADER..],
+            width,
+            height,
+        };
 
-        text::render_concert_info(
-            &mut Canvas {
-                pixels: &mut pixels,
-                width,
-                height,
-            },
-            info,
-            image_height,
-            color.is_light,
-        );
-        pixels
+        dither::compose_and_dither(&img, color.rgb, &mut canvas, &self.palette);
+        drop(img);
+        text::render_concert_info(&mut canvas, &self.font, info, image_height, color.is_light);
+        out
     }
 }
 
@@ -123,20 +126,7 @@ impl Default for Renderer {
 /// Size of the stored image header (width, height as u16 LE)
 pub const IMAGE_HEADER: usize = 4;
 
-/// Encode palette indices as header + 4bpp packed pixels (high nibble first)
-pub fn pack_image(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(IMAGE_HEADER + pixels.len().div_ceil(2));
-    out.extend_from_slice(&(width as u16).to_le_bytes());
-    out.extend_from_slice(&(height as u16).to_le_bytes());
-    out.extend(
-        pixels
-            .chunks(2)
-            .map(|p| (p[0] << 4) | p.get(1).copied().unwrap_or(0)),
-    );
-    out
-}
-
-/// Stored image view
+/// Stored image: 4-byte header (width, height as u16 LE) then 4bpp palette indices
 pub struct PackedImage<'a> {
     pub width: u32,
     pub height: u32,
@@ -149,7 +139,7 @@ impl<'a> PackedImage<'a> {
         let width = u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?) as u32;
         let height = u16::from_le_bytes(bytes.get(2..4)?.try_into().ok()?) as u32;
         let data = &bytes[IMAGE_HEADER..];
-        ((width * height).div_ceil(2) as usize == data.len()).then_some(Self {
+        (Canvas::len(width, height) == data.len()).then_some(Self {
             width,
             height,
             data,

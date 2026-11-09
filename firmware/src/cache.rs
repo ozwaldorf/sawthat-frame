@@ -263,6 +263,24 @@ where
         Ok(total_read)
     }
 
+    /// Delete a cached image
+    pub fn remove_image(&mut self, path: &str, orientation: Orientation) -> Result<(), CacheError> {
+        let mut volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| CacheError::Filesystem)?;
+        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let mut concerts_dir = root_dir
+            .open_dir(ROOT_DIR)
+            .map_err(|_| CacheError::Filesystem)?;
+        let mut orient_dir = concerts_dir
+            .open_dir(orientation_dir(orientation))
+            .map_err(|_| CacheError::Filesystem)?;
+        orient_dir
+            .delete_file_in_dir(cache_filename(path).as_str())
+            .map_err(|_| CacheError::NotFound)
+    }
+
     /// Write image to cache
     pub fn write_image(
         &mut self,

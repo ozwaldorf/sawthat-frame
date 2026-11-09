@@ -12,7 +12,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use sawthat_render::palette::{BLACK, GREEN, WHITE};
-use sawthat_render::text::{Canvas, draw_text, text_width};
+use sawthat_render::text::{Canvas, draw_text, font, text_width};
 
 use crate::epd::{HEIGHT, Rect, WIDTH};
 use crate::framebuffer::Framebuffer;
@@ -81,7 +81,8 @@ impl Progress {
             total,
             if total == 1 { "" } else { "s" }
         );
-        let box_w = (text_width(&label, TEXT_SIZE) as u32 + 2 * PADDING).div_ceil(ALIGN) * ALIGN;
+        let box_w =
+            (text_width(&font(), &label, TEXT_SIZE) as u32 + 2 * PADDING).div_ceil(ALIGN) * ALIGN;
         Self {
             orientation,
             total,
@@ -154,18 +155,23 @@ impl Progress {
 
     fn draw_box(&self, framebuffer: &mut Framebuffer) {
         let (box_w, bar_w, fill) = (self.box_w, self.bar_w(), self.drawn);
-        let mut pixels = vec![WHITE; (box_w * BOX_H) as usize];
-        let mut set = |x: u32, y: u32, c: u8| pixels[(y * box_w + x) as usize] = c;
+        // White is palette index 1 in both nibbles
+        let mut data = vec![(WHITE << 4) | WHITE; Canvas::len(box_w, BOX_H)];
+        let mut canvas = Canvas {
+            data: &mut data,
+            width: box_w,
+            height: BOX_H,
+        };
 
         // 2px box border
         for x in 0..box_w {
             for y in [0, 1, BOX_H - 2, BOX_H - 1] {
-                set(x, y, BLACK);
+                canvas.set(x, y, BLACK);
             }
         }
         for y in 0..BOX_H {
             for x in [0, 1, box_w - 2, box_w - 1] {
-                set(x, y, BLACK);
+                canvas.set(x, y, BLACK);
             }
         }
 
@@ -181,27 +187,23 @@ impl Progress {
                 } else {
                     WHITE
                 };
-                set(x, y, color);
+                canvas.set(x, y, color);
             }
         }
 
         draw_text(
-            &mut Canvas {
-                pixels: &mut pixels,
-                width: box_w,
-                height: BOX_H,
-            },
+            &mut canvas,
+            &font(),
             &self.label,
             TEXT_SIZE,
-            PADDING as f32,
-            5.0,
+            (PADDING as f32, 5.0),
             BLACK,
         );
 
         for y in 0..BOX_H {
             for x in 0..box_w {
                 let (fx, fy) = to_framebuffer(self.orientation, x, y);
-                framebuffer.set_pixel_indexed(fx, fy, pixels[(y * box_w + x) as usize]);
+                framebuffer.set_pixel_indexed(fx, fy, canvas.get(x, y));
             }
         }
     }

@@ -1,12 +1,12 @@
 //! Canvas composition and Floyd-Steinberg dithering to the 6-color palette in OKLab space.
 //!
-//! Processes one row at a time with two error rows, so no full-size float canvas is needed.
+//! Processes one row at a time with two error rows, writing packed 4bpp output directly.
 
 use alloc::vec;
-use alloc::vec::Vec;
 
 use crate::palette::{Oklab, OklabPalette};
 use crate::resize::RgbImage;
+use crate::text::Canvas;
 
 /// Height of the gradient blending the image into the text background
 pub const GRADIENT_HEIGHT: u32 = 80;
@@ -36,27 +36,33 @@ fn canvas_pixel(img: &RgbImage, bg: [u8; 3], x: u32, y: u32) -> [u8; 3] {
     }
 }
 
-/// Compose `img` (full width, top of canvas) over `bg` and dither to palette indices.
+/// Compose `img` (full width, top of `canvas`) over `bg` and dither into the canvas.
 pub fn compose_and_dither(
     img: &RgbImage,
     bg: [u8; 3],
-    height: u32,
+    canvas: &mut Canvas,
     palette: &OklabPalette,
-) -> Vec<u8> {
+) {
     let width = img.width as usize;
-    let mut indexed = vec![0u8; width * height as usize];
     let mut cur = vec![Oklab::default(); width];
     let mut next = vec![Oklab::default(); width];
 
-    for y in 0..height {
+    // Neighbouring pixels often share a color (the solid text area especially)
+    let mut last_rgb = None;
+    let mut last_oklab = Oklab::default();
+
+    for y in 0..canvas.height {
         for x in 0..width {
-            let [r, g, b] = canvas_pixel(img, bg, x as u32, y);
-            let base = palette.to_oklab(r, g, b);
-            let e = cur[x];
+            let rgb = canvas_pixel(img, bg, x as u32, y);
+            if last_rgb != Some(rgb) {
+                last_oklab = palette.to_oklab(rgb[0], rgb[1], rgb[2]);
+                last_rgb = Some(rgb);
+            }
+            let (base, e) = (last_oklab, cur[x]);
             let px = Oklab::new(base.l + e.l, base.a + e.a, base.b + e.b);
 
             let idx = palette.nearest(&px);
-            indexed[y as usize * width + x] = idx;
+            canvas.set(x as u32, y, idx);
 
             let t = palette.get(idx);
             let err = Oklab::new(px.l - t.l, px.a - t.a, px.b - t.b);
@@ -79,6 +85,4 @@ pub fn compose_and_dither(
         core::mem::swap(&mut cur, &mut next);
         next.iter_mut().for_each(|e| *e = Oklab::default());
     }
-
-    indexed
 }

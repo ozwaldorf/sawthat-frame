@@ -25,13 +25,17 @@ use embassy_net::{
     dns::DnsSocket,
     tcp::client::{TcpClient, TcpClientState},
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
+};
 use embassy_time::{Delay, Duration, Timer, with_timeout};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_alloc as _;
 use esp_backtrace as _;
+use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::system::Stack as CoreStack;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
@@ -53,6 +57,7 @@ use esp_radio::{
     Controller,
     wifi::{ClientConfig, Config as WifiConfig, ModeConfig, WifiController, WifiDevice},
 };
+use esp_rtos::embassy::Executor;
 use sawthat_frame_firmware::TimestampLogger;
 use sawthat_frame_firmware::battery;
 use sawthat_frame_firmware::cache::SdCache;
@@ -63,6 +68,7 @@ use sawthat_frame_firmware::progress;
 use sawthat_frame_firmware::sync::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::widget::{Orientation, WidgetData};
 use sawthat_render::Renderer;
+use sawthat_render::concerts::Concert;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -212,6 +218,46 @@ enum LedCommand {
 
 /// Signal to wake LED task when commands are sent
 static LED_SIGNAL: Signal<CriticalSectionRawMutex, LedCommand> = Signal::new();
+
+/// Concerts per sync batch; Deezer lookups and cover downloads each reuse one connection
+const COVER_BATCH: usize = 8;
+
+/// Stack for the second core, which renders artwork during sync
+const RENDER_CORE_STACK_SIZE: usize = 96 * 1024;
+static mut RENDER_CORE_STACK: CoreStack<RENDER_CORE_STACK_SIZE> = CoreStack::new();
+
+/// Cover to render on the second core
+struct RenderJob {
+    index: usize,
+    concert: Concert,
+    jpeg: Vec<u8>,
+    size: (u32, u32),
+}
+
+/// Rendered artwork in the stored image format
+struct RenderResult {
+    index: usize,
+    image: Result<Vec<u8>, sync::SyncError>,
+}
+
+static RENDER_JOBS: Channel<CriticalSectionRawMutex, RenderJob, 1> = Channel::new();
+static RENDER_RESULTS: Channel<CriticalSectionRawMutex, RenderResult, 4> = Channel::new();
+
+/// Renders covers on the second core so downloads continue on the first
+#[embassy_executor::task]
+async fn render_task() {
+    let renderer = Renderer::new();
+    loop {
+        let job = RENDER_JOBS.receive().await;
+        let image = sync::render_cover(&renderer, &job.jpeg, &job.concert, job.size);
+        RENDER_RESULTS
+            .send(RenderResult {
+                index: job.index,
+                image,
+            })
+            .await;
+    }
+}
 
 /// Combined LED task - handles red LED blinking and green LED flash requests
 /// Uses signal-based waking to avoid continuous polling
@@ -398,6 +444,25 @@ async fn main(spawner: Spawner) -> ! {
         #[cfg(target_arch = "riscv32")]
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT)
             .software_interrupt0,
+    );
+
+    // The second core renders artwork while this core handles the network during sync
+    let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start_second_core(
+        peripherals.CPU_CTRL,
+        sw_ints.software_interrupt0,
+        sw_ints.software_interrupt1,
+        // Taken once at boot; `&mut STATIC` is rejected for `static mut` in edition 2024
+        #[allow(clippy::deref_addrof)]
+        unsafe {
+            &mut *(&raw mut RENDER_CORE_STACK)
+        },
+        || {
+            let executor = mk_static!(Executor, Executor::new());
+            executor.run(|spawner| {
+                spawner.spawn(render_task()).ok();
+            });
+        },
     );
 
     // ==================== Early Button Check (before heavy init) ====================
@@ -639,10 +704,8 @@ async fn main(spawner: Spawner) -> ! {
                     let ctrl = mk_static!(Controller<'static>, ctrl);
 
                     let wifi = wifi_peripheral.take().unwrap();
-                    // AMPDU RX bursts were dropped by the driver, stalling large downloads
-                    let wifi_config = WifiConfig::default().with_ampdu_rx_enable(false);
                     let (wifi_ctrl, ifaces) =
-                        esp_radio::wifi::new(ctrl, wifi, wifi_config).unwrap();
+                        esp_radio::wifi::new(ctrl, wifi, WifiConfig::default()).unwrap();
 
                     let (stk, runner) = embassy_net::new(
                         ifaces.sta,
@@ -691,6 +754,19 @@ async fn main(spawner: Spawner) -> ! {
             .unwrap_or_default(),
     );
     info!("{} stored items for {:?}", items.len(), orientation);
+
+    // Test builds: delete some artwork so the power-on sync has work to do
+    if let Some(n) = option_env!("SAWTHAT_INVALIDATE").and_then(|n| n.parse::<usize>().ok())
+        && cold_boot
+        && let Some(cache) = sd_cache.as_mut()
+    {
+        let removed = items
+            .iter()
+            .take(n)
+            .filter(|path| cache.remove_image(path, orientation).is_ok())
+            .count();
+        info!("Invalidated {} {:?} images", removed, orientation);
+    }
 
     {
         // Get saved state if resuming
@@ -892,75 +968,112 @@ async fn main(spawner: Spawner) -> ! {
                             }
                         }
 
-                        let renderer = Renderer::new();
                         let mut albums = sync::AlbumCache::new();
                         let mut rendered: Vec<usize> = Vec::new();
-                        for (done, &i) in missing.iter().enumerate() {
-                            // Refresh the new bar slice once the panel is free
-                            if let Some(p) = progress.as_mut()
-                                && !epd.is_busy()
-                                && let Some((rect, region)) = p.update(&mut framebuffer, done)
-                                && epd.partial_update_start(&rect, &region, &mut delay).is_ok()
-                            {
-                                p.confirm();
-                            }
+                        let mut completed = 0usize;
+                        let mut in_flight = 0usize;
 
-                            let concert = &concerts[i];
-                            match sync::render_concert(
+                        // Store a finished render, then refresh the bar and, with nothing
+                        // cached, show the first screen as soon as it is available
+                        macro_rules! finish_render {
+                            ($result:expr) => {{
+                                let RenderResult { index: i, image } = $result;
+                                let concert = &concerts[i];
+                                completed += 1;
+                                in_flight -= 1;
+                                match image {
+                                    Ok(image) => {
+                                        match cache.write_image(&concert.path, orientation, &image) {
+                                            Ok(()) => {
+                                                ready_flags[i] = true;
+                                                rendered.push(i);
+                                            }
+                                            Err(e) => {
+                                                info!("Failed to store {}: {:?}", concert.path, e)
+                                            }
+                                        }
+                                    }
+                                    Err(e) => info!("Skipping {}: {:?}", concert.path, e),
+                                }
+
+                                if !shown && rendered.len() >= per_screen {
+                                    while epd.is_busy() {
+                                        Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS))
+                                            .await;
+                                    }
+                                    let paths: Vec<&str> = rendered[..per_screen]
+                                        .iter()
+                                        .map(|&i| concerts[i].path.as_str())
+                                        .collect();
+                                    if compose_screen(
+                                        cache,
+                                        &mut framebuffer,
+                                        &mut *image_buf,
+                                        &paths,
+                                        orientation,
+                                        $battery,
+                                    ) {
+                                        if let Some(p) = progress.as_mut() {
+                                            p.draw(&mut framebuffer, completed);
+                                        }
+                                        if epd
+                                            .display_start(framebuffer.as_slice(), &mut delay)
+                                            .is_ok()
+                                        {
+                                            shown = true;
+                                            start_button_monitor();
+                                            if let Some(p) = progress.as_mut() {
+                                                p.confirm();
+                                            }
+                                        }
+                                    }
+                                } else if let Some(p) = progress.as_mut()
+                                    && !epd.is_busy()
+                                    && let Some((rect, region)) =
+                                        p.update(&mut framebuffer, completed)
+                                    && epd.partial_update_start(&rect, &region, &mut delay).is_ok()
+                                {
+                                    p.confirm();
+                                }
+                            }};
+                        }
+
+                        // Download covers on this core while the second core renders,
+                        // reusing connections within each batch
+                        for batch in missing.chunks(COVER_BATCH) {
+                            sync::fetch_covers(
                                 &mut net,
                                 &mut albums,
-                                &renderer,
-                                concert,
+                                &concerts,
+                                batch,
                                 layout_size(orientation),
-                            )
-                            .await
-                            {
-                                Ok(image) => {
-                                    match cache.write_image(&concert.path, orientation, &image) {
-                                        Ok(()) => {
-                                            ready_flags[i] = true;
-                                            rendered.push(i);
+                                async |i, cover| {
+                                    match cover {
+                                        Ok(jpeg) => {
+                                            RENDER_JOBS
+                                                .send(RenderJob {
+                                                    index: i,
+                                                    concert: concerts[i].clone(),
+                                                    jpeg,
+                                                    size: layout_size(orientation),
+                                                })
+                                                .await;
+                                            in_flight += 1;
                                         }
                                         Err(e) => {
-                                            info!("Failed to store {}: {:?}", concert.path, e)
+                                            info!("Skipping {}: {:?}", concerts[i].path, e);
+                                            completed += 1;
                                         }
                                     }
-                                }
-                                Err(e) => info!("Skipping {}: {:?}", concert.path, e),
-                            }
-
-                            // With nothing cached, show the first screen as soon as it renders
-                            if !shown && rendered.len() >= per_screen {
-                                while epd.is_busy() {
-                                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
-                                }
-                                let paths: Vec<&str> = rendered[..per_screen]
-                                    .iter()
-                                    .map(|&i| concerts[i].path.as_str())
-                                    .collect();
-                                if compose_screen(
-                                    cache,
-                                    &mut framebuffer,
-                                    &mut *image_buf,
-                                    &paths,
-                                    orientation,
-                                    $battery,
-                                ) {
-                                    if let Some(p) = progress.as_mut() {
-                                        p.draw(&mut framebuffer, done + 1);
+                                    while let Ok(result) = RENDER_RESULTS.try_receive() {
+                                        finish_render!(result);
                                     }
-                                    if epd
-                                        .display_start(framebuffer.as_slice(), &mut delay)
-                                        .is_ok()
-                                    {
-                                        shown = true;
-                                        start_button_monitor();
-                                        if let Some(p) = progress.as_mut() {
-                                            p.confirm();
-                                        }
-                                    }
-                                }
-                            }
+                                },
+                            )
+                            .await;
+                        }
+                        while in_flight > 0 {
+                            finish_render!(RENDER_RESULTS.receive().await);
                         }
 
                         let mut ready: Box<WidgetData> = Box::new(heapless::Vec::new());
