@@ -79,6 +79,7 @@ SAWTHAT_USER_ID=your-sawthat-user-id
 | `WIFI_PASS` | no | open network | WiFi password (8-64 characters) |
 | `SAWTHAT_USER_ID` | yes | | SawThat user whose concerts are shown |
 | `REFRESH_MINUTES` | no | 15 | Minutes between artwork changes (1-1440) |
+| `ORIENTATION` | no | horizontal | `horizontal` or `vertical`; holding KEY rewrites this line |
 
 Lines are `KEY=VALUE`; blank lines and lines starting with `#` are ignored.
 
@@ -131,7 +132,7 @@ The KEY button controls navigation and orientation:
 | Action | Duration | Effect |
 |--------|----------|--------|
 | Tap | < 500ms | Next item |
-| Hold | >= 500ms | Toggle orientation (horizontal/vertical) |
+| Hold | >= 500ms | Toggle orientation (horizontal/vertical), saved as `ORIENTATION` in `CONFIG.TXT` |
 
 Button input is detected in three places:
 - **On wake**: Immediately after waking from deep sleep
@@ -191,7 +192,6 @@ If SawThat is unreachable, the last successful response stored on the SD card is
   BANDS.JSN           # Last SawThat bands response
   HORIZ.JSN           # Items with horizontal artwork
   VERT.JSN            # Items with vertical artwork
-  ORIENT.DAT          # Orientation (1 byte: 0=horizontal, 1=vertical)
   horiz/
     {hash}.IMG        # Horizontal artwork (400x480)
   vert/

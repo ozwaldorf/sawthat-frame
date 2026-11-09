@@ -9,14 +9,21 @@
 //! | `WIFI_PASS`       | no       | WiFi password; empty or missing for an open network  |
 //! | `SAWTHAT_USER_ID` | yes      | SawThat user whose concerts are shown                |
 //! | `REFRESH_MINUTES` | no       | Minutes between artwork changes (default 15)         |
+//! | `ORIENTATION`     | no       | `horizontal` or `vertical`; holding KEY rewrites it   |
 
 use alloc::string::{String, ToString};
+use core::fmt::Write;
+
+use crate::widget::Orientation;
 
 /// Config filename on the SD card root (8.3 format)
 pub const CONFIG_FILE: &str = "CONFIG.TXT";
 
 /// Template written to the SD root when there is no config
 pub const TEMPLATE: &str = include_str!("../../docs/CONFIG.TXT");
+
+/// Key of the screen orientation, rewritten when KEY is held
+pub const ORIENTATION_KEY: &str = "ORIENTATION";
 
 /// Largest accepted config file
 pub const MAX_CONFIG: usize = 4096;
@@ -34,6 +41,8 @@ pub struct Config {
     pub wifi_pass: String,
     pub user_id: String,
     pub refresh_minutes: u32,
+    /// Screen orientation, if set
+    pub orientation: Option<Orientation>,
 }
 
 impl Config {
@@ -126,6 +135,7 @@ pub fn parse(data: &[u8]) -> Result<Config, ConfigError> {
     let mut pass = None;
     let mut user_id = None;
     let mut refresh = None;
+    let mut orientation = None;
 
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -139,6 +149,7 @@ pub fn parse(data: &[u8]) -> Result<Config, ConfigError> {
             "WIFI_PASS" => &mut pass,
             "SAWTHAT_USER_ID" => &mut user_id,
             "REFRESH_MINUTES" => &mut refresh,
+            ORIENTATION_KEY => &mut orientation,
             _ => return Err(ConfigError::BadLine(n + 1)),
         };
         *slot = Some(value);
@@ -175,10 +186,59 @@ pub fn parse(data: &[u8]) -> Result<Config, ConfigError> {
             .ok_or(ConfigError::Invalid("REFRESH_MINUTES"))?,
     };
 
+    let orientation = match orientation.filter(|v| !v.is_empty()) {
+        None => None,
+        Some(v) => Some(match v.to_ascii_lowercase().as_str() {
+            "horizontal" => Orientation::Horizontal,
+            "vertical" => Orientation::Vertical,
+            _ => return Err(ConfigError::Invalid(ORIENTATION_KEY)),
+        }),
+    };
+
     Ok(Config {
         wifi_ssid,
         wifi_pass,
         user_id,
         refresh_minutes,
+        orientation,
     })
+}
+
+/// Config value for an orientation
+pub fn orientation_value(orientation: Orientation) -> &'static str {
+    match orientation {
+        Orientation::Horizontal => "horizontal",
+        Orientation::Vertical => "vertical",
+    }
+}
+
+/// Set `key` to `value` in config file text, keeping comments, other keys and line endings.
+///
+/// Every uncommented line for `key` is replaced (parsing uses the last one); without one,
+/// the entry is appended.
+pub fn set_value(text: &str, key: &str, value: &str) -> String {
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(text.len() + key.len() + value.len() + 4);
+    let mut found = false;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let trimmed = body.trim_start();
+        let is_key = !trimmed.starts_with('#')
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key));
+        if is_key {
+            let _ = write!(out, "{}={}{}", key, value, &line[body.len()..]);
+            found = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    if !found {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        let _ = write!(out, "{}={}{}", key, value, eol);
+    }
+    out
 }

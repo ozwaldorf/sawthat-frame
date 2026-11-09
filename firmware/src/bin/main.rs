@@ -625,23 +625,27 @@ async fn main(spawner: Spawner) -> ! {
         Some(cache) => load_config(cache),
     };
 
-    // Handle orientation persistence
+    // Orientation: a hold during boot toggled it; otherwise CONFIG.TXT sets it, taking over the
+    // orientation file of older firmware when it has no entry
     if BUTTON_STATE.load(Ordering::Relaxed) == BUTTON_FLIP {
-        // Orientation was changed during boot button hold - save to SD card
-        if let Some(cache) = sd_cache.as_mut()
-            && let Err(e) = cache.store_orientation(orientation)
-        {
-            info!("Failed to store orientation: {:?}", e);
+        if let Some(cache) = sd_cache.as_mut() {
+            save_orientation(cache, orientation);
         }
         // Reset button state after handling so display loop starts fresh
         BUTTON_STATE.store(BUTTON_CANCELLED, Ordering::Relaxed);
     } else if BUTTON_STATE.load(Ordering::Relaxed) == BUTTON_NEXT {
         // Button tap detected during boot - reset state, display loop will show next item
         BUTTON_STATE.store(BUTTON_CANCELLED, Ordering::Relaxed);
-    } else if let Some(cached_orient) = sd_cache.as_mut().and_then(|c| c.load_orientation()) {
-        // Load orientation from SD card (persistent across power cycles)
-        orientation = cached_orient;
-        info!("Using cached orientation: {:?}", orientation);
+    } else if let Ok(config) = &config {
+        if let Some(configured) = config.orientation {
+            orientation = configured;
+        } else if let Some(cache) = sd_cache.as_mut()
+            && let Some(legacy) = cache.load_legacy_orientation()
+        {
+            orientation = legacy;
+            save_orientation(cache, orientation);
+        }
+        info!("Orientation: {:?}", orientation);
     }
 
     // ==================== Power Management (AXP2101) ====================
@@ -1581,10 +1585,8 @@ async fn main(spawner: Spawner) -> ! {
                 BUTTON_FLIP => {
                     info!("Button held during update! Toggling orientation...");
                     orientation = orientation.toggle();
-                    if let Some(cache) = sd_cache.as_mut()
-                        && let Err(e) = cache.store_orientation(orientation)
-                    {
-                        info!("Failed to store orientation: {:?}", e);
+                    if let Some(cache) = sd_cache.as_mut() {
+                        save_orientation(cache, orientation);
                     }
 
                     // Each orientation has its own artwork; sync if none is cached
@@ -1804,6 +1806,29 @@ fn hash_data(items: &WidgetData) -> u32 {
         hash = hash.wrapping_mul(33).wrapping_add(0); // separator
     }
     hash
+}
+
+/// Set the orientation in `CONFIG.TXT`, keeping the rest of the file, and drop the orientation
+/// file of older firmware once it is stored there
+fn save_orientation<S: SpiDevice, D: DelayNs>(cache: &mut SdCache<S, D>, orientation: Orientation) {
+    let mut write = || -> Result<(), CacheError> {
+        let data = cache.read_root_file(config::CONFIG_FILE, config::MAX_CONFIG)?;
+        let text = core::str::from_utf8(&data).map_err(|_| CacheError::Read)?;
+        let value = config::orientation_value(orientation);
+        let text = config::set_value(text, config::ORIENTATION_KEY, value);
+        cache.write_root_file(config::CONFIG_FILE, text.as_bytes())
+    };
+    match write() {
+        Ok(()) => {
+            info!(
+                "Stored orientation {:?} in {}",
+                orientation,
+                config::CONFIG_FILE
+            );
+            cache.remove_legacy_orientation();
+        }
+        Err(e) => info!("Failed to store orientation: {:?}", e),
+    }
 }
 
 /// Read `CONFIG.TXT` from the SD root

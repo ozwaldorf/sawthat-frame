@@ -11,4 +11,7 @@ SAWTHAT_USER_ID=
 # Minutes between artwork changes (1-1440)
 REFRESH_MINUTES=15
 
+# Screen orientation: horizontal or vertical (holding KEY switches it and updates this line)
+ORIENTATION=horizontal
+
 # To use a custom font for the concert text, put FONT.TTF or FONT.OTF in the SD card root

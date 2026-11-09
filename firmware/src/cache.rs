@@ -37,7 +37,7 @@ fn items_file(orientation: Orientation) -> &'static str {
     }
 }
 
-/// Orientation state filename - 8.3 format
+/// Orientation file of older firmware, migrated into CONFIG.TXT - 8.3 format
 const ORIENT_FILE: &str = "ORIENT.DAT";
 
 /// Raw SawThat bands response - 8.3 format
@@ -483,46 +483,32 @@ where
         read_all(&mut file)
     }
 
-    /// Load orientation from cache
-    pub fn load_orientation(&mut self) -> Option<Orientation> {
+    /// Read the orientation file of older firmware, which stored it outside `CONFIG.TXT`
+    pub fn load_legacy_orientation(&mut self) -> Option<Orientation> {
         let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
         let mut root_dir = volume.open_root_dir().ok()?;
         let mut concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
-
         let mut file = concerts_dir
             .open_file_in_dir(ORIENT_FILE, Mode::ReadOnly)
             .ok()?;
-
         let mut buf = [0u8; 1];
         file.read(&mut buf).ok()?;
-
-        let orientation = Orientation::from_u8(buf[0]);
-        info!("Loaded orientation from cache: {:?}", orientation);
-        Some(orientation)
+        Some(Orientation::from_u8(buf[0]))
     }
 
-    /// Store orientation to cache
-    pub fn store_orientation(&mut self, orientation: Orientation) -> Result<(), CacheError> {
-        let mut volume = self
-            .volume_mgr
-            .open_volume(VolumeIdx(0))
-            .map_err(|_| CacheError::Filesystem)?;
-
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
-
-        let mut concerts_dir = root_dir
-            .open_dir(ROOT_DIR)
-            .map_err(|_| CacheError::Filesystem)?;
-
-        let mut file = concerts_dir
-            .open_file_in_dir(ORIENT_FILE, Mode::ReadWriteCreateOrTruncate)
-            .map_err(|_| CacheError::Write)?;
-
-        file.write(&[orientation as u8])
-            .map_err(|_| CacheError::Write)?;
-
-        info!("Stored orientation to cache: {:?}", orientation);
-        Ok(())
+    /// Delete the orientation file of older firmware, if present
+    pub fn remove_legacy_orientation(&mut self) {
+        let Ok(mut volume) = self.volume_mgr.open_volume(VolumeIdx(0)) else {
+            return;
+        };
+        let Ok(mut root_dir) = volume.open_root_dir() else {
+            return;
+        };
+        if let Ok(mut concerts_dir) = root_dir.open_dir(ROOT_DIR)
+            && concerts_dir.delete_file_in_dir(ORIENT_FILE).is_ok()
+        {
+            info!("Removed {}", ORIENT_FILE);
+        }
     }
 
     /// Remove cache entries not in the valid items list
