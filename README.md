@@ -232,3 +232,12 @@ The same pipeline can be run on a host to preview output:
 cd render
 cargo run --release --example render -- cover.jpg "Band" 27-07-2012 "Venue" out
 ```
+
+## Maintenance
+
+- `embassy-net` is pinned to `=0.8.0` in `firmware/Cargo.toml`. `alloc_tcp_state` in
+  `firmware/src/bin/main.rs` allocates the TCP socket buffers in PSRAM as zeroed memory, which
+  relies on an all-zero `TcpClientState` matching `TcpClientState::new()`. Check that against the
+  new version's source before upgrading.
+- The main core needs more than 75KB of stack. Keep large buffers out of internal RAM (`.bss`), or
+  the boot will overflow the stack guard.

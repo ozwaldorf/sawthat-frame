@@ -22,7 +22,9 @@ esp-rtos = { version = "0.2.0", features = [
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3", "log-04"] }
 log                    = "0.4.27"
 
-embassy-net = { version = "0.8.0", features = [
+# Pinned: alloc_tcp_state in main.rs relies on TcpClientState being valid when zeroed.
+# Re-check that against embassy-net source before upgrading.
+embassy-net = { version = "=0.8.0", features = [
   "dhcpv4",
   "dns",
   "log",

@@ -93,7 +93,7 @@ const SAWTHAT_USER_ID: &str = match option_env!("SAWTHAT_USER_ID") {
 
 /// Maximum time to connect to WiFi and obtain an IP
 const WIFI_TIMEOUT: Duration = Duration::from_secs(60);
-/// TCP socket buffer sizes
+/// TCP socket buffer sizes (allocated in PSRAM, see `alloc_tcp_state`)
 const TCP_RX_SIZE: usize = 8192;
 const TCP_TX_SIZE: usize = 1024;
 /// Largest stored image (vertical 480x800 at 4bpp plus header)
@@ -716,10 +716,7 @@ async fn main(spawner: Spawner) -> ! {
                     );
                     spawner.spawn(net_task(runner)).ok();
 
-                    let tcp_state = mk_static!(
-                        TcpClientState<2, TCP_RX_SIZE, TCP_TX_SIZE>,
-                        TcpClientState::new()
-                    );
+                    let tcp_state = alloc_tcp_state();
                     tcp_client = Some(TcpClient::new(stk, tcp_state));
                     dns_socket = Some(DnsSocket::new(stk));
                     net_stack = Some(stk);
@@ -1521,7 +1518,10 @@ async fn wifi_connect(controller: &mut WifiController<'static>) {
     loop {
         match controller.connect_async().await {
             Ok(_) => {
-                info!("WiFi connected!");
+                match controller.rssi() {
+                    Ok(rssi) => info!("WiFi connected (RSSI {} dBm)", rssi),
+                    Err(_) => info!("WiFi connected!"),
+                }
                 stop_blink();
                 break;
             }
@@ -1637,4 +1637,19 @@ fn draw_battery_icon(framebuffer: &mut Framebuffer, orientation: Orientation, pe
         (WIDTH as u16 - bat_w) / 2
     };
     battery::draw_battery(framebuffer.as_mut_slice(), x, 8, percent, vertical);
+}
+
+/// TCP socket buffers for both sync connections, allocated in PSRAM and kept for the
+/// program's lifetime so they don't take internal RAM from the main stack
+fn alloc_tcp_state() -> &'static TcpClientState<2, TCP_RX_SIZE, TCP_TX_SIZE> {
+    let layout = core::alloc::Layout::new::<TcpClientState<2, TCP_RX_SIZE, TCP_TX_SIZE>>();
+    // SAFETY: zeroed memory is identical to `TcpClientState::new()` in embassy-net 0.8 (all
+    // pool slots unused, buffers uninitialized); allocating it directly avoids building the
+    // struct on the stack. The allocation is never freed.
+    unsafe {
+        let ptr =
+            alloc::alloc::alloc_zeroed(layout) as *mut TcpClientState<2, TCP_RX_SIZE, TCP_TX_SIZE>;
+        assert!(!ptr.is_null(), "TCP buffer allocation failed");
+        &*ptr
+    }
 }
