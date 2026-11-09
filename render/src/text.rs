@@ -70,7 +70,7 @@ pub fn draw_text(canvas: &mut Canvas, text: &str, size: f32, x: f32, y: f32, col
 /// Draw `text` horizontally centered with its top at `y`
 pub fn draw_text_centered(canvas: &mut Canvas, text: &str, size: f32, y: f32, color: u8) {
     let x = ((canvas.width as f32 - text_width(text, size)) / 2.0).max(0.0);
-    // Snap to whole pixels like the server's integer positioning
+    // Snap to whole pixels for consistent glyph placement
     draw_text(canvas, text, size, (x as u32) as f32, y, color);
 }
 

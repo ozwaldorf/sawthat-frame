@@ -15,8 +15,8 @@ pub struct PrimaryColor {
 
 /// Extract the dominant color from the bottom 10% of the adjusted image.
 ///
-/// Matches the server: adjust, downscale to 100x100, take the 3 most common colors
-/// in the last 10 rows, and average them in OKLab weighted by count.
+/// Adjusts, downscales to 100x100, then takes the 3 most common colors
+/// in the last 10 rows and averages them in OKLab, weighted by count.
 pub fn primary_color(src: &RgbImage, adjuster: &Adjuster) -> PrimaryColor {
     let rows = resize_window(src, 100, 100, 0, 90, 100, 10, |p| adjuster.apply(p));
 
