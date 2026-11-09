@@ -26,10 +26,14 @@ pub fn battery_dimensions(vertical: bool) -> (u16, u16) {
     }
 }
 
-/// Get fill color based on battery percentage
-pub fn percentage_color(percentage: u8) -> Color {
+/// Fill color at (x, y) for a battery percentage.
+///
+/// Mid levels use a red/yellow checkerboard, which reads as orange and contrasts better
+/// against the white interior than solid yellow.
+pub fn fill_color(percentage: u8, x: u16, y: u16) -> Color {
     match percentage {
         0..=15 => Color::Red,
+        16..=40 if (x + y).is_multiple_of(2) => Color::Red,
         16..=40 => Color::Yellow,
         _ => Color::Green,
     }
@@ -43,7 +47,6 @@ pub fn percentage_color(percentage: u8) -> Color {
 /// - `vertical`: If true, draw vertical battery (tip on top), else horizontal (tip on right)
 pub fn draw_battery(framebuffer: &mut [u8], fb_x: u16, fb_y: u16, percentage: u8, vertical: bool) {
     let (buf_width, buf_height) = battery_dimensions(vertical);
-    let fill_color = percentage_color(percentage);
 
     // Helper to set a pixel in the framebuffer
     let set_pixel = |fb: &mut [u8], x: u16, y: u16, color: Color| {
@@ -64,23 +67,9 @@ pub fn draw_battery(framebuffer: &mut [u8], fb_x: u16, fb_y: u16, percentage: u8
     };
 
     if vertical {
-        draw_battery_vertical(
-            framebuffer,
-            &set_pixel,
-            buf_width,
-            buf_height,
-            fill_color,
-            percentage,
-        );
+        draw_battery_vertical(framebuffer, &set_pixel, buf_width, buf_height, percentage);
     } else {
-        draw_battery_horizontal(
-            framebuffer,
-            &set_pixel,
-            buf_width,
-            buf_height,
-            fill_color,
-            percentage,
-        );
+        draw_battery_horizontal(framebuffer, &set_pixel, buf_width, buf_height, percentage);
     }
 }
 
@@ -89,7 +78,6 @@ fn draw_battery_vertical<F>(
     set_pixel: &F,
     _buf_width: u16,
     _buf_height: u16,
-    fill_color: Color,
     percentage: u8,
 ) where
     F: Fn(&mut [u8], u16, u16, Color),
@@ -150,7 +138,7 @@ fn draw_battery_vertical<F>(
 
     for x in fill_x_start..(fill_x_start + fill_width) {
         for y in fill_y_start..fill_y_end {
-            set_pixel(fb, x, y, fill_color);
+            set_pixel(fb, x, y, fill_color(percentage, x, y));
         }
     }
 }
@@ -160,7 +148,6 @@ fn draw_battery_horizontal<F>(
     set_pixel: &F,
     _buf_width: u16,
     _buf_height: u16,
-    fill_color: Color,
     percentage: u8,
 ) where
     F: Fn(&mut [u8], u16, u16, Color),
@@ -219,7 +206,7 @@ fn draw_battery_horizontal<F>(
 
     for x in fill_x_start..(fill_x_start + fill_width) {
         for y in fill_y_start..(fill_y_start + fill_height) {
-            set_pixel(fb, x, y, fill_color);
+            set_pixel(fb, x, y, fill_color(percentage, x, y));
         }
     }
 }
@@ -258,8 +245,6 @@ pub fn draw_battery_icon(
             }
         }
     }
-
-    let fill_color = percentage_color(percentage);
 
     // Helper to set a pixel in the buffer
     let set_pixel = |buf: &mut [u8], x: u16, y: u16, color: Color| {
@@ -332,7 +317,7 @@ pub fn draw_battery_icon(
 
         for x in fill_x_start..(fill_x_start + fill_width) {
             for y in fill_y_start..fill_y_end {
-                set_pixel(&mut buffer, x, y, fill_color);
+                set_pixel(&mut buffer, x, y, fill_color(percentage, x, y));
             }
         }
     } else {
@@ -390,7 +375,7 @@ pub fn draw_battery_icon(
 
         for x in fill_x_start..(fill_x_start + fill_width) {
             for y in fill_y_start..(fill_y_start + fill_height) {
-                set_pixel(&mut buffer, x, y, fill_color);
+                set_pixel(&mut buffer, x, y, fill_color(percentage, x, y));
             }
         }
     }
@@ -404,13 +389,14 @@ mod tests {
     use crate::epd::BUFFER_SIZE;
 
     #[test]
-    fn test_percentage_color() {
-        assert_eq!(percentage_color(0), Color::Red);
-        assert_eq!(percentage_color(15), Color::Red);
-        assert_eq!(percentage_color(16), Color::Yellow);
-        assert_eq!(percentage_color(40), Color::Yellow);
-        assert_eq!(percentage_color(41), Color::Green);
-        assert_eq!(percentage_color(100), Color::Green);
+    fn test_fill_color() {
+        assert_eq!(fill_color(0, 0, 0), Color::Red);
+        assert_eq!(fill_color(15, 1, 0), Color::Red);
+        assert_eq!(fill_color(16, 0, 0), Color::Red);
+        assert_eq!(fill_color(16, 1, 0), Color::Yellow);
+        assert_eq!(fill_color(40, 1, 1), Color::Red);
+        assert_eq!(fill_color(41, 0, 0), Color::Green);
+        assert_eq!(fill_color(100, 1, 0), Color::Green);
     }
 
     #[test]
