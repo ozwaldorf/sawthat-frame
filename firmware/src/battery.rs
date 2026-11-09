@@ -3,7 +3,11 @@
 //! Draws a battery icon with fill level and color based on percentage.
 //! Copies background from framebuffer for transparency.
 
+use sawthat_render::OklabPalette;
+use sawthat_render::dither::floyd_steinberg;
+
 use crate::epd::{Color, WIDTH};
+use crate::framebuffer::remap_color;
 
 /// Battery icon dimensions (horizontal mode)
 pub const BATTERY_WIDTH_H: u16 = 48;
@@ -26,16 +30,56 @@ pub fn battery_dimensions(vertical: bool) -> (u16, u16) {
     }
 }
 
-/// Fill color at (x, y) for a battery percentage.
+/// Mid-level fill colors (sRGB), dithered to the panel palette like the artwork: a darker
+/// orange for the lower half of the range
+const ORANGE_LOW: [u8; 3] = [170, 60, 0];
+const ORANGE_HIGH: [u8; 3] = [190, 70, 0];
+
+/// Orange fill color for a mid-level battery percentage
+fn orange(percentage: u8) -> [u8; 3] {
+    if percentage < 33 {
+        ORANGE_LOW
+    } else {
+        ORANGE_HIGH
+    }
+}
+
+/// Draw the fill rectangle at (x0, y0) for a battery percentage.
 ///
-/// Mid levels use a red/yellow checkerboard, which reads as orange and contrasts better
-/// against the white interior than solid yellow.
-pub fn fill_color(percentage: u8, x: u16, y: u16) -> Color {
-    match percentage {
+/// Low and high levels are solid red and green; mid levels Floyd-Steinberg dither
+/// `orange`, normally [`orange`] for the percentage.
+fn draw_fill(
+    percentage: u8,
+    orange: [u8; 3],
+    (x0, y0, w, h): (u16, u16, u16, u16),
+    mut set: impl FnMut(u16, u16, Color),
+) {
+    let solid = match percentage {
         0..=15 => Color::Red,
-        16..=49 if (x + y).is_multiple_of(2) => Color::Red,
-        16..=49 => Color::Yellow,
-        _ => Color::Green,
+        50.. => Color::Green,
+        _ => {
+            let palette = OklabPalette::new();
+            let color = palette.to_oklab(orange[0], orange[1], orange[2]);
+            floyd_steinberg(
+                w.into(),
+                h.into(),
+                &palette,
+                |_, _| color,
+                |x, y, idx| {
+                    set(
+                        x0 + x as u16,
+                        y0 + y as u16,
+                        Color::from_4bit(remap_color(idx)),
+                    )
+                },
+            );
+            return;
+        }
+    };
+    for y in y0..y0 + h {
+        for x in x0..x0 + w {
+            set(x, y, solid);
+        }
     }
 }
 
@@ -46,6 +90,7 @@ pub fn fill_color(percentage: u8, x: u16, y: u16) -> Color {
 /// - `percentage`: Battery level 0-100
 /// - `vertical`: If true, draw vertical battery (tip on top), else horizontal (tip on right)
 pub fn draw_battery(framebuffer: &mut [u8], fb_x: u16, fb_y: u16, percentage: u8, vertical: bool) {
+    let orange = orange(percentage);
     let (buf_width, buf_height) = battery_dimensions(vertical);
 
     // Helper to set a pixel in the framebuffer
@@ -67,9 +112,23 @@ pub fn draw_battery(framebuffer: &mut [u8], fb_x: u16, fb_y: u16, percentage: u8
     };
 
     if vertical {
-        draw_battery_vertical(framebuffer, &set_pixel, buf_width, buf_height, percentage);
+        draw_battery_vertical(
+            framebuffer,
+            &set_pixel,
+            buf_width,
+            buf_height,
+            percentage,
+            orange,
+        );
     } else {
-        draw_battery_horizontal(framebuffer, &set_pixel, buf_width, buf_height, percentage);
+        draw_battery_horizontal(
+            framebuffer,
+            &set_pixel,
+            buf_width,
+            buf_height,
+            percentage,
+            orange,
+        );
     }
 }
 
@@ -79,6 +138,7 @@ fn draw_battery_vertical<F>(
     _buf_width: u16,
     _buf_height: u16,
     percentage: u8,
+    orange: [u8; 3],
 ) where
     F: Fn(&mut [u8], u16, u16, Color),
 {
@@ -136,11 +196,12 @@ fn draw_battery_vertical<F>(
     let fill_height = ((fill_max_height as u32 * percentage.min(100) as u32) / 100) as u16;
     let fill_y_start = fill_y_end - fill_height;
 
-    for x in fill_x_start..(fill_x_start + fill_width) {
-        for y in fill_y_start..fill_y_end {
-            set_pixel(fb, x, y, fill_color(percentage, x, y));
-        }
-    }
+    draw_fill(
+        percentage,
+        orange,
+        (fill_x_start, fill_y_start, fill_width, fill_height),
+        |x, y, c| set_pixel(fb, x, y, c),
+    );
 }
 
 fn draw_battery_horizontal<F>(
@@ -149,6 +210,7 @@ fn draw_battery_horizontal<F>(
     _buf_width: u16,
     _buf_height: u16,
     percentage: u8,
+    orange: [u8; 3],
 ) where
     F: Fn(&mut [u8], u16, u16, Color),
 {
@@ -204,11 +266,12 @@ fn draw_battery_horizontal<F>(
     let fill_height: u16 = body_height - 8;
     let fill_width = ((fill_max_width as u32 * percentage.min(100) as u32) / 100) as u16;
 
-    for x in fill_x_start..(fill_x_start + fill_width) {
-        for y in fill_y_start..(fill_y_start + fill_height) {
-            set_pixel(fb, x, y, fill_color(percentage, x, y));
-        }
-    }
+    draw_fill(
+        percentage,
+        orange,
+        (fill_x_start, fill_y_start, fill_width, fill_height),
+        |x, y, c| set_pixel(fb, x, y, c),
+    );
 }
 
 /// Draw battery icon into a buffer, copying background from framebuffer
@@ -315,11 +378,12 @@ pub fn draw_battery_icon(
         let fill_height = ((fill_max_height as u32 * percentage.min(100) as u32) / 100) as u16;
         let fill_y_start = fill_y_end - fill_height;
 
-        for x in fill_x_start..(fill_x_start + fill_width) {
-            for y in fill_y_start..fill_y_end {
-                set_pixel(&mut buffer, x, y, fill_color(percentage, x, y));
-            }
-        }
+        draw_fill(
+            percentage,
+            orange(percentage),
+            (fill_x_start, fill_y_start, fill_width, fill_height),
+            |x, y, c| set_pixel(&mut buffer, x, y, c),
+        );
     } else {
         // Horizontal battery: tip on right, fill goes left to right
         let body_width: u16 = 42;
@@ -373,11 +437,12 @@ pub fn draw_battery_icon(
         let fill_height: u16 = body_height - 8;
         let fill_width = ((fill_max_width as u32 * percentage.min(100) as u32) / 100) as u16;
 
-        for x in fill_x_start..(fill_x_start + fill_width) {
-            for y in fill_y_start..(fill_y_start + fill_height) {
-                set_pixel(&mut buffer, x, y, fill_color(percentage, x, y));
-            }
-        }
+        draw_fill(
+            percentage,
+            orange(percentage),
+            (fill_x_start, fill_y_start, fill_width, fill_height),
+            |x, y, c| set_pixel(&mut buffer, x, y, c),
+        );
     }
 
     buffer
@@ -388,15 +453,23 @@ mod tests {
     use super::*;
     use crate::epd::BUFFER_SIZE;
 
+    fn fill(percentage: u8) -> [usize; 8] {
+        let mut counts = [0; 8];
+        draw_fill(percentage, orange(percentage), (0, 0, 30, 30), |_, _, c| {
+            counts[c as usize] += 1
+        });
+        counts
+    }
+
     #[test]
     fn test_fill_color() {
-        assert_eq!(fill_color(0, 0, 0), Color::Red);
-        assert_eq!(fill_color(15, 1, 0), Color::Red);
-        assert_eq!(fill_color(16, 0, 0), Color::Red);
-        assert_eq!(fill_color(16, 1, 0), Color::Yellow);
-        assert_eq!(fill_color(49, 1, 1), Color::Red);
-        assert_eq!(fill_color(50, 0, 0), Color::Green);
-        assert_eq!(fill_color(100, 1, 0), Color::Green);
+        assert_eq!(fill(15)[Color::Red as usize], 900);
+        assert_eq!(fill(50)[Color::Green as usize], 900);
+
+        // Orange is mostly red with some yellow
+        let orange = fill(30);
+        assert!(orange[Color::Red as usize] > orange[Color::Yellow as usize]);
+        assert!(orange[Color::Yellow as usize] > 100);
     }
 
     #[test]

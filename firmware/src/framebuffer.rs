@@ -17,7 +17,7 @@ const COLOR_REMAP: [u8; 6] = [0x00, 0x01, 0x03, 0x02, 0x05, 0x06];
 
 /// Remap a PNG palette index to EPD color value
 #[inline]
-fn remap_color(palette_idx: u8) -> u8 {
+pub fn remap_color(palette_idx: u8) -> u8 {
     if palette_idx < 6 {
         COLOR_REMAP[palette_idx as usize]
     } else {

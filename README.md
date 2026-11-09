@@ -101,7 +101,8 @@ unreliable until it has seen a full charge cycle):
 | Level | Fill |
 |-------|------|
 | 0-15% | Red |
-| 16-49% | Orange (red/yellow checkerboard) |
+| 16-32% | Dark orange, dithered like the artwork |
+| 33-49% | Orange, dithered like the artwork |
 | 50-100% | Green |
 
 ## Sync

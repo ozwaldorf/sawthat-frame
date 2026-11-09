@@ -43,26 +43,47 @@ pub fn compose_and_dither(
     canvas: &mut Canvas,
     palette: &OklabPalette,
 ) {
-    let width = img.width as usize;
-    let mut cur = vec![Oklab::default(); width];
-    let mut next = vec![Oklab::default(); width];
-
     // Neighbouring pixels often share a color (the solid text area especially)
     let mut last_rgb = None;
     let mut last_oklab = Oklab::default();
-
-    for y in 0..canvas.height {
-        for x in 0..width {
-            let rgb = canvas_pixel(img, bg, x as u32, y);
+    floyd_steinberg(
+        img.width,
+        canvas.height,
+        palette,
+        |x, y| {
+            let rgb = canvas_pixel(img, bg, x, y);
             if last_rgb != Some(rgb) {
                 last_oklab = palette.to_oklab(rgb[0], rgb[1], rgb[2]);
                 last_rgb = Some(rgb);
             }
-            let (base, e) = (last_oklab, cur[x]);
+            last_oklab
+        },
+        |x, y, idx| canvas.set(x, y, idx),
+    );
+}
+
+/// Floyd-Steinberg dither a `width` x `height` area to the palette in OKLab space.
+///
+/// `pixel` gives the source color at (x, y) and `out` receives the palette index; both are
+/// called in row-major order.
+pub fn floyd_steinberg(
+    width: u32,
+    height: u32,
+    palette: &OklabPalette,
+    mut pixel: impl FnMut(u32, u32) -> Oklab,
+    mut out: impl FnMut(u32, u32, u8),
+) {
+    let width = width as usize;
+    let mut cur = vec![Oklab::default(); width];
+    let mut next = vec![Oklab::default(); width];
+
+    for y in 0..height {
+        for x in 0..width {
+            let (base, e) = (pixel(x as u32, y), cur[x]);
             let px = Oklab::new(base.l + e.l, base.a + e.a, base.b + e.b);
 
             let idx = palette.nearest(&px);
-            canvas.set(x as u32, y, idx);
+            out(x as u32, y, idx);
 
             let t = palette.get(idx);
             let err = Oklab::new(px.l - t.l, px.a - t.a, px.b - t.b);
