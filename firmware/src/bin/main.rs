@@ -988,7 +988,7 @@ async fn main(spawner: Spawner) -> ! {
                     let concerts = match sync::fetch_bands(&mut net, &config.user_id)
                         .await
                         .ok()
-                        .and_then(|json| Some((sync::parse_concerts(&json)?, json)))
+                        .and_then(|json| Some((sync::parse_concerts(&json, &config.user_id)?, json)))
                     {
                         Some((concerts, json)) => {
                             if let Err(e) = cache.store_bands(&json) {
@@ -1000,7 +1000,7 @@ async fn main(spawner: Spawner) -> ! {
                             info!("Concert fetch failed, using stored band data");
                             cache
                                 .load_bands()
-                                .and_then(|json| sync::parse_concerts(&json))
+                                .and_then(|json| sync::parse_concerts(&json, &config.user_id))
                         }
                     };
 
@@ -1243,6 +1243,18 @@ async fn main(spawner: Spawner) -> ! {
                         }
                         if let Err(e) = cache.store_widget_data(orientation, &ready) {
                             info!("Failed to store item list: {:?}", e);
+                        }
+                        // The cleanup may have removed artwork the other orientation's list
+                        // still names (a concert or the user changed); keep only current items
+                        let other = orientation.toggle();
+                        if let Some(mut list) = cache.load_widget_data(other) {
+                            let len = list.len();
+                            list.retain(|item| valid.contains(item));
+                            if list.len() != len
+                                && let Err(e) = cache.store_widget_data(other, &list)
+                            {
+                                info!("Failed to prune {:?} item list: {:?}", other, e);
+                            }
                         }
 
                         // Show the full bar, hold it briefly, then erase the dialog. Skipped

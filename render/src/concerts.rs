@@ -19,6 +19,9 @@ struct Band {
     picture: Option<String>,
     concerts: Vec<BandConcert>,
     id: String,
+    /// SawThat user the band belongs to
+    #[serde(default)]
+    user_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -48,12 +51,16 @@ impl Concert {
     }
 }
 
-/// Parse the SawThat bands response into concerts, most recent first
-pub fn parse_concerts(json: &[u8]) -> Result<Vec<Concert>, serde_json::Error> {
+/// Parse the SawThat bands response into concerts of `user_id`, most recent first.
+///
+/// Bands of another user are skipped, so a stored response for a previous user yields
+/// nothing; bands without a user ID are kept.
+pub fn parse_concerts(json: &[u8], user_id: &str) -> Result<Vec<Concert>, serde_json::Error> {
     let bands: Vec<Band> = serde_json::from_slice(json)?;
 
     let mut concerts: Vec<(String, Concert)> = bands
         .into_iter()
+        .filter(|band| band.user_id.as_deref().is_none_or(|id| id == user_id))
         .flat_map(|band| {
             let picture = band.picture.unwrap_or_default();
             band.concerts
@@ -251,11 +258,23 @@ mod tests {
             {"band":"A","picture":"p","concerts":[{"date":"15-06-2024","location":"V"}],"id":"a-id","genre":[]},
             {"band":"B","picture":"","concerts":[{"date":"01-01-2025","location":"W"}],"id":"b-id"}
         ]"#;
-        let c = parse_concerts(json).unwrap();
+        let c = parse_concerts(json, "u").unwrap();
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].path, "2025-01-01-b-id");
         assert_eq!(c[1].path, "2024-06-15-a-id");
         assert_eq!(c[1].formatted_date(), "June 15th, 2024");
+    }
+
+    #[test]
+    fn concerts_of_other_users_skipped() {
+        let json = br#"[
+            {"band":"A","concerts":[{"date":"15-06-2024","location":"V"}],"id":"a-id","user_id":"me"},
+            {"band":"B","concerts":[{"date":"01-01-2025","location":"W"}],"id":"b-id","user_id":"other"}
+        ]"#;
+        let c = parse_concerts(json, "me").unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].path, "2024-06-15-a-id");
+        assert!(parse_concerts(json, "nobody").unwrap().is_empty());
     }
 
     #[test]

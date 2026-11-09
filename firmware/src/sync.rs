@@ -125,9 +125,9 @@ pub async fn fetch_bands<T: TcpConnect, D: Dns>(
     net.get(&url, MAX_JSON).await
 }
 
-/// Parse a SawThat bands response into concerts, most recent first
-pub fn parse_concerts(json: &[u8]) -> Option<Vec<Concert>> {
-    let concerts = concerts::parse_concerts(json).ok()?;
+/// Parse a SawThat bands response into concerts of `user_id`, most recent first
+pub fn parse_concerts(json: &[u8], user_id: &str) -> Option<Vec<Concert>> {
+    let concerts = concerts::parse_concerts(json, user_id).ok()?;
     info!("Parsed {} concerts ({} bytes)", concerts.len(), json.len());
     Some(concerts)
 }
