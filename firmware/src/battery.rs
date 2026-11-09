@@ -33,8 +33,8 @@ pub fn battery_dimensions(vertical: bool) -> (u16, u16) {
 pub fn fill_color(percentage: u8, x: u16, y: u16) -> Color {
     match percentage {
         0..=15 => Color::Red,
-        16..=40 if (x + y).is_multiple_of(2) => Color::Red,
-        16..=40 => Color::Yellow,
+        16..=49 if (x + y).is_multiple_of(2) => Color::Red,
+        16..=49 => Color::Yellow,
         _ => Color::Green,
     }
 }
@@ -394,8 +394,8 @@ mod tests {
         assert_eq!(fill_color(15, 1, 0), Color::Red);
         assert_eq!(fill_color(16, 0, 0), Color::Red);
         assert_eq!(fill_color(16, 1, 0), Color::Yellow);
-        assert_eq!(fill_color(40, 1, 1), Color::Red);
-        assert_eq!(fill_color(41, 0, 0), Color::Green);
+        assert_eq!(fill_color(49, 1, 1), Color::Red);
+        assert_eq!(fill_color(50, 0, 0), Color::Green);
         assert_eq!(fill_color(100, 1, 0), Color::Green);
     }
 
