@@ -85,9 +85,11 @@ The KEY button controls navigation and orientation:
 | Tap | < 500ms | Next item |
 | Hold | >= 500ms | Toggle orientation (horizontal/vertical) |
 
-Button input is detected in two places:
+Button input is detected in three places:
 - **On wake**: Immediately after waking from deep sleep
 - **During refresh**: While the e-paper display is refreshing
+- **During sync**: A tap shows the next screen behind the progress dialog (waiting for its
+  artwork to render if needed); a hold stops the sync and rotates
 
 LED feedback:
 - **Green LED**: 1 flash = next item, 3 flashes = orientation changed
@@ -117,10 +119,14 @@ A sync runs:
 
 All other wakes read artwork from the SD card without using WiFi.
 
-While syncing, the frame shows artwork immediately: the next cached screen, or, with an empty
-SD card, the first screen as soon as it has been rendered. A "Syncing N concerts..." dialog
-with a progress bar is drawn in the corner; only the newly filled slice of the bar is
+While syncing, the frame shows the next cached screen immediately, with a "Syncing N
+concerts..." dialog and progress bar in the corner. Only the newly filled slice of the bar is
 refreshed as concerts render, and the dialog is erased with a small refresh when done.
+
+When there is no artwork for the current orientation (first boot, or the first switch to an
+orientation), a centered welcome dialog with the progress bar and usage instructions is shown
+instead. Once the first screen has been rendered it is shown behind the dialog, and the dialog
+is erased when the sync finishes.
 
 If SawThat is unreachable, the last successful response stored on the SD card is used.
 

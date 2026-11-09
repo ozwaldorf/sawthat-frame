@@ -1,4 +1,5 @@
-//! Sync progress dialog drawn in the top-left screen corner.
+//! Sync progress dialogs: a small box in the top-left screen corner, or a larger centered
+//! welcome box with usage instructions for a first sync.
 //!
 //! The dialog ("Syncing N concerts..." and a progress bar) is drawn once, either as part of a
 //! full refresh or as its own partial refresh. Later updates only refresh the newly filled
@@ -18,16 +19,28 @@ use crate::epd::{HEIGHT, Rect, WIDTH};
 use crate::framebuffer::Framebuffer;
 use crate::widget::Orientation;
 
-/// Box height, inner padding, and distance from the screen corner, in screen coordinates
-const BOX_H: u32 = 48;
+/// Inner padding and corner box distance from the screen corner, in screen coordinates
 const PADDING: u32 = 8;
 const MARGIN: u32 = 16;
 const TEXT_SIZE: f32 = 20.0;
 
-/// Progress bar position within the box (including its 1px border)
-const BAR_X: u32 = PADDING;
-const BAR_Y: u32 = 32;
+/// Progress bar height (including its 1px border) and gap below the label
 const BAR_H: u32 = 8;
+const BAR_GAP: u32 = 4;
+
+/// Welcome box: title size, instruction size, and line spacing
+const TITLE_SIZE: f32 = 28.0;
+const NOTE_SIZE: f32 = 18.0;
+const LINE_GAP: u32 = 6;
+const SECTION_GAP: u32 = 18;
+
+/// Usage instructions on the welcome box
+const INSTRUCTIONS: [&str; 4] = [
+    "Tap KEY for the next concert",
+    "Hold KEY to rotate the screen",
+    "Artwork changes every 15 minutes and",
+    "resyncs after every concert is shown",
+];
 
 /// Panel partial window alignment in framebuffer x
 const ALIGN: u32 = 8;
@@ -36,7 +49,7 @@ const ALIGN: u32 = 8;
 const ICON_W: u32 = 24;
 const ICON_H: u32 = 16;
 const ICON_GAP: u32 = 6;
-/// Icon top, roughly centered on the label's cap height
+/// Icon top for a label at the top padding, roughly centered on its cap height
 const ICON_Y: u32 = 6;
 
 /// Signal bars (0-3) for a WiFi RSSI in dBm
@@ -78,19 +91,26 @@ fn draw_wifi_icon(canvas: &mut Canvas, x: u32, y: u32, bars: u32) {
     }
 }
 
-/// Map a box coordinate to framebuffer coordinates.
+/// Screen size (width, height) for an orientation
+fn screen_size(orientation: Orientation) -> (u32, u32) {
+    match orientation {
+        Orientation::Horizontal => (WIDTH, HEIGHT),
+        Orientation::Vertical => (HEIGHT, WIDTH),
+    }
+}
+
+/// Map a screen coordinate to framebuffer coordinates.
 ///
 /// Horizontal screens are rotated 180 degrees in the framebuffer; vertical screens
 /// (480x800) are rotated 90 degrees.
 fn to_framebuffer(orientation: Orientation, x: u32, y: u32) -> (u32, u32) {
-    let (x, y) = (MARGIN + x, MARGIN + y);
     match orientation {
         Orientation::Horizontal => (WIDTH - 1 - x, HEIGHT - 1 - y),
         Orientation::Vertical => (y, HEIGHT - 1 - x),
     }
 }
 
-/// Framebuffer rect covering a box-coordinate rectangle, aligned for the panel
+/// Framebuffer rect covering a screen-coordinate rectangle, aligned for the panel
 fn framebuffer_rect(orientation: Orientation, x: u32, y: u32, w: u32, h: u32) -> Rect {
     let (ax, ay) = to_framebuffer(orientation, x, y);
     let (bx, by) = to_framebuffer(orientation, x + w - 1, y + h - 1);
@@ -105,15 +125,30 @@ fn framebuffer_rect(orientation: Orientation, x: u32, y: u32, w: u32, h: u32) ->
     )
 }
 
+/// A line of text in the dialog: text, size, and top in box coordinates
+struct Line {
+    text: String,
+    size: f32,
+    y: u32,
+}
+
 /// Progress dialog state
 pub struct Progress {
     orientation: Orientation,
     total: usize,
-    label: String,
+    /// Text lines; the first is the "Syncing" label, drawn after the WiFi icon
+    lines: Vec<Line>,
+    /// Index of the "Syncing" label in `lines`
+    label: usize,
     /// WiFi signal bars shown before the label, if the RSSI is known
     wifi_bars: Option<u32>,
-    /// Box width, sized to the icon and label
+    /// Box top-left corner in screen coordinates
+    origin: (u32, u32),
+    /// Box size, sized to its content
     box_w: u32,
+    box_h: u32,
+    /// Progress bar top in box coordinates
+    bar_y: u32,
     /// Framebuffer contents under the box, saved when it is drawn
     saved: Option<(Rect, Vec<u8>)>,
     /// Fill width (px) currently on the panel, `None` until the box is shown
@@ -122,28 +157,113 @@ pub struct Progress {
     drawn: u32,
 }
 
+/// Line height for a text size
+fn line_h(size: f32) -> u32 {
+    size as u32 + LINE_GAP
+}
+
 impl Progress {
-    /// `rssi` is the WiFi signal strength in dBm, shown as an icon before the label
+    /// Small box in the top-left corner.
+    ///
+    /// `rssi` is the WiFi signal strength in dBm, shown as an icon before the label.
     pub fn new(orientation: Orientation, total: usize, rssi: Option<i32>) -> Self {
-        let label = format!(
-            "Syncing {} concert{}...",
-            total,
-            if total == 1 { "" } else { "s" }
-        );
+        Self::build(orientation, total, rssi, false)
+    }
+
+    /// Larger centered box with a welcome title and usage instructions
+    pub fn welcome(orientation: Orientation, total: usize, rssi: Option<i32>) -> Self {
+        Self::build(orientation, total, rssi, true)
+    }
+
+    fn build(orientation: Orientation, total: usize, rssi: Option<i32>, welcome: bool) -> Self {
+        let font = font();
         let wifi_bars = rssi.map(signal_bars);
-        let content_w = text_width(&font(), &label, TEXT_SIZE) as u32
-            + wifi_bars.map_or(0, |_| ICON_W + ICON_GAP);
+        let mut lines = Vec::new();
+        let mut y = PADDING;
+
+        if welcome {
+            lines.push(Line {
+                text: String::from("Welcome to SawThat Frame"),
+                size: TITLE_SIZE,
+                y,
+            });
+            y += line_h(TITLE_SIZE) + SECTION_GAP / 2;
+        }
+
+        let label = lines.len();
+        lines.push(Line {
+            text: format!(
+                "Syncing {} concert{}...",
+                total,
+                if total == 1 { "" } else { "s" }
+            ),
+            size: TEXT_SIZE,
+            y,
+        });
+        y += line_h(TEXT_SIZE) + BAR_GAP - LINE_GAP;
+        let bar_y = y;
+        y += BAR_H + PADDING;
+
+        if welcome {
+            y += SECTION_GAP - PADDING;
+            for text in INSTRUCTIONS {
+                lines.push(Line {
+                    text: String::from(text),
+                    size: NOTE_SIZE,
+                    y,
+                });
+                y += line_h(NOTE_SIZE);
+            }
+            y += PADDING - LINE_GAP;
+        }
+
+        let content_w = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let icon = if i == label {
+                    wifi_bars.map_or(0, |_| ICON_W + ICON_GAP)
+                } else {
+                    0
+                };
+                text_width(&font, &line.text, line.size) as u32 + icon
+            })
+            .max()
+            .unwrap_or(0);
         let box_w = (content_w + 2 * PADDING).div_ceil(ALIGN) * ALIGN;
+        let box_h = y;
+
+        let origin = if welcome {
+            let (sw, sh) = screen_size(orientation);
+            (sw.saturating_sub(box_w) / 2, sh.saturating_sub(box_h) / 2)
+        } else {
+            (MARGIN, MARGIN)
+        };
+
         Self {
             orientation,
             total,
+            lines,
             label,
             wifi_bars,
+            origin,
             box_w,
+            box_h,
+            bar_y,
             saved: None,
             shown: None,
             drawn: 0,
         }
+    }
+
+    /// Framebuffer coordinates of a box coordinate
+    fn to_fb(&self, x: u32, y: u32) -> (u32, u32) {
+        to_framebuffer(self.orientation, self.origin.0 + x, self.origin.1 + y)
+    }
+
+    /// Framebuffer rect of a box-coordinate rectangle
+    fn rect(&self, x: u32, y: u32, w: u32, h: u32) -> Rect {
+        framebuffer_rect(self.orientation, self.origin.0 + x, self.origin.1 + y, w, h)
     }
 
     fn bar_w(&self) -> u32 {
@@ -159,7 +279,7 @@ impl Progress {
     /// Returns the region for a partial refresh; a following full refresh also shows it.
     /// Call [`Self::confirm`] once the refresh has started.
     pub fn draw(&mut self, framebuffer: &mut Framebuffer, done: usize) -> (Rect, Vec<u8>) {
-        let rect = framebuffer_rect(self.orientation, 0, 0, self.box_w, BOX_H);
+        let rect = self.rect(0, 0, self.box_w, self.box_h);
         self.saved = Some((rect, framebuffer.extract_rect(&rect)));
         self.drawn = self.fill(done);
         self.draw_box(framebuffer);
@@ -179,15 +299,15 @@ impl Progress {
             return None;
         }
 
-        let (x, y) = (BAR_X + 1 + shown, BAR_Y + 1);
+        let (x, y) = (PADDING + 1 + shown, self.bar_y + 1);
         for by in y..y + BAR_H - 2 {
-            for bx in x..BAR_X + 1 + fill {
-                let (fx, fy) = to_framebuffer(self.orientation, bx, by);
+            for bx in x..PADDING + 1 + fill {
+                let (fx, fy) = self.to_fb(bx, by);
                 framebuffer.set_pixel_indexed(fx, fy, GREEN);
             }
         }
         self.drawn = fill;
-        let rect = framebuffer_rect(self.orientation, x, y, fill - shown, BAR_H - 2);
+        let rect = self.rect(x, y, fill - shown, BAR_H - 2);
         Some((rect, framebuffer.extract_rect(&rect)))
     }
 
@@ -211,35 +331,38 @@ impl Progress {
     }
 
     fn draw_box(&self, framebuffer: &mut Framebuffer) {
-        let (box_w, bar_w, fill) = (self.box_w, self.bar_w(), self.drawn);
+        let (box_w, box_h, bar_w, bar_y, fill) =
+            (self.box_w, self.box_h, self.bar_w(), self.bar_y, self.drawn);
         // White is palette index 1 in both nibbles
-        let mut data = vec![(WHITE << 4) | WHITE; Canvas::len(box_w, BOX_H)];
+        let mut data = vec![(WHITE << 4) | WHITE; Canvas::len(box_w, box_h)];
         let mut canvas = Canvas {
             data: &mut data,
             width: box_w,
-            height: BOX_H,
+            height: box_h,
         };
 
         // 2px box border
         for x in 0..box_w {
-            for y in [0, 1, BOX_H - 2, BOX_H - 1] {
+            for y in [0, 1, box_h - 2, box_h - 1] {
                 canvas.set(x, y, BLACK);
             }
         }
-        for y in 0..BOX_H {
+        for y in 0..box_h {
             for x in [0, 1, box_w - 2, box_w - 1] {
                 canvas.set(x, y, BLACK);
             }
         }
 
         // Bar outline and fill
-        for y in BAR_Y..BAR_Y + BAR_H {
-            for x in BAR_X..BAR_X + bar_w {
-                let edge =
-                    y == BAR_Y || y == BAR_Y + BAR_H - 1 || x == BAR_X || x == BAR_X + bar_w - 1;
+        for y in bar_y..bar_y + BAR_H {
+            for x in PADDING..PADDING + bar_w {
+                let edge = y == bar_y
+                    || y == bar_y + BAR_H - 1
+                    || x == PADDING
+                    || x == PADDING + bar_w - 1;
                 let color = if edge {
                     BLACK
-                } else if x - BAR_X - 1 < fill {
+                } else if x - PADDING - 1 < fill {
                     GREEN
                 } else {
                     WHITE
@@ -248,23 +371,28 @@ impl Progress {
             }
         }
 
-        let mut text_x = PADDING;
-        if let Some(bars) = self.wifi_bars {
-            draw_wifi_icon(&mut canvas, PADDING, ICON_Y, bars);
-            text_x += ICON_W + ICON_GAP;
+        let font = font();
+        for (i, line) in self.lines.iter().enumerate() {
+            let mut text_x = PADDING;
+            if i == self.label
+                && let Some(bars) = self.wifi_bars
+            {
+                draw_wifi_icon(&mut canvas, PADDING, line.y + ICON_Y - PADDING, bars);
+                text_x += ICON_W + ICON_GAP;
+            }
+            draw_text(
+                &mut canvas,
+                &font,
+                &line.text,
+                line.size,
+                (text_x as f32, line.y as f32 - 3.0),
+                BLACK,
+            );
         }
-        draw_text(
-            &mut canvas,
-            &font(),
-            &self.label,
-            TEXT_SIZE,
-            (text_x as f32, 5.0),
-            BLACK,
-        );
 
-        for y in 0..BOX_H {
+        for y in 0..box_h {
             for x in 0..box_w {
-                let (fx, fy) = to_framebuffer(self.orientation, x, y);
+                let (fx, fy) = self.to_fb(x, y);
                 framebuffer.set_pixel_indexed(fx, fy, canvas.get(x, y));
             }
         }

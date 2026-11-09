@@ -237,16 +237,25 @@ fn cover_url(albums: &AlbumCache, concert: &Concert, size: (u32, u32)) -> Option
 /// downloads, reopened only when the cover host changes or a request fails. Each cover
 /// downloads while the next concert's band is looked up on the other connection.
 /// `on_cover` receives each concert index with its JPEG or the failure, in order, as soon
-/// as it downloads.
+/// as it downloads, and returns false to stop.
 pub async fn fetch_covers<T: TcpConnect, D: Dns>(
     net: &mut Net<'_, T, D>,
     albums: &mut AlbumCache,
     concerts: &[Concert],
     order: &[usize],
     size: (u32, u32),
-    mut on_cover: impl AsyncFnMut(usize, Result<Vec<u8>, SyncError>),
+    mut on_cover: impl AsyncFnMut(usize, Result<Vec<u8>, SyncError>) -> bool,
 ) {
     let (mut k, mut failures, mut api_down) = (0, 0, false);
+
+    // Hand a result to `on_cover`, returning if it asks to stop
+    macro_rules! cover {
+        ($i:expr, $result:expr) => {
+            if !on_cover($i, $result).await {
+                return;
+            }
+        };
+    }
 
     // Deezer API connection, reopened after a failed lookup
     'api: while k < order.len() {
@@ -306,7 +315,7 @@ pub async fn fetch_covers<T: TcpConnect, D: Dns>(
                 continue 'api;
             }
             let Some(mut url) = cover_url(albums, &concerts[order[k]], size) else {
-                on_cover(order[k], Err(SyncError::NoImage)).await;
+                cover!(order[k], Err(SyncError::NoImage));
                 k += 1;
                 continue 'cover;
             };
@@ -324,7 +333,7 @@ pub async fn fetch_covers<T: TcpConnect, D: Dns>(
                 _ => {
                     failures += 1;
                     if failures >= ATTEMPTS {
-                        on_cover(order[k], Err(SyncError::Network)).await;
+                        cover!(order[k], Err(SyncError::Network));
                         (k, failures) = (k + 1, 0);
                     }
                     continue 'cover;
@@ -354,13 +363,13 @@ pub async fn fetch_covers<T: TcpConnect, D: Dns>(
 
                 match download {
                     Ok(jpeg) => {
-                        on_cover(order[k], Ok(jpeg)).await;
+                        cover!(order[k], Ok(jpeg));
                         (k, failures) = (k + 1, 0);
                     }
                     Err(e) => {
                         failures += 1;
                         if !retryable(&e) || failures >= ATTEMPTS {
-                            on_cover(order[k], Err(e)).await;
+                            cover!(order[k], Err(e));
                             (k, failures) = (k + 1, 0);
                         }
                         continue 'cover;
@@ -381,7 +390,7 @@ pub async fn fetch_covers<T: TcpConnect, D: Dns>(
                             break;
                         }
                         None => {
-                            on_cover(order[k], Err(SyncError::NoImage)).await;
+                            cover!(order[k], Err(SyncError::NoImage));
                             k += 1;
                         }
                     }

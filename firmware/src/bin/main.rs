@@ -355,6 +355,14 @@ fn start_button_monitor() {
     BUTTON_MONITOR_SIGNAL.signal(());
 }
 
+/// Whether a tap or hold is waiting to be handled
+fn button_pending() -> bool {
+    matches!(
+        BUTTON_STATE.load(Ordering::Relaxed),
+        BUTTON_NEXT | BUTTON_FLIP
+    )
+}
+
 /// Button monitor task - persistent task that monitors button when signaled
 /// Waits for signal when inactive (no polling), monitors button when active
 #[embassy_executor::task]
@@ -838,9 +846,11 @@ async fn main(spawner: Spawner) -> ! {
         }
 
         // Sync cycle: show the next cached screen (with the progress dialog when there is
-        // work), render missing artwork for the current orientation while the panel
-        // refreshes, show the first rendered screen if nothing was cached, then erase the
-        // dialog. Evaluates to whether a refresh was started.
+        // work), or a welcome screen with instructions when there is no artwork for the
+        // current orientation. Render missing artwork while the panel refreshes; the first
+        // rendered screen replaces the welcome screen's background, keeping the dialog. A tap
+        // shows the next ready screen behind the dialog, and a hold stops the sync to rotate.
+        // Then erase the dialog. Evaluates to whether a refresh was started or a press waits.
         macro_rules! sync_cycle {
             ($battery:expr) => {{
                 let per_screen = screen_items(orientation);
@@ -915,6 +925,65 @@ async fn main(spawner: Spawner) -> ! {
                         let mut progress = (total > 0)
                             .then(|| progress::Progress::new(orientation, total, rssi));
 
+                        // Screens shown during the sync come from the cached list when it was
+                        // shown, otherwise from `pool`: artwork on the card, then each new
+                        // render, in order
+                        let mut from_items = false;
+                        let mut pool: Vec<usize> =
+                            (0..concerts.len()).filter(|&i| ready_flags[i]).collect();
+                        let mut pool_shown = 0usize;
+                        let mut completed = 0usize;
+                        let mut in_flight = 0usize;
+
+                        // Full refresh of the next screen behind the dialog (at the current
+                        // progress), evaluating to whether it started. Re-arms the button
+                        // monitor unless a hold is waiting to be handled.
+                        macro_rules! show_next {
+                            () => {{
+                                let paths: Option<Vec<&str>> = if from_items {
+                                    Some(
+                                        (0..per_screen)
+                                            .map(|s| items[(index + s) % items.len()].as_str())
+                                            .collect(),
+                                    )
+                                } else {
+                                    pool.get(pool_shown..pool_shown + per_screen).map(|next| {
+                                        next.iter().map(|&i| concerts[i].path.as_str()).collect()
+                                    })
+                                };
+                                let started = paths.is_some_and(|paths| {
+                                    compose_screen(
+                                        cache,
+                                        &mut framebuffer,
+                                        &mut *image_buf,
+                                        &paths,
+                                        orientation,
+                                        $battery,
+                                    )
+                                }) && {
+                                    if let Some(p) = progress.as_mut() {
+                                        p.draw(&mut framebuffer, completed);
+                                    }
+                                    epd.display_start(framebuffer.as_slice(), &mut delay).is_ok()
+                                };
+                                if started {
+                                    if from_items {
+                                        advance_full!();
+                                    } else {
+                                        pool_shown += per_screen;
+                                    }
+                                    if let Some(p) = progress.as_mut() {
+                                        p.confirm();
+                                    }
+                                    shown = true;
+                                    if BUTTON_STATE.load(Ordering::Relaxed) != BUTTON_FLIP {
+                                        start_button_monitor();
+                                    }
+                                }
+                                started
+                            }};
+                        }
+
                         // Show the cached screen, with the dialog when there is work
                         if cached_ready {
                             if let Some(p) = progress.as_mut() {
@@ -925,111 +994,46 @@ async fn main(spawner: Spawner) -> ! {
                                 .is_ok()
                             {
                                 shown = true;
+                                from_items = true;
                                 advance_full!();
                                 start_button_monitor();
                                 if let Some(p) = progress.as_mut() {
                                     p.confirm();
                                 }
                             }
-                        } else {
-                            // No cached list: use artwork already on the card, if any
-                            let on_card: Vec<&str> = concerts
-                                .iter()
-                                .zip(&ready_flags)
-                                .filter(|&(_, &ready)| ready)
-                                .map(|(c, _)| c.path.as_str())
-                                .take(per_screen)
-                                .collect();
-                            if on_card.len() == per_screen
-                                && compose_screen(
-                                    cache,
-                                    &mut framebuffer,
-                                    &mut *image_buf,
-                                    &on_card,
-                                    orientation,
-                                    $battery,
-                                )
+                        } else if !show_next!() && progress.is_some() {
+                            // Nothing to show yet: welcome screen until the first render
+                            let p = progress.insert(progress::Progress::welcome(
+                                orientation,
+                                total,
+                                rssi,
+                            ));
+                            framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
+                            draw_battery_icon(&mut framebuffer, orientation, $battery);
+                            p.draw(&mut framebuffer, 0);
+                            if epd
+                                .display_start(framebuffer.as_slice(), &mut delay)
+                                .is_ok()
                             {
-                                if let Some(p) = progress.as_mut() {
-                                    p.draw(&mut framebuffer, 0);
-                                }
-                                if epd
-                                    .display_start(framebuffer.as_slice(), &mut delay)
-                                    .is_ok()
-                                {
-                                    shown = true;
-                                    start_button_monitor();
-                                    if let Some(p) = progress.as_mut() {
-                                        p.confirm();
-                                    }
-                                }
-                            } else if let Some(p) = progress.as_mut() {
-                                let (rect, region) = p.draw(&mut framebuffer, 0);
-                                if epd.partial_update_start(&rect, &region, &mut delay).is_ok() {
-                                    p.confirm();
-                                }
+                                p.confirm();
+                                start_button_monitor();
                             }
                         }
 
                         let mut albums = sync::AlbumCache::new();
-                        let mut rendered: Vec<usize> = Vec::new();
-                        let mut completed = 0usize;
-                        let mut in_flight = 0usize;
 
-                        // Store a finished render, then refresh the bar and, with nothing
-                        // cached, show the first screen as soon as it is available
-                        macro_rules! finish_render {
-                            ($result:expr) => {{
-                                let RenderResult { index: i, image } = $result;
-                                let concert = &concerts[i];
-                                completed += 1;
-                                in_flight -= 1;
-                                match image {
-                                    Ok(image) => {
-                                        match cache.write_image(&concert.path, orientation, &image) {
-                                            Ok(()) => {
-                                                ready_flags[i] = true;
-                                                rendered.push(i);
-                                            }
-                                            Err(e) => {
-                                                info!("Failed to store {}: {:?}", concert.path, e)
-                                            }
-                                        }
-                                    }
-                                    Err(e) => info!("Skipping {}: {:?}", concert.path, e),
-                                }
-
-                                if !shown && rendered.len() >= per_screen {
+                        // After progress: show the first screen once one is available, the
+                        // next screen for a waiting tap, or otherwise the new bar slice
+                        macro_rules! update_screen {
+                            () => {{
+                                let state = BUTTON_STATE.load(Ordering::Relaxed);
+                                if !shown && state != BUTTON_FLIP && pool.len() >= per_screen {
                                     while epd.is_busy() {
                                         Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS))
                                             .await;
                                     }
-                                    let paths: Vec<&str> = rendered[..per_screen]
-                                        .iter()
-                                        .map(|&i| concerts[i].path.as_str())
-                                        .collect();
-                                    if compose_screen(
-                                        cache,
-                                        &mut framebuffer,
-                                        &mut *image_buf,
-                                        &paths,
-                                        orientation,
-                                        $battery,
-                                    ) {
-                                        if let Some(p) = progress.as_mut() {
-                                            p.draw(&mut framebuffer, completed);
-                                        }
-                                        if epd
-                                            .display_start(framebuffer.as_slice(), &mut delay)
-                                            .is_ok()
-                                        {
-                                            shown = true;
-                                            start_button_monitor();
-                                            if let Some(p) = progress.as_mut() {
-                                                p.confirm();
-                                            }
-                                        }
-                                    }
+                                    show_next!();
+                                } else if state == BUTTON_NEXT && !epd.is_busy() && show_next!() {
                                 } else if let Some(p) = progress.as_mut()
                                     && !epd.is_busy()
                                     && let Some((rect, region)) =
@@ -1041,7 +1045,33 @@ async fn main(spawner: Spawner) -> ! {
                             }};
                         }
 
-                        // Download covers on this core while the second core renders
+                        // Store a finished render, then update the screen
+                        macro_rules! finish_render {
+                            ($result:expr) => {{
+                                let RenderResult { index: i, image } = $result;
+                                let concert = &concerts[i];
+                                completed += 1;
+                                in_flight -= 1;
+                                match image {
+                                    Ok(image) => {
+                                        match cache.write_image(&concert.path, orientation, &image) {
+                                            Ok(()) => {
+                                                ready_flags[i] = true;
+                                                pool.push(i);
+                                            }
+                                            Err(e) => {
+                                                info!("Failed to store {}: {:?}", concert.path, e)
+                                            }
+                                        }
+                                    }
+                                    Err(e) => info!("Skipping {}: {:?}", concert.path, e),
+                                }
+                                update_screen!();
+                            }};
+                        }
+
+                        // Download covers on this core while the second core renders; a
+                        // hold stops the sync so the screen can rotate
                         sync::fetch_covers(
                             &mut net,
                             &mut albums,
@@ -1064,16 +1094,21 @@ async fn main(spawner: Spawner) -> ! {
                                     Err(e) => {
                                         info!("Skipping {}: {:?}", concerts[i].path, e);
                                         completed += 1;
+                                        update_screen!();
                                     }
                                 }
                                 while let Ok(result) = RENDER_RESULTS.try_receive() {
                                     finish_render!(result);
                                 }
+                                BUTTON_STATE.load(Ordering::Relaxed) != BUTTON_FLIP
                             },
                         )
                         .await;
                         while in_flight > 0 {
                             finish_render!(RENDER_RESULTS.receive().await);
+                        }
+                        if BUTTON_STATE.load(Ordering::Relaxed) == BUTTON_FLIP {
+                            info!("Sync stopped to rotate");
                         }
 
                         let mut ready: Box<WidgetData> = Box::new(heapless::Vec::new());
@@ -1099,9 +1134,12 @@ async fn main(spawner: Spawner) -> ! {
                             info!("Failed to store item list: {:?}", e);
                         }
 
-                        // Show the full bar, hold it briefly, then erase the dialog
+                        // Show the full bar, hold it briefly, then erase the dialog. Skipped
+                        // when the screen is replaced next anyway: a welcome screen with no
+                        // artwork behind it, or a button press waiting to be handled.
                         if let Some(p) = progress.as_mut()
                             && p.is_shown()
+                            && !button_pending()
                         {
                             while epd.is_busy() {
                                 Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
@@ -1116,7 +1154,7 @@ async fn main(spawner: Spawner) -> ! {
                                 }
                             }
                             Timer::after(Duration::from_millis(DIALOG_HOLD_MS)).await;
-                            if let Some((rect, region)) = p.restore(&mut framebuffer) {
+                            if shown && let Some((rect, region)) = p.restore(&mut framebuffer) {
                                 epd.partial_update_start(&rect, &region, &mut delay).ok();
                             }
                         }
@@ -1159,7 +1197,8 @@ async fn main(spawner: Spawner) -> ! {
                 if shown {
                     use_partial = orientation == Orientation::Horizontal;
                 }
-                shown
+                // A waiting press is handled after the refresh, like any other screen
+                shown || button_pending()
             }};
         }
 
