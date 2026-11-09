@@ -617,45 +617,46 @@ async fn main(spawner: Spawner) -> ! {
     let mut tcp_client: Option<TcpClient<'static, 1, 1024, 1024>> = None;
     let mut dns_socket: Option<DnsSocket<'static>> = None;
 
-    // Helper macro to ensure WiFi is initialized and connected
+    // Network stack - created lazily on first WiFi init
+    let mut net_stack: Option<Stack<'static>> = None;
+
+    // Helper macro to ensure WiFi is initialized (once) and connected
     macro_rules! ensure_wifi {
         () => {{
             if !wifi_connected {
-                info!("Initializing WiFi (deferred)...");
-                start_fast_blink(); // Visual feedback during slow init
+                if wifi_controller.is_none() {
+                    info!("Initializing WiFi (deferred)...");
+                    start_fast_blink(); // Visual feedback during slow init
 
-                // Initialize esp-radio (this is the slow part ~500-1000ms)
-                let ctrl = esp_radio::init().unwrap();
-                let ctrl = mk_static!(Controller<'static>, ctrl);
+                    // Initialize esp-radio (this is the slow part ~500-1000ms)
+                    let ctrl = esp_radio::init().unwrap();
+                    let ctrl = mk_static!(Controller<'static>, ctrl);
 
-                // Create WiFi controller and interfaces
-                let wifi = wifi_peripheral.take().unwrap();
-                let (wifi_ctrl, ifaces) = esp_radio::wifi::new(
-                    ctrl,
-                    wifi,
-                    WifiConfig::default(),
-                )
-                .unwrap();
+                    // Create WiFi controller and interfaces
+                    let wifi = wifi_peripheral.take().unwrap();
+                    let (wifi_ctrl, ifaces) =
+                        esp_radio::wifi::new(ctrl, wifi, WifiConfig::default()).unwrap();
 
-                let net_config = embassy_net::Config::dhcpv4(Default::default());
-                let (stk, runner) = embassy_net::new(
-                    ifaces.sta,
-                    net_config,
-                    mk_static!(StackResources<3>, StackResources::<3>::new()),
-                    rng.random() as u64,
-                );
-                let stk = mk_static!(Stack<'static>, stk);
-                spawner.spawn(net_task(runner)).ok();
+                    let (stk, runner) = embassy_net::new(
+                        ifaces.sta,
+                        embassy_net::Config::dhcpv4(Default::default()),
+                        mk_static!(StackResources<3>, StackResources::<3>::new()),
+                        rng.random() as u64,
+                    );
+                    spawner.spawn(net_task(runner)).ok();
 
-                let tcp_state = mk_static!(TcpClientState<1, 1024, 1024>, TcpClientState::new());
-                tcp_client = Some(TcpClient::new(*stk, tcp_state));
-                dns_socket = Some(DnsSocket::new(*stk));
-                _esp_radio_ctrl = Some(ctrl);
-                wifi_controller = Some(wifi_ctrl);
+                    let tcp_state =
+                        mk_static!(TcpClientState<1, 1024, 1024>, TcpClientState::new());
+                    tcp_client = Some(TcpClient::new(stk, tcp_state));
+                    dns_socket = Some(DnsSocket::new(stk));
+                    net_stack = Some(stk);
+                    _esp_radio_ctrl = Some(ctrl);
+                    wifi_controller = Some(wifi_ctrl);
+                }
 
-                // Connect to WiFi
+                // Connect, or reconnect after a disconnect during a display refresh
                 wifi_connect(wifi_controller.as_mut().unwrap()).await;
-                wait_for_ip(*stk).await;
+                wait_for_ip(net_stack.unwrap()).await;
                 wifi_connected = true;
                 info!("WiFi ready!");
             }
