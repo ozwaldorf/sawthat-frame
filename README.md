@@ -100,11 +100,16 @@ seconds); other failures retry for up to 60 seconds. The frame retries every
 
 On the setup screen, if the frame is connected to a computer, the whole SD card appears as a
 USB drive, including the artwork cache. Edit `CONFIG.TXT` (or add a font), then eject the
-drive; the frame restarts and reads the new config. Pressing KEY or unplugging also restarts
-it, but eject first so the computer finishes writing.
+drive; the frame restarts and reads the new config. Pressing KEY or BOOT, or unplugging, also
+restarts it, but eject first so the computer finishes writing.
 
-Without a computer connected, the frame sleeps until KEY is pressed or USB is plugged in (or
-the retry timer, for a WiFi failure).
+At any other time, pressing BOOT while connected to a computer enters drive mode too, with a
+"USB Drive Mode" box over the current screen. BOOT wakes the frame from sleep; a press while
+it is refreshing or syncing takes effect when that finishes. Without a computer connected,
+BOOT does nothing.
+
+Without a computer connected, the setup screen sleeps until KEY or BOOT is pressed or USB is
+plugged in (or the retry timer, for a WiFi failure).
 
 The drive uses the same USB port as the serial console, so the console disconnects while the
 drive is shown. Flashing works again after the frame restarts, or by holding BOOT while
@@ -134,8 +139,12 @@ Button input is detected in three places:
 - **During sync**: A tap shows the next screen behind the progress dialog (waiting for its
   artwork to render if needed); a hold stops the sync and rotates
 
+The BOOT button enters or leaves [USB drive mode](#usb-drive-mode) when the frame is connected
+to a computer. Do not hold it while the frame resets or powers on: that starts the ESP32
+download mode instead of the firmware.
+
 LED feedback:
-- **Green LED**: 1 flash = next item, 3 flashes = orientation changed
+- **Green LED**: 1 flash = next item or BOOT press, 3 flashes = orientation changed
 - **Red LED**: Solid = idle, blinking = syncing, fast blink = WiFi connecting
 
 ### Battery Indicator

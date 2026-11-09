@@ -224,8 +224,15 @@ impl<D: BlockDevice> Drive<D> {
     }
 }
 
-/// Expose `device` as a USB drive until it is ejected, unplugged, or `stop` returns true
-pub async fn serve<D: BlockDevice>(device: D, usb: Usb<'static>, stop: impl Fn() -> bool) -> Exit {
+/// Expose `device` as a USB drive until it is ejected, unplugged, or `stop` returns true.
+///
+/// `tick` runs on every pass of the polling loop, for work that must continue meanwhile.
+pub async fn serve<D: BlockDevice>(
+    device: D,
+    usb: Usb<'static>,
+    stop: impl Fn() -> bool,
+    mut tick: impl FnMut(),
+) -> Exit {
     static EP_MEMORY: StaticCell<[u32; 1024]> = StaticCell::new();
 
     let blocks = match device.num_blocks() {
@@ -300,6 +307,7 @@ pub async fn serve<D: BlockDevice>(device: D, usb: Usb<'static>, stop: impl Fn()
         if drive.ejected.is_some_and(|t| t.elapsed() > EJECT_DELAY) {
             return Exit::Ejected;
         }
+        tick();
         if stop() {
             return Exit::Stopped;
         }

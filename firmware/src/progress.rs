@@ -56,6 +56,13 @@ const SETUP_LINES: [&str; 10] = [
     "press KEY to retry.",
 ];
 
+/// Drive mode box contents after the title
+const DRIVE_LINES: [&str; 3] = [
+    "The SD card is shown as a USB drive.",
+    "Eject it or press BOOT to finish,",
+    "then the frame restarts and syncs.",
+];
+
 /// Panel partial window alignment in framebuffer x
 const ALIGN: u32 = 8;
 
@@ -156,14 +163,46 @@ fn draw_border(canvas: &mut Canvas) {
 
 /// Draw a centered setup box explaining `error` and the expected config file
 pub fn draw_setup(framebuffer: &mut Framebuffer, orientation: Orientation, error: &str) {
+    draw_notice(
+        framebuffer,
+        orientation,
+        "SawThat Frame Setup",
+        Some(error),
+        &SETUP_LINES,
+    );
+}
+
+/// Draw a centered box saying the SD card is shown as a USB drive, returning its
+/// framebuffer region for a partial refresh
+pub fn draw_drive_mode(framebuffer: &mut Framebuffer, orientation: Orientation) -> Rect {
+    draw_notice(
+        framebuffer,
+        orientation,
+        "USB Drive Mode",
+        None,
+        &DRIVE_LINES,
+    )
+}
+
+/// Draw a centered box with a title, an optional red line, and notes, returning its
+/// framebuffer region
+fn draw_notice(
+    framebuffer: &mut Framebuffer,
+    orientation: Orientation,
+    title: &str,
+    alert: Option<&str>,
+    notes: &[&str],
+) -> Rect {
     let font = font();
     let mut lines = Vec::new();
     let mut y = PADDING;
-    lines.push((String::from("SawThat Frame Setup"), TITLE_SIZE, BLACK, y));
+    lines.push((String::from(title), TITLE_SIZE, BLACK, y));
     y += line_h(TITLE_SIZE) + SECTION_GAP / 2;
-    lines.push((String::from(error), NOTE_SIZE, RED, y));
-    y += line_h(NOTE_SIZE) + SECTION_GAP - LINE_GAP;
-    for text in SETUP_LINES {
+    if let Some(alert) = alert {
+        lines.push((String::from(alert), NOTE_SIZE, RED, y));
+        y += line_h(NOTE_SIZE) + SECTION_GAP - LINE_GAP;
+    }
+    for &text in notes {
         lines.push((String::from(text), NOTE_SIZE, BLACK, y));
         y += line_h(NOTE_SIZE);
     }
@@ -202,6 +241,7 @@ pub fn draw_setup(framebuffer: &mut Framebuffer, orientation: Orientation, error
             framebuffer.set_pixel_indexed(fx, fy, canvas.get(x, y));
         }
     }
+    framebuffer_rect(orientation, origin.0, origin.1, box_w, box_h)
 }
 
 /// A line of text in the dialog: text, size, and top in box coordinates

@@ -215,6 +215,11 @@ impl SleepState {
 /// Button monitor state
 static BUTTON_STATE: AtomicU8 = AtomicU8::new(BUTTON_CANCELLED);
 
+/// Set by a BOOT press while awake; enters or leaves USB drive mode when a computer is connected
+static BOOT_PRESSED: AtomicBool = AtomicBool::new(false);
+/// BOOT (GPIO0) bit in the RTC pin wake status
+const BOOT_RTC_PIN_MASK: u32 = 1 << 0;
+
 /// Last ESP-IDF station disconnect reason, and whether the station joined the network
 static WIFI_REASON: AtomicU8 = AtomicU8::new(0);
 static WIFI_LINKED: AtomicBool = AtomicBool::new(false);
@@ -234,6 +239,8 @@ enum LedCommand {
     RedBlink(u16),
     /// Stop red LED blinking (keep LED on)
     RedSolid,
+    /// Alternate red and green at interval (ms)
+    Alternate(u16),
 }
 
 /// Signal to wake LED task when commands are sent
@@ -285,69 +292,63 @@ async fn render_task() {
     }
 }
 
-/// Combined LED task - handles red LED blinking and green LED flash requests
+/// Combined LED task: red blinking, red and green alternating, and green flash requests
 /// Uses signal-based waking to avoid continuous polling
 #[embassy_executor::task]
 async fn led_task(led_red: &'static mut Output<'static>, led_green: &'static mut Output<'static>) {
-    let mut blink_enabled = false;
-    let mut blink_interval_ms: u64 = 500;
+    use embassy_futures::select::{Either, select};
 
+    /// What the LEDs do between commands
+    #[derive(Clone, Copy)]
+    enum Mode {
+        /// Red solid, green off
+        Solid,
+        /// Red blinking at the interval (ms)
+        RedBlink(u64),
+        /// Red and green alternating at the interval (ms)
+        Alternate(u64),
+    }
+
+    // LEDs are active low
+    let mut mode = Mode::Solid;
     loop {
-        if blink_enabled {
-            // When blinking, use select to handle either signal or blink timer
-            use embassy_futures::select::{Either, select};
-
-            match select(
-                LED_SIGNAL.wait(),
-                Timer::after(Duration::from_millis(blink_interval_ms)),
-            )
-            .await
-            {
-                Either::First(cmd) => {
-                    // Process command
-                    match cmd {
-                        LedCommand::GreenFlash(count) => {
-                            for _ in 0..count {
-                                led_green.set_low(); // ON
-                                Timer::after(Duration::from_millis(100)).await;
-                                led_green.set_high(); // OFF
-                                Timer::after(Duration::from_millis(100)).await;
-                            }
-                        }
-                        LedCommand::RedBlink(interval) => {
-                            blink_enabled = true;
-                            blink_interval_ms = interval as u64;
-                        }
-                        LedCommand::RedSolid => {
-                            blink_enabled = false;
-                            led_red.set_low(); // ON (active low)
-                        }
-                    }
-                }
-                Either::Second(()) => {
-                    // Blink timer fired - toggle LED
-                    led_red.toggle();
+        let cmd = match mode {
+            Mode::Solid => Some(LED_SIGNAL.wait().await),
+            Mode::RedBlink(ms) | Mode::Alternate(ms) => {
+                match select(LED_SIGNAL.wait(), Timer::after(Duration::from_millis(ms))).await {
+                    Either::First(cmd) => Some(cmd),
+                    Either::Second(()) => None,
                 }
             }
-        } else {
-            // Not blinking - just wait for signal (no polling!)
-            let cmd = LED_SIGNAL.wait().await;
-            match cmd {
-                LedCommand::GreenFlash(count) => {
-                    for _ in 0..count {
-                        led_green.set_low(); // ON
-                        Timer::after(Duration::from_millis(100)).await;
-                        led_green.set_high(); // OFF
-                        Timer::after(Duration::from_millis(100)).await;
-                    }
+        };
+        match cmd {
+            None => {
+                led_red.toggle();
+                if matches!(mode, Mode::Alternate(_)) {
+                    led_green.toggle();
                 }
-                LedCommand::RedBlink(interval) => {
-                    blink_enabled = true;
-                    blink_interval_ms = interval as u64;
+            }
+            Some(LedCommand::GreenFlash(count)) => {
+                for _ in 0..count {
+                    led_green.set_low();
+                    Timer::after(Duration::from_millis(100)).await;
+                    led_green.set_high();
+                    Timer::after(Duration::from_millis(100)).await;
                 }
-                LedCommand::RedSolid => {
-                    led_red.set_low(); // ON (active low)
+                // Keep alternating out of phase with red
+                if matches!(mode, Mode::Alternate(_)) && led_red.is_set_high() {
+                    led_green.set_low();
                 }
+            }
+            Some(LedCommand::RedBlink(ms)) => mode = Mode::RedBlink(ms as u64),
+            Some(LedCommand::RedSolid) => {
+                mode = Mode::Solid;
+                led_red.set_low();
+            }
+            Some(LedCommand::Alternate(ms)) => {
+                mode = Mode::Alternate(ms as u64);
+                led_red.set_low();
+                led_green.set_high();
             }
         }
     }
@@ -361,6 +362,11 @@ fn start_blink() {
 /// Start fast blinking the red LED (100ms)
 fn start_fast_blink() {
     LED_SIGNAL.signal(LedCommand::RedBlink(100));
+}
+
+/// Alternate red and green LEDs (USB drive mode)
+fn start_alternate() {
+    LED_SIGNAL.signal(LedCommand::Alternate(250));
 }
 
 /// Stop blinking and keep red LED solid on
@@ -384,6 +390,18 @@ fn button_pending() -> bool {
         BUTTON_STATE.load(Ordering::Relaxed),
         BUTTON_NEXT | BUTTON_FLIP
     )
+}
+
+/// Records BOOT presses from pin edges in `BOOT_PRESSED`
+#[embassy_executor::task]
+async fn boot_monitor_task(boot: &'static mut Input<'static>) {
+    loop {
+        boot.wait_for_falling_edge().await;
+        BOOT_PRESSED.store(true, Ordering::Relaxed);
+        flash_green(1);
+        boot.wait_for_high().await;
+        Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+    }
 }
 
 /// Button monitor task: classifies each press as a tap or hold while monitoring is active.
@@ -442,6 +460,15 @@ async fn main(spawner: Spawner) -> ! {
     // Check wake reason immediately
     let wake_reason = esp_hal::rtc_cntl::wakeup_cause();
     let button_wake = matches!(wake_reason, esp_hal::system::SleepSource::Ext0);
+    // Ext1 wakes on BOOT or the charger IRQ; the status register holds the RTC pins that fired
+    let boot_wake = matches!(wake_reason, esp_hal::system::SleepSource::Ext1)
+        && esp_hal::peripherals::LPWR::regs()
+            .ext_wakeup1_status()
+            .read()
+            .ext_wakeup1_status()
+            .bits()
+            & BOOT_RTC_PIN_MASK
+            != 0;
 
     // PSRAM is registered first so general allocations land there, leaving internal RAM
     // for allocations that request it explicitly (WiFi buffers, RTOS task stacks)
@@ -536,6 +563,13 @@ async fn main(spawner: Spawner) -> ! {
     // Persistent button monitor; acts only while monitoring is started
     spawner
         .spawn(button_monitor_task(mk_static!(Input<'static>, key_input)))
+        .ok();
+    let boot_input = Input::new(
+        peripherals.GPIO0,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    spawner
+        .spawn(boot_monitor_task(mk_static!(Input<'static>, boot_input)))
         .ok();
 
     // ==================== Normal Boot Sequence ====================
@@ -699,31 +733,29 @@ async fn main(spawner: Spawner) -> ! {
     // Framebuffer (192KB, PSRAM)
     let mut framebuffer = Framebuffer::new();
 
-    // Show the setup screen for `$error`, expose the card to a connected computer (rebooting
-    // afterwards to read the new config), then sleep until KEY, USB, or the `$retry` timer
-    macro_rules! enter_setup {
-        ($error:expr, $retry:expr) => {{
-            let error: ConfigError = $error;
-            info!("Setup needed: {:?}", error);
-            let message = error.message();
-            // Skip the refresh when the same setup screen is already shown
-            let shown = message_hash(&message, orientation);
-            if !(setup_pending && unsafe { SETUP_SHOWN } == shown) {
-                framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
-                progress::draw_setup(&mut framebuffer, orientation, &message);
-                match epd.display(framebuffer.as_slice(), &mut delay) {
-                    Ok(()) => unsafe { SETUP_SHOWN = shown },
-                    Err(e) => info!("Setup screen refresh failed: {:?}", e),
-                }
-            }
-            epd.sleep(&mut delay).ok();
+    // USB OTG peripheral and pins (D+, D-), taken when drive mode starts
+    let mut usb_parts = Some((peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19));
 
-            if let Some(cache) = sd_cache.take()
-                && usb_host_connected().await
+    // Expose the SD card to a connected computer until it is ejected, unplugged, or KEY or
+    // BOOT is pressed, then reboot to read the new config. Continues only if no computer
+    // enumerated the drive.
+    macro_rules! drive_mode {
+        ($tick:expr) => {{
+            if usb_parts.is_some()
+                && let Some(cache) = sd_cache.take()
+                && let Some((usb0, dp, dm)) = usb_parts.take()
             {
                 start_button_monitor();
-                let usb = Usb::new(peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19);
-                let exit = usb_drive::serve(cache.into_card(), usb, button_pending).await;
+                BOOT_PRESSED.store(false, Ordering::Relaxed);
+                start_alternate();
+                let usb = Usb::new(usb0, dp, dm);
+                let exit = usb_drive::serve(
+                    cache.into_card(),
+                    usb,
+                    || button_pending() || BOOT_PRESSED.load(Ordering::Relaxed),
+                    $tick,
+                )
+                .await;
                 info!("USB drive mode ended: {:?}", exit);
                 usb_drive::restore_phy();
                 if exit != usb_drive::Exit::NoHost {
@@ -731,7 +763,73 @@ async fn main(spawner: Spawner) -> ! {
                     esp_hal::system::software_reset();
                 }
             }
+        }};
+    }
+
+    // Drive mode tick that puts the panel to sleep once the refresh started before it ends
+    macro_rules! sleep_panel_when_idle {
+        ($busy:ident) => {
+            || {
+                if $busy && !epd.is_busy() {
+                    epd.sleep(&mut delay).ok();
+                    $busy = false;
+                }
+            }
+        };
+    }
+
+    // Show the setup screen for `$error`, expose the card to a connected computer (rebooting
+    // afterwards to read the new config), then sleep until KEY, BOOT, USB, or the `$retry`
+    // timer. The panel refreshes while the drive starts.
+    macro_rules! enter_setup {
+        ($error:expr, $retry:expr) => {{
+            let error: ConfigError = $error;
+            info!("Setup needed: {:?}", error);
+            let message = error.message();
+            // Skip the refresh when the same setup screen is already shown
+            let shown = message_hash(&message, orientation);
+            let mut panel_busy = false;
+            if !(setup_pending && unsafe { SETUP_SHOWN } == shown) {
+                framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
+                progress::draw_setup(&mut framebuffer, orientation, &message);
+                match epd.display_start(framebuffer.as_slice(), &mut delay) {
+                    Ok(()) => {
+                        unsafe { SETUP_SHOWN = shown };
+                        panel_busy = true;
+                    }
+                    Err(e) => info!("Setup screen refresh failed: {:?}", e),
+                }
+            }
+            if usb_host_connected().await {
+                drive_mode!(sleep_panel_when_idle!(panel_busy));
+            }
+            while epd.is_busy() {
+                Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
+            }
+            epd.sleep(&mut delay).ok();
             sleep_on_setup(&mut rtc, &mut i2c, &mut delay, $retry)
+        }};
+    }
+
+    // Draw the drive mode box over the current screen and expose the card to a connected
+    // computer while the panel refreshes
+    macro_rules! drive_mode_with_notice {
+        () => {{
+            if sd_cache.is_some() {
+                let rect = progress::draw_drive_mode(&mut framebuffer, orientation);
+                let region = framebuffer.extract_rect(&rect);
+                let mut panel_busy = match epd.partial_update_start(&rect, &region, &mut delay) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        info!("Drive mode box refresh failed: {:?}", e);
+                        false
+                    }
+                };
+                drive_mode!(sleep_panel_when_idle!(panel_busy));
+                while epd.is_busy() {
+                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
+                }
+            }
         }};
     }
 
@@ -740,6 +838,24 @@ async fn main(spawner: Spawner) -> ! {
         Err(e) => enter_setup!(e, None),
     };
     info!("Refresh interval: {} minutes", config.refresh_minutes);
+
+    // BOOT pressed during sleep: enter drive mode if a computer is connected, otherwise sleep
+    // until the timer wake that was already scheduled
+    if boot_wake {
+        info!("Woken by BOOT");
+        let host = usb_host_connected().await;
+        if host {
+            // Returns only if no computer enumerated the drive, with the card handed over
+            drive_mode_with_notice!();
+        }
+        if resuming || host {
+            epd.sleep(&mut delay).ok();
+            if resuming {
+                sleep_until_scheduled(&mut rtc, &mut i2c, &mut delay);
+            }
+            sleep_until_wake(&mut rtc, &mut i2c, &mut delay, config.refresh_secs());
+        }
+    }
 
     // Charger plugged, unplugged, started or finished during sleep: redraw only the battery
     // body, then sleep until the timer wake that was already scheduled
@@ -753,10 +869,7 @@ async fn main(spawner: Spawner) -> ! {
             info!("Battery refresh failed: {:?}", e);
         }
         epd.sleep(&mut delay).ok();
-
-        let now = rtc.time_since_boot().as_micros() as u64;
-        let remaining = unsafe { NEXT_WAKE_US }.saturating_sub(now) / 1_000_000;
-        sleep_until_wake(&mut rtc, &mut i2c, &mut delay, remaining.max(1));
+        sleep_until_scheduled(&mut rtc, &mut i2c, &mut delay);
     }
 
     // Buffers for stored artwork and partial updates (PSRAM)
@@ -1530,6 +1643,13 @@ async fn main(spawner: Spawner) -> ! {
         wifi_disconnect(ctrl).await;
     }
 
+    // BOOT pressed while awake: enter drive mode if a computer is connected
+    if BOOT_PRESSED.swap(false, Ordering::Relaxed) && usb_host_connected().await {
+        info!("BOOT pressed with a computer connected");
+        epd.wake_up(&mut delay).ok();
+        drive_mode_with_notice!();
+    }
+
     unsafe {
         NEXT_WAKE_US = rtc.time_since_boot().as_micros() as u64 + config.refresh_secs() * 1_000_000;
     }
@@ -1752,8 +1872,8 @@ fn sleep_on_setup(
     }
     arm_charger_irq(i2c);
     let ext0 = key_wakeup();
-    let mut irq_pin = charger_irq_pin();
-    let mut irq_pins: [&mut dyn esp_hal::gpio::RtcPin; 1] = [&mut irq_pin];
+    let (mut irq_pin, mut boot_pin) = (charger_irq_pin(), boot_button_pin());
+    let mut irq_pins: [&mut dyn esp_hal::gpio::RtcPin; 2] = [&mut irq_pin, &mut boot_pin];
     let ext1 = Ext1WakeupSource::new(&mut irq_pins, WakeupLevel::Low);
     info!(
         "Entering deep sleep until KEY, USB, or retry in {:?} s...",
@@ -1786,6 +1906,25 @@ fn charger_irq_pin() -> esp_hal::peripherals::GPIO21<'static> {
     irq_pin
 }
 
+/// BOOT button (GPIO0, active low), reclaimed for the RTC domain with a pull-up
+fn boot_button_pin() -> esp_hal::peripherals::GPIO0<'static> {
+    let pin = unsafe { esp_hal::peripherals::GPIO0::steal() };
+    pin.rtcio_pullup(true);
+    pin.rtcio_pulldown(false);
+    pin
+}
+
+/// Sleep until the timer wake that was already scheduled (or KEY, BOOT, or a charger change)
+fn sleep_until_scheduled(
+    rtc: &mut Rtc,
+    i2c: &mut I2c<'_, esp_hal::Blocking>,
+    delay: &mut Delay,
+) -> ! {
+    let now = rtc.time_since_boot().as_micros();
+    let remaining = unsafe { NEXT_WAKE_US }.saturating_sub(now) / 1_000_000;
+    sleep_until_wake(rtc, i2c, delay, remaining.max(1))
+}
+
 /// Arm the charger wake and deep sleep for `seconds`, or until KEY or a charger change.
 ///
 /// Wake sources: the timer, the KEY button (GPIO4, active low), and the AXP2101 IRQ line
@@ -1801,8 +1940,8 @@ fn sleep_until_wake(
     let timer = TimerWakeupSource::new(CoreDuration::from_secs(seconds));
 
     let ext0 = key_wakeup();
-    let mut irq_pin = charger_irq_pin();
-    let mut irq_pins: [&mut dyn esp_hal::gpio::RtcPin; 1] = [&mut irq_pin];
+    let (mut irq_pin, mut boot_pin) = (charger_irq_pin(), boot_button_pin());
+    let mut irq_pins: [&mut dyn esp_hal::gpio::RtcPin; 2] = [&mut irq_pin, &mut boot_pin];
     let ext1 = Ext1WakeupSource::new(&mut irq_pins, WakeupLevel::Low);
 
     info!(
