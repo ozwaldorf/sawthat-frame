@@ -81,10 +81,15 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new() -> Self {
+        Self::with_font(text::font())
+    }
+
+    /// Renderer drawing concert text with `font`
+    pub fn with_font(font: FontRef<'static>) -> Self {
         Self {
             adjuster: Adjuster::new(),
             palette: OklabPalette::new(),
-            font: text::font(),
+            font,
         }
     }
 

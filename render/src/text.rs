@@ -1,10 +1,10 @@
-//! Text rendering onto packed palette-indexed buffers using the embedded font.
+//! Text rendering onto packed palette-indexed buffers.
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 
 use crate::palette::{BLACK, WHITE};
 
-static FONT_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/font.ttf"));
+static FONT_DATA: &[u8] = include_bytes!("../assets/IBMPlexMono-Bold.ttf");
 
 /// Band name sizes, largest first
 const BAND_SIZES: &[f32] = &[48.0, 40.0, 32.0, 24.0, 20.0];
@@ -14,6 +14,11 @@ const VENUE_SIZES: &[f32] = &[24.0, 20.0, 16.0];
 /// Parse the embedded font; keep the result around rather than calling this per draw
 pub fn font() -> FontRef<'static> {
     FontRef::try_from_slice(FONT_DATA).expect("embedded font is invalid")
+}
+
+/// Parse a TTF/OTF font, or `None` if it is invalid
+pub fn parse_font(data: &'static [u8]) -> Option<FontRef<'static>> {
+    FontRef::try_from_slice(data).ok()
 }
 
 /// Concert info shown below the artwork
