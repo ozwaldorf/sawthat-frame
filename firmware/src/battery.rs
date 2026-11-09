@@ -43,7 +43,7 @@ fn orange(percentage: u8) -> [u8; 3] {
     }
 }
 
-/// Draw the fill rectangle at (x0, y0) for a battery percentage.
+/// Draw the fill rectangle at (x0, y0) for a battery percentage, with rounded corners.
 ///
 /// Low and high levels are solid red and green; mid levels Floyd-Steinberg dither
 /// `orange`, normally [`orange`] for the percentage.
@@ -53,6 +53,13 @@ fn draw_fill(
     (x0, y0, w, h): (u16, u16, u16, u16),
     mut set: impl FnMut(u16, u16, Color),
 ) {
+    // Round the fill's corners; pixels outside keep the white body interior
+    let rect = (x0 as i32, y0 as i32, w as i32, h as i32);
+    let mut set = |x: u16, y: u16, color: Color| {
+        if in_rounded(x as i32, y as i32, rect, FILL_RADIUS) {
+            set(x, y, color);
+        }
+    };
     let solid = match percentage {
         0..=15 => Color::Red,
         50.. => Color::Green,
@@ -150,11 +157,14 @@ where
             && (0..h).contains(&y)
             && bitmap[y as usize].as_bytes()[x as usize] == b'#'
     };
-    // Body center in icon coordinates
+    // Body center in icon coordinates; the horizontal body is mirrored (see `draw_battery`)
     let (cx, cy) = if vertical {
         (BATTERY_WIDTH_V as i32 / 2, 6 + 42 / 2)
     } else {
-        (42 / 2, BATTERY_HEIGHT_H as i32 / 2)
+        (
+            BATTERY_WIDTH_H as i32 - 1 - 42 / 2,
+            BATTERY_HEIGHT_H as i32 / 2,
+        )
     };
     // Map a bitmap pixel to icon coordinates
     let to_icon = |x: i32, y: i32| -> (u16, u16) {
@@ -186,7 +196,8 @@ where
 /// - `framebuffer`: The main display framebuffer to draw into
 /// - `fb_x`, `fb_y`: Position in framebuffer where icon will be drawn
 /// - `percentage`: Battery level 0-100
-/// - `vertical`: If true, draw vertical battery (tip on top), else horizontal (tip on right)
+/// - `vertical`: If true, draw vertical battery (tip on top), else horizontal (tip on the
+///   right of the screen)
 /// - `symbol`: Power symbol drawn over the fill
 pub fn draw_battery(
     framebuffer: &mut [u8],
@@ -227,9 +238,14 @@ pub fn draw_battery(
             orange,
         );
     } else {
+        // Mirrored in the framebuffer so the 180 degree rotated screen shows the tip on the
+        // right and the fill growing from the left
+        let mirrored = |fb: &mut [u8], x: u16, y: u16, color: Color| {
+            set_pixel(fb, BATTERY_WIDTH_H - 1 - x, y, color)
+        };
         draw_battery_horizontal(
             framebuffer,
-            &set_pixel,
+            &mirrored,
             buf_width,
             buf_height,
             percentage,
@@ -242,6 +258,66 @@ pub fn draw_battery(
         PowerSymbol::Bolt => draw_symbol(framebuffer, &set_pixel, vertical, &BOLT),
         PowerSymbol::Usb => draw_symbol(framebuffer, &set_pixel, vertical, &USB),
         PowerSymbol::Full => draw_symbol(framebuffer, &set_pixel, vertical, &CHECK),
+    }
+}
+
+/// Outline thickness, outer corner radius of the body, radius of the tip's free corners, and
+/// corner radius of the fill
+const BORDER: i32 = 2;
+const BODY_RADIUS: i32 = 4;
+const TIP_RADIUS: i32 = 2;
+const FILL_RADIUS: i32 = 2;
+
+/// Whether pixel (x, y) is inside the rect (x0, y0, w, h) with corners rounded to `r`
+fn in_rounded(x: i32, y: i32, (x0, y0, w, h): (i32, i32, i32, i32), r: i32) -> bool {
+    let (x, y) = (x - x0, y - y0);
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return false;
+    }
+    let r = r.min(w / 2).min(h / 2);
+    let dx = if x < r {
+        r - 1 - x
+    } else if x >= w - r {
+        x - (w - r)
+    } else {
+        return true;
+    };
+    let dy = if y < r {
+        r - 1 - y
+    } else if y >= h - r {
+        y - (h - r)
+    } else {
+        return true;
+    };
+    // Pixel center within the corner circle
+    (2 * dx + 1).pow(2) + (2 * dy + 1).pow(2) <= 4 * r * r
+}
+
+/// Draw a rounded rect `outer` with a `BORDER` thick black outline and white inside, limited to
+/// pixels where `clip` holds
+fn draw_outline<F>(
+    fb: &mut [u8],
+    set_pixel: &F,
+    outer: (i32, i32, i32, i32),
+    r: i32,
+    clip: impl Fn(i32, i32) -> bool,
+) where
+    F: Fn(&mut [u8], u16, u16, Color),
+{
+    let (x0, y0, w, h) = outer;
+    let inner = (x0 + BORDER, y0 + BORDER, w - 2 * BORDER, h - 2 * BORDER);
+    for y in y0..y0 + h {
+        for x in x0..x0 + w {
+            if !clip(x, y) || !in_rounded(x, y, outer, r) {
+                continue;
+            }
+            let color = if in_rounded(x, y, inner, (r - BORDER).max(0)) {
+                Color::White
+            } else {
+                Color::Black
+            };
+            set_pixel(fb, x as u16, y as u16, color);
+        }
     }
 }
 
@@ -260,46 +336,19 @@ fn draw_battery_vertical<F>(
     let body_height: u16 = 42;
     let body_y_start: u16 = 6; // Leave room for tip at top
 
-    // Draw main body outline and white interior
-    for x in 0..body_width {
-        for y in body_y_start..(body_y_start + body_height) {
-            let is_border = y < body_y_start + 2
-                || y >= body_y_start + body_height - 2
-                || x < 2
-                || x >= body_width - 2;
-            set_pixel(
-                fb,
-                x,
-                y,
-                if is_border {
-                    Color::Black
-                } else {
-                    Color::White
-                },
-            );
-        }
-    }
+    let body = (
+        0,
+        body_y_start as i32,
+        body_width as i32,
+        body_height as i32,
+    );
+    draw_outline(fb, set_pixel, body, BODY_RADIUS, |_, _| true);
 
-    // Draw tip on top
-    let tip_width: u16 = 12;
-    let tip_height: u16 = 6;
-    let tip_x_start = (body_width - tip_width) / 2;
-
-    for x in tip_x_start..(tip_x_start + tip_width) {
-        for y in 0..tip_height {
-            let is_border = x < tip_x_start + 2 || x >= tip_x_start + tip_width - 2 || y < 2;
-            set_pixel(
-                fb,
-                x,
-                y,
-                if is_border {
-                    Color::Black
-                } else {
-                    Color::White
-                },
-            );
-        }
-    }
+    // Tip on top: the outline extends into the body so only its free corners are rounded
+    let (tip_width, tip_height) = (12, body_y_start as i32);
+    let tip_x = (body_width as i32 - tip_width) / 2;
+    let tip = (tip_x, 0, tip_width, tip_height + 2 * TIP_RADIUS);
+    draw_outline(fb, set_pixel, tip, TIP_RADIUS, |_, y| y < tip_height);
 
     // Fill area (fills from bottom to top)
     let fill_x_start: u16 = 4;
@@ -327,50 +376,24 @@ fn draw_battery_horizontal<F>(
 ) where
     F: Fn(&mut [u8], u16, u16, Color),
 {
-    // Horizontal battery: tip on right, fill goes left to right
+    // Horizontal battery before mirroring: tip on right, fill goes left to right
     let body_width: u16 = 42;
     let body_height: u16 = BATTERY_HEIGHT_H;
 
-    // Draw main body outline and white interior
-    for x in 0..body_width {
-        for y in 0..body_height {
-            let is_border = y < 2 || y >= body_height - 2 || x < 2 || x >= body_width - 2;
-            set_pixel(
-                fb,
-                x,
-                y,
-                if is_border {
-                    Color::Black
-                } else {
-                    Color::White
-                },
-            );
-        }
-    }
+    let body = (0, 0, body_width as i32, body_height as i32);
+    draw_outline(fb, set_pixel, body, BODY_RADIUS, |_, _| true);
 
-    // Draw tip on right
-    let tip_x = body_width;
-    let tip_width: u16 = 6;
-    let tip_height: u16 = 12;
-    let tip_y_start = (body_height - tip_height) / 2;
-
-    for x in tip_x..(tip_x + tip_width) {
-        for y in tip_y_start..(tip_y_start + tip_height) {
-            let is_border = y < tip_y_start + 2
-                || y >= tip_y_start + tip_height - 2
-                || x >= tip_x + tip_width - 2;
-            set_pixel(
-                fb,
-                x,
-                y,
-                if is_border {
-                    Color::Black
-                } else {
-                    Color::White
-                },
-            );
-        }
-    }
+    // Tip on right: the outline extends into the body so only its free corners are rounded
+    let (tip_width, tip_height) = (6, 12);
+    let tip_x = body_width as i32;
+    let tip_y = (body_height as i32 - tip_height) / 2;
+    let tip = (
+        tip_x - 2 * TIP_RADIUS,
+        tip_y,
+        tip_width + 2 * TIP_RADIUS,
+        tip_height,
+    );
+    draw_outline(fb, set_pixel, tip, TIP_RADIUS, |x, _| x >= tip_x);
 
     // Fill area (fills from left to right)
     let fill_x_start: u16 = 4;

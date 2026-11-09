@@ -2175,8 +2175,9 @@ fn draw_battery_icon(framebuffer: &mut Framebuffer, orientation: Orientation, po
 fn battery_body_rect(orientation: Orientation) -> Rect {
     let (x, y) = battery_origin(orientation);
     match orientation {
-        // Body is 42x24 below the tip; x is cut to the 8-pixel window alignment
-        Orientation::Horizontal => Rect::new(x, y, 40, 24),
+        // Body is 42x24 right of the 6px tip in the framebuffer (mirrored, see
+        // `battery::draw_battery`); x is cut to the 8-pixel window alignment
+        Orientation::Horizontal => Rect::new(x + 8, y, 40, 24),
         // Body is 24x42 below the 6px tip
         Orientation::Vertical => Rect::new(x, y + 6, 24, 42),
     }
