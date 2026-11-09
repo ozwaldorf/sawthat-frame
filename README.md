@@ -9,6 +9,9 @@ Built on the [Waveshare ESP32-S3-PhotoPainter](https://www.amazon.com/dp/B0FWRJD
 - GPIO Buttons and LEDs
 - (unused) Speaker, microphones
 
+Everything runs on the device: it fetches concerts from SawThat, finds matching album art
+on Deezer, renders it for the 6-color display, and caches the result on the SD card.
+
 ## Examples
 
 ### Physical Device
@@ -16,16 +19,16 @@ Built on the [Waveshare ESP32-S3-PhotoPainter](https://www.amazon.com/dp/B0FWRJD
 <img height="300" alt="image" src="https://github.com/user-attachments/assets/1339362c-3e16-41e8-9678-fdbbde66b622" />
 <img height="300" alt="image" src="https://github.com/user-attachments/assets/48a749e5-eb84-4dd3-bde5-b50005cf1192" />
 
-### API Outputs
+### Rendered Artwork
 
-<img width="150" alt="Santana" src="server/examples/santana_2012_horiz.png" />
-<img width="150" alt="Primus" src="server/examples/primus_2014_horiz.png" />
-<img width="150" alt="Billy Strings" src="server/examples/billy_strings_2017_horiz.png" />
-<img width="150" alt="Korn" src="server/examples/korn_2022_horiz.png" />
-<img width="150" alt="GRiZ" src="server/examples/griz_2022_horiz.png" />
-<img width="150" alt="Yonder Mountain" src="server/examples/yonder_mountain_2024_horiz.png" />
-<img width="150" alt="Atmosphere" src="server/examples/atmosphere_2025_horiz.png" />
-<img width="150" alt="Phish" src="server/examples/phish_2025_horiz.png" />
+<img width="150" alt="Santana" src="docs/examples/santana_2012_horiz.png" />
+<img width="150" alt="Primus" src="docs/examples/primus_2014_horiz.png" />
+<img width="150" alt="Billy Strings" src="docs/examples/billy_strings_2017_horiz.png" />
+<img width="150" alt="Korn" src="docs/examples/korn_2022_horiz.png" />
+<img width="150" alt="GRiZ" src="docs/examples/griz_2022_horiz.png" />
+<img width="150" alt="Yonder Mountain" src="docs/examples/yonder_mountain_2024_horiz.png" />
+<img width="150" alt="Atmosphere" src="docs/examples/atmosphere_2025_horiz.png" />
+<img width="150" alt="Phish" src="docs/examples/phish_2025_horiz.png" />
 
 ## Usage
 
@@ -41,56 +44,6 @@ A nix dev shell can be used for all required build tools:
 nix develop
 ```
 
-### Running the server
-
-The server provides the widget API for data fetching and image processing
-
-#### From source
-
-```bash
-cd server
-PORT=3000 cargo run -r
-```
-
-#### Using nix
-
-```bash
-nix run .
-```
-
-#### NixOS Module
-
-For nixos systems, a module is provided to run the server as a systemd service.
-Add the following flake input and NixOS configuration:
-
-```nix
-{
-  inputs.sawthat-frame.url = "github:ozwaldorf/sawthat-frame";
-
-  outputs = { nixpkgs, sawthat-frame, ... }: {
-    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
-      modules = [
-        sawthat-frame.nixosModules.default
-        {
-          services.sawthat-frame-server = {
-            enable = true;
-            port = 3000;
-            openFirewall = true;
-            logLevel = "info";
-          };
-        }
-      ];
-    };
-  };
-}
-```
-
-### Firmware
-
-The firmware runs on the ESP32-S3 and drives the e-paper display.
-
-#### Prerequisites
-
 Install the ESP Rust toolchain using [espup](https://github.com/esp-rs/espup):
 
 ```bash
@@ -98,17 +51,23 @@ espup install
 source ~/export-esp.sh
 ```
 
-#### Configuration
+### Configuration
 
-Set WiFi credentials and server address via environment variables:
+Set WiFi credentials via environment variables:
 
 ```bash
 export WIFI_SSID="your-ssid"
 export WIFI_PASS="your-password"
-export SERVER_URL="http://192.168.1.42:3000"
 ```
 
-#### Build and flash
+Optional:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SAWTHAT_USER_ID` | built-in user | SawThat user whose concerts are shown |
+| `SAWTHAT_FONT` | IBM Plex Mono Bold | Path to a TTF/OTF used for the concert text |
+
+### Build and flash
 
 Flash the firmware to the device and connect to the serial console:
 
@@ -117,56 +76,71 @@ cd firmware
 cargo run --release
 ```
 
-#### Button Controls
+### Button Controls
 
 The KEY button controls navigation and orientation:
 
 | Action | Duration | Effect |
 |--------|----------|--------|
-| Tap | >= 50ms | Next item |
+| Tap | < 500ms | Next item |
 | Hold | >= 500ms | Toggle orientation (horizontal/vertical) |
 
 Button input is detected in two places:
-- **On wake**: Immediately after waking from deep sleep (button or timer)
-- **Post-display**: 10-second window after each display refresh
+- **On wake**: Immediately after waking from deep sleep
+- **During refresh**: While the e-paper display is refreshing
 
 LED feedback:
 - **Green LED**: 1 flash = next item, 3 flashes = orientation changed
-- **Red LED**: Solid = idle, blinking = network activity, fast blink = WiFi connecting
+- **Red LED**: Solid = idle, blinking = syncing, fast blink = WiFi connecting
 
-### SD Card Cache
+### Battery Indicator
 
-The firmware uses an optional SD card for caching. If no SD card is present, the firmware falls back to fetching everything from the network on each boot.
+The battery level is derived from the measured cell voltage (the PMIC's fuel gauge is
+unreliable until it has seen a full charge cycle):
 
-#### Directory Structure
+| Level | Fill |
+|-------|------|
+| 0-15% | Red |
+| 16-49% | Orange (red/yellow checkerboard) |
+| 50-100% | Green |
+
+## Sync
+
+Artwork is rendered on the device and stored on the SD card. Only the current orientation is
+rendered; the other orientation is synced the first time it is shown.
+
+A sync runs:
+- **On power-on**
+- **After every item has been shown** (once per full cycle through the shuffled list)
+- **When the orientation is toggled** and no artwork exists for it yet
+
+All other wakes read artwork from the SD card without using WiFi.
+
+While syncing, the frame shows artwork immediately: the next cached screen, or, with an empty
+SD card, the first screen as soon as it has been rendered. A "Syncing N concerts..." dialog
+with a progress bar is drawn in the corner; only the newly filled slice of the bar is
+refreshed as concerts render, and the dialog is erased with a small refresh when done.
+
+If SawThat is unreachable, the last successful response stored on the SD card is used.
+
+### SD Card Layout
 
 ```
 /concerts/
-  WIDGET.JSN          # JSON array of item paths
-  ORIENT.DAT          # Orientation state (1 byte: 0=horizontal, 1=vertical)
+  BANDS.JSN           # Last SawThat bands response
+  HORIZ.JSN           # Items with horizontal artwork
+  VERT.JSN            # Items with vertical artwork
+  ORIENT.DAT          # Orientation (1 byte: 0=horizontal, 1=vertical)
   horiz/
-    {hash}.PNG        # Horizontal orientation images (400x480 each)
+    {hash}.IMG        # Horizontal artwork (400x480)
   vert/
-    {hash}.PNG        # Vertical orientation images (480x800)
+    {hash}.IMG        # Vertical artwork (480x800)
 ```
 
-Image filenames are 8-character hex hashes of the item path (FAT 8.3 compatible).
-
-#### What Gets Cached
-
-| Data | File | Purpose |
-|------|------|---------|
-| Widget items | `WIDGET.JSN` | List of concert IDs to display |
-| Orientation | `ORIENT.DAT` | Persists orientation across power cycles |
-| Images | `horiz/*.PNG`, `vert/*.PNG` | Pre-rendered e-paper images |
-
-#### Cache Behavior
-
-- **Boot**: Load widget data and orientation from SD card if available
-- **Cache hit**: Read PNG directly from SD card (skips WiFi entirely)
-- **Cache miss**: Fetch from server, store to SD card for next time
-- **Background sync**: While display refreshes, fetch fresh widget data and prefetch next image
-- **Cleanup**: When widget data changes, stale images are automatically deleted
+Item paths are `YYYY-MM-DD-{band-id}`. Image filenames are 8-character hex hashes of the item
+path (FAT 8.3 compatible). Images are stored as a 4-byte header (width, height) followed by
+4-bit palette indices. Files for concerts that are no longer listed are removed after each
+sync.
 
 ## Specifications
 
@@ -175,57 +149,43 @@ Image filenames are 8-character hex hashes of the item path (FAT 8.3 compatible)
 ```mermaid
 stateDiagram-v2
     PowerOn --> Boot
+    Wake --> Boot: 15min timer or button
 
     state Boot {
         direction LR
         InitSD: Init SD card
-        InitSD --> LoadJson: Load widget.json
+        InitSD --> LoadList: Load item list for orientation
     }
 
-    Boot --> CacheCheck: Check image cache
+    Boot --> NeedSync
 
-    state CacheCheck <<choice>>
-    CacheCheck --> ReadSD: Cached
-    CacheCheck --> Init: Not cached
+    state NeedSync <<choice>>
+    NeedSync --> Sync: Power-on, cycle complete,\nor no artwork
+    NeedSync --> Display: Otherwise
 
-    state Init {
+    state Sync {
         direction LR
-        [*] --> Connect
-        Connect --> FetchJson: Fetch widget.json
-        FetchJson --> FetchPNG: Fetch PNG
-        FetchPNG --> StorePNG: Store to SD
+        [*] --> Fetch: Fetch concerts
+        Fetch --> Show: Show screen + dialog
+        Show --> Render: Render missing artwork
+        Render --> Erase: Erase dialog
     }
-
-    ReadSD --> Display
-    Init --> Display
 
     state Display {
-        [*] --> Refresh: E-paper refresh (~15s)
-        [*] --> Sync
-
-        state "Background Sync" as Sync {
-            direction LR
-            [*] --> WiFi: Connect
-            WiFi --> FetchFresh: Fetch fresh data
-            FetchFresh --> Update: Update widget.json
-            Update --> Cleanup: Remove stale PNGs
-            Cleanup --> Prefetch: Prefetch next PNG
-        }
-
-        Refresh --> [*]
-        Sync --> [*]
+        direction LR
+        [*] --> Read: Read artwork from SD
+        Read --> Refresh: E-paper refresh
     }
 
-    Display --> Input: 10s button wait
+    Sync --> Input
+    Display --> Input
 
     state Input <<choice>>
-    Input --> CacheCheck: Button tap
+    Input --> NeedSync: Button tap
     Input --> Orientation: Button hold
-    Input --> Sleep: Timeout
+    Input --> Sleep: No input
 
-    Orientation --> CacheCheck: Toggle horiz/vert
-
-    Sleep --> Boot: 15min timer or button
+    Orientation --> NeedSync: Toggle horiz/vert
 ```
 
 ### Network Interactions
@@ -233,38 +193,42 @@ stateDiagram-v2
 ```mermaid
 sequenceDiagram
     participant FW as Firmware
-    participant API as Server API
     participant ST as SawThat.band
     participant DZ as Deezer
 
-    Note over FW,DZ: Fetch Widget Data
-    FW->>API: GET /concerts
-    API->>ST: GET /api/bands/{user_id}
-    ST-->>API: Band list + concerts JSON
-    Note over API: Compute concert list
-    API-->>FW: ["2024-06-15-band-id", ...]
+    FW->>ST: GET /api/bands?id={user_id}
+    ST-->>FW: Bands and concerts JSON
+    Note over FW: Store response, compute concert list
 
-    Note over FW,DZ: Fetch Image (cache miss)
-    FW->>API: GET /concerts/horiz/2024-06-15-band-id
-    API->>DZ: GET /search/artist?q={band}
-    DZ-->>API: Artist ID
-    API->>DZ: GET /artist/{id}/albums
-    DZ-->>API: Album list with dates
-    API->>DZ: GET CDN image (closest album)
-    DZ-->>API: Album art JPEG
-    Note over API: Render widget PNG<br/>(dither, palette, text)
-    API-->>FW: PNG image
-
-    Note over FW: Cache and display
+    loop Each concert without artwork
+        FW->>DZ: GET /search/artist?q={band}
+        DZ-->>FW: Artist ID
+        FW->>DZ: GET /artist/{id}/albums
+        DZ-->>FW: Albums with release dates
+        FW->>DZ: GET cover (closest album before the concert, sized for the layout)
+        DZ-->>FW: Album art JPEG
+        Note over FW: Render and store to SD
+    end
 ```
+
+Albums are looked up once per band per sync. If no album precedes the concert, the band's
+Spotify picture from SawThat is used instead.
 
 ### Image Processing Pipeline
 
-The server transforms source images into 6-color indexed PNGs for the e-paper display:
+The `render` crate (`no_std`) transforms source images for the 6-color display:
 
-1. **Resize**: Cover-fit with center crop (400×360 horizontal, 480×680 vertical)
-2. **Tone adjustments**: Exposure (×0.8), saturation boost (×2.0), and S-curve for mid-tones
-3. **Canvas composition**: Image area with gradient blend into solid background for text
-4. **Dithering**: Floyd-Steinberg error diffusion in OKLab color space to 6-color palette
-5. **Text rendering**: Concert info (band, date, venue) with adaptive font sizing
-6. **PNG encode**: Indexed color output with embedded palette
+1. **Resize**: Cover-fit with center crop (400x360 horizontal, 480x680 vertical). Deezer covers
+   are requested at the covering size so only a crop is needed
+2. **Tone adjustments**: Exposure (x0.8), saturation boost (x2.0), and S-curve for mid-tones
+3. **Background color**: Dominant color of the bottom 10% of the adjusted image
+4. **Canvas composition**: Image area with gradient blend into solid background for text
+5. **Dithering**: Floyd-Steinberg error diffusion in OKLab color space to the 6-color palette
+6. **Text rendering**: Concert info (band, date, venue) with adaptive font sizing
+
+The same pipeline can be run on a host to preview output:
+
+```bash
+cd render
+cargo run --release --example render -- cover.jpg "Band" 27-07-2012 "Venue" out
+```
