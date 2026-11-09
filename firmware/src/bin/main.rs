@@ -107,6 +107,8 @@ const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
 const HOLD_THRESHOLD_MS: u32 = 500;
 /// Button polling interval in milliseconds
 const BUTTON_POLL_MS: u64 = 50;
+/// How long the completed sync dialog stays on screen before it is erased
+const DIALOG_HOLD_MS: u64 = 1000;
 /// Display busy polling interval in milliseconds (display refresh takes seconds)
 const DISPLAY_BUSY_POLL_MS: u64 = 200;
 /// Magic number to validate RTC memory state
@@ -909,8 +911,9 @@ async fn main(spawner: Spawner) -> ! {
                         for &i in &missing {
                             ready_flags[i] = false;
                         }
-                        let mut progress =
-                            (total > 0).then(|| progress::Progress::new(orientation, total));
+                        let rssi = wifi_controller.as_ref().and_then(|c| c.rssi().ok());
+                        let mut progress = (total > 0)
+                            .then(|| progress::Progress::new(orientation, total, rssi));
 
                         // Show the cached screen, with the dialog when there is work
                         if cached_ready {
@@ -1096,11 +1099,23 @@ async fn main(spawner: Spawner) -> ! {
                             info!("Failed to store item list: {:?}", e);
                         }
 
-                        // Erase the dialog
-                        if let Some(p) = progress.as_mut() {
+                        // Show the full bar, hold it briefly, then erase the dialog
+                        if let Some(p) = progress.as_mut()
+                            && p.is_shown()
+                        {
                             while epd.is_busy() {
                                 Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
                             }
+                            if let Some((rect, region)) = p.update(&mut framebuffer, total)
+                                && epd.partial_update_start(&rect, &region, &mut delay).is_ok()
+                            {
+                                p.confirm();
+                                while epd.is_busy() {
+                                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS))
+                                        .await;
+                                }
+                            }
+                            Timer::after(Duration::from_millis(DIALOG_HOLD_MS)).await;
                             if let Some((rect, region)) = p.restore(&mut framebuffer) {
                                 epd.partial_update_start(&rect, &region, &mut delay).ok();
                             }

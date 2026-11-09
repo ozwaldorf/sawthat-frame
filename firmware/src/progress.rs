@@ -32,6 +32,52 @@ const BAR_H: u32 = 8;
 /// Panel partial window alignment in framebuffer x
 const ALIGN: u32 = 8;
 
+/// WiFi icon size and gap before the label, in box coordinates
+const ICON_W: u32 = 24;
+const ICON_H: u32 = 16;
+const ICON_GAP: u32 = 6;
+/// Icon top, roughly centered on the label's cap height
+const ICON_Y: u32 = 6;
+
+/// Signal bars (0-3) for a WiFi RSSI in dBm
+fn signal_bars(rssi: i32) -> u32 {
+    match rssi {
+        -60.. => 3,
+        -70.. => 2,
+        -80.. => 1,
+        _ => 0,
+    }
+}
+
+/// Draw a WiFi icon with `bars` lit arcs at (x, y); unlit arcs are a black/white
+/// checkerboard so they read as grey
+fn draw_wifi_icon(canvas: &mut Canvas, x: u32, y: u32, bars: u32) {
+    // Arcs fan out from a point at the bottom center, within 45 degrees of vertical
+    let (cx, cy) = (x as i32 + ICON_W as i32 / 2, y as i32 + ICON_H as i32 - 1);
+    // Squared radius bands: dot, then three arcs
+    const BANDS: [(i32, i32); 4] = [(0, 6), (25, 49), (81, 121), (169, 225)];
+
+    for py in y..y + ICON_H {
+        for px in x..x + ICON_W {
+            let (dx, dy) = (px as i32 - cx, cy - py as i32);
+            if dy < 0 || (dx.abs() > dy && dx * dx + dy * dy > BANDS[0].1) {
+                continue;
+            }
+            let r2 = dx * dx + dy * dy;
+            let Some(band) = BANDS.iter().position(|&(lo, hi)| r2 >= lo && r2 < hi) else {
+                continue;
+            };
+            let lit = band == 0 || band as u32 <= bars;
+            let color = if lit || (px + py).is_multiple_of(2) {
+                BLACK
+            } else {
+                WHITE
+            };
+            canvas.set(px, py, color);
+        }
+    }
+}
+
 /// Map a box coordinate to framebuffer coordinates.
 ///
 /// Horizontal screens are rotated 180 degrees in the framebuffer; vertical screens
@@ -64,7 +110,9 @@ pub struct Progress {
     orientation: Orientation,
     total: usize,
     label: String,
-    /// Box width, sized to the label
+    /// WiFi signal bars shown before the label, if the RSSI is known
+    wifi_bars: Option<u32>,
+    /// Box width, sized to the icon and label
     box_w: u32,
     /// Framebuffer contents under the box, saved when it is drawn
     saved: Option<(Rect, Vec<u8>)>,
@@ -75,18 +123,22 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub fn new(orientation: Orientation, total: usize) -> Self {
+    /// `rssi` is the WiFi signal strength in dBm, shown as an icon before the label
+    pub fn new(orientation: Orientation, total: usize, rssi: Option<i32>) -> Self {
         let label = format!(
             "Syncing {} concert{}...",
             total,
             if total == 1 { "" } else { "s" }
         );
-        let box_w =
-            (text_width(&font(), &label, TEXT_SIZE) as u32 + 2 * PADDING).div_ceil(ALIGN) * ALIGN;
+        let wifi_bars = rssi.map(signal_bars);
+        let content_w = text_width(&font(), &label, TEXT_SIZE) as u32
+            + wifi_bars.map_or(0, |_| ICON_W + ICON_GAP);
+        let box_w = (content_w + 2 * PADDING).div_ceil(ALIGN) * ALIGN;
         Self {
             orientation,
             total,
             label,
+            wifi_bars,
             box_w,
             saved: None,
             shown: None,
@@ -137,6 +189,11 @@ impl Progress {
         self.drawn = fill;
         let rect = framebuffer_rect(self.orientation, x, y, fill - shown, BAR_H - 2);
         Some((rect, framebuffer.extract_rect(&rect)))
+    }
+
+    /// Whether the dialog is currently on the panel
+    pub fn is_shown(&self) -> bool {
+        self.shown.is_some()
     }
 
     /// Record that the last `draw` or `update` is on the panel
@@ -191,12 +248,17 @@ impl Progress {
             }
         }
 
+        let mut text_x = PADDING;
+        if let Some(bars) = self.wifi_bars {
+            draw_wifi_icon(&mut canvas, PADDING, ICON_Y, bars);
+            text_x += ICON_W + ICON_GAP;
+        }
         draw_text(
             &mut canvas,
             &font(),
             &self.label,
             TEXT_SIZE,
-            (PADDING as f32, 5.0),
+            (text_x as f32, 5.0),
             BLACK,
         );
 
