@@ -38,13 +38,13 @@ use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::system::Stack as CoreStack;
 use esp_hal::{
     clock::CpuClock,
-    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull, RtcPinWithResistors},
     i2c::master::{Config as I2cConfig, I2c},
     ram,
     rng::Rng,
     rtc_cntl::{
         Rtc,
-        sleep::{Ext0WakeupSource, TimerWakeupSource, WakeupLevel},
+        sleep::{Ext0WakeupSource, Ext1WakeupSource, TimerWakeupSource, WakeupLevel},
     },
     spi::{
         Mode,
@@ -109,6 +109,9 @@ const HOLD_THRESHOLD_MS: u32 = 500;
 const BUTTON_POLL_MS: u64 = 50;
 /// How long the completed sync dialog stays on screen before it is erased
 const DIALOG_HOLD_MS: u64 = 1000;
+/// AXP2101 PMIC I2C address and fuel gauge percentage register
+const AXP2101_ADDR: u8 = 0x34;
+const BAT_PERCENT_REG: u8 = 0xA4;
 /// Display busy polling interval in milliseconds (display refresh takes seconds)
 const DISPLAY_BUSY_POLL_MS: u64 = 200;
 /// Magic number to validate RTC memory state
@@ -117,6 +120,10 @@ const SLEEP_STATE_MAGIC: u32 = 0xCAFE_F00D;
 /// RTC fast memory state - persists across deep sleep
 #[esp_hal::ram(unstable(rtc_fast))]
 static mut SLEEP_STATE: SleepState = SleepState::new();
+
+/// RTC time (us) of the next timer wake, so a charger wake does not postpone it
+#[esp_hal::ram(unstable(rtc_fast))]
+static mut NEXT_WAKE_US: u64 = 0;
 
 /// State persisted in RTC memory across deep sleep
 #[repr(C)]
@@ -519,7 +526,9 @@ async fn main(spawner: Spawner) -> ! {
     let mut delay = Delay;
     let cold_boot = !matches!(
         wake_reason,
-        esp_hal::system::SleepSource::Timer | esp_hal::system::SleepSource::Ext0
+        esp_hal::system::SleepSource::Timer
+            | esp_hal::system::SleepSource::Ext0
+            | esp_hal::system::SleepSource::Ext1
     );
 
     // ==================== SD Card Initialization ====================
@@ -585,11 +594,9 @@ async fn main(spawner: Spawner) -> ! {
     .with_sda(peripherals.GPIO47)
     .with_scl(peripherals.GPIO48);
 
-    const AXP2101_ADDR: u8 = 0x34;
     const LDO_ONOFF_CTRL0: u8 = 0x90; // ALDO enable bits
     const LDO_VOL2_CTRL: u8 = 0x94; // ALDO3 voltage
     const LDO_VOL3_CTRL: u8 = 0x95; // ALDO4 voltage
-    const BAT_PERCENT_REG: u8 = 0xA4; // Battery percentage (0-100)
 
     // Try to configure PMIC - may already be set by bootloader
     let pmic_ok = (|| -> Result<(), esp_hal::i2c::master::Error> {
@@ -664,6 +671,24 @@ async fn main(spawner: Spawner) -> ! {
 
     // Framebuffer (192KB, PSRAM)
     let mut framebuffer = Framebuffer::new();
+
+    // Charger plugged, unplugged, started or finished during sleep: redraw only the battery
+    // body, then sleep until the timer wake that was already scheduled
+    if matches!(wake_reason, esp_hal::system::SleepSource::Ext1) && resuming {
+        info!("Charger changed");
+        let power = read_power(&mut i2c).await;
+        draw_battery_icon(&mut framebuffer, orientation, power);
+        let rect = battery_body_rect(orientation);
+        let region = framebuffer.extract_rect(&rect);
+        if let Err(e) = epd.partial_update(&rect, &region, &mut delay) {
+            info!("Battery refresh failed: {:?}", e);
+        }
+        epd.sleep(&mut delay).ok();
+
+        let now = rtc.time_since_boot().as_micros() as u64;
+        let remaining = unsafe { NEXT_WAKE_US }.saturating_sub(now) / 1_000_000;
+        sleep_until_wake(&mut rtc, &mut i2c, &mut delay, remaining.max(1));
+    }
 
     // Buffers for stored artwork and partial updates (PSRAM)
     let mut image_buf: Box<[u8; IMAGE_BUF_SIZE]> = Box::new([0u8; IMAGE_BUF_SIZE]);
@@ -1200,21 +1225,12 @@ async fn main(spawner: Spawner) -> ! {
             info!("Waking up display...");
             epd.wake_up(&mut delay).expect("Failed to wake display");
 
-            let battery_percent = match log_charger_status(&mut i2c) {
-                Some(mv) => battery_percent_from_mv(mv),
-                None => {
-                    let mut buf = [0u8; 1];
-                    i2c.write_read(AXP2101_ADDR, &[BAT_PERCENT_REG], &mut buf)
-                        .map(|_| buf[0])
-                        .unwrap_or(50)
-                }
-            };
-            info!("Battery: {}%", battery_percent);
+            let power = read_power(&mut i2c).await;
 
             let display_started = if need_sync {
                 need_sync = false;
                 info!("Syncing {:?} artwork", orientation);
-                let shown = sync_cycle!(battery_percent);
+                let shown = sync_cycle!(power);
                 if !shown && !items.is_empty() {
                     // Synced without showing a screen: display normally
                     continue;
@@ -1253,7 +1269,7 @@ async fn main(spawner: Spawner) -> ! {
                     }
                     continue;
                 }
-                draw_battery_icon(&mut framebuffer, orientation, battery_percent);
+                draw_battery_icon(&mut framebuffer, orientation, power);
 
                 framebuffer.extract_half(next_slot, &mut *half_buffer);
                 let x_offset = if next_slot == 0 { 0 } else { 400 };
@@ -1290,7 +1306,7 @@ async fn main(spawner: Spawner) -> ! {
                         &mut *image_buf,
                         &paths,
                         orientation,
-                        battery_percent,
+                        power,
                     )
                 });
                 if !drawn {
@@ -1403,14 +1419,10 @@ async fn main(spawner: Spawner) -> ! {
         wifi_disconnect(ctrl).await;
     }
 
-    // Reclaim GPIO4 for deep sleep wake source
-    let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
-
-    info!(
-        "Entering deep sleep for {} seconds (press button to wake early)...",
-        REFRESH_INTERVAL_SECS
-    );
-    enter_deep_sleep(&mut rtc, key_pin, &mut delay, REFRESH_INTERVAL_SECS);
+    unsafe {
+        NEXT_WAKE_US = rtc.time_since_boot().as_micros() as u64 + REFRESH_INTERVAL_SECS * 1_000_000;
+    }
+    sleep_until_wake(&mut rtc, &mut i2c, &mut delay, REFRESH_INTERVAL_SECS);
 }
 
 /// Approximate Li-ion state of charge from resting cell voltage
@@ -1441,7 +1453,7 @@ fn battery_percent_from_mv(mv: u16) -> u8 {
 fn pmic_read(i2c: &mut I2c<'_, esp_hal::Blocking>, reg: u8) -> Option<u8> {
     let mut buf = [0u8; 1];
     for attempt in 0..3 {
-        match i2c.write_read(0x34, &[reg], &mut buf) {
+        match i2c.write_read(AXP2101_ADDR, &[reg], &mut buf) {
             Ok(()) => return Some(buf[0]),
             Err(e) => info!("PMIC read {:#04x} attempt {} failed: {:?}", reg, attempt, e),
         }
@@ -1449,15 +1461,64 @@ fn pmic_read(i2c: &mut I2c<'_, esp_hal::Blocking>, reg: u8) -> Option<u8> {
     None
 }
 
-/// Log AXP2101 charger state and VBUS presence, returning battery voltage in mV
-fn log_charger_status(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Option<u16> {
+/// Battery level and power symbol, as shown by the battery icon
+#[derive(Clone, Copy)]
+struct Power {
+    percent: u8,
+    symbol: battery::PowerSymbol,
+}
+
+/// Read battery level (from cell voltage, falling back to the fuel gauge) and power source:
+/// a check when plugged in and full, a USB icon when connected to a computer, and a bolt
+/// when charging from anything else
+async fn read_power(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Power {
+    let (mv, vbus, charging, full) = log_charger_status(i2c);
+    let percent = match mv {
+        Some(mv) => battery_percent_from_mv(mv),
+        None => pmic_read(i2c, BAT_PERCENT_REG).unwrap_or(50),
+    };
+    let symbol = if vbus && full {
+        battery::PowerSymbol::Full
+    } else if vbus && usb_host_connected().await {
+        battery::PowerSymbol::Usb
+    } else if charging {
+        battery::PowerSymbol::Bolt
+    } else {
+        battery::PowerSymbol::None
+    };
+    info!("Power: {}%, {:?}", percent, symbol);
+    Power { percent, symbol }
+}
+
+/// Whether a computer is on the USB port: a host sends a start-of-frame packet every
+/// millisecond, which advances the USB serial frame counter; a charger does not. Waits up to
+/// a second for the host to enumerate after boot.
+async fn usb_host_connected() -> bool {
+    // USB_SERIAL_JTAG FRAM_NUM register (SOF frame index in bits 10:0)
+    const FRAM_NUM: *const u32 = 0x6003_8024 as *const u32;
+    let frame = || unsafe { FRAM_NUM.read_volatile() } & 0x7FF;
+    let first = frame();
+    for _ in 0..100 {
+        Timer::after(Duration::from_millis(10)).await;
+        if frame() != first {
+            return true;
+        }
+    }
+    false
+}
+
+/// Log AXP2101 charger state, returning battery voltage in mV, whether USB power is present,
+/// whether the battery is charging, and whether charging is done
+fn log_charger_status(i2c: &mut I2c<'_, esp_hal::Blocking>) -> (Option<u16>, bool, bool, bool) {
     const STATUS1: u8 = 0x00;
     const STATUS2: u8 = 0x01;
     const ADC_ENABLE: u8 = 0x30;
     const VBAT_H: u8 = 0x34;
     const VBAT_L: u8 = 0x35;
 
+    let mut vbus = false;
     if let Some(s1) = pmic_read(i2c, STATUS1) {
+        vbus = s1 & 0x20 != 0;
         info!(
             "PMIC status1={:#04x}: vbus_good={} battery_present={}",
             s1,
@@ -1466,7 +1527,10 @@ fn log_charger_status(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Option<u16> {
         );
     }
 
+    let (mut charging, mut full) = (false, false);
     if let Some(s2) = pmic_read(i2c, STATUS2) {
+        charging = (s2 >> 5) & 0x03 == 1;
+        full = s2 & 0x07 == 4;
         let direction = match (s2 >> 5) & 0x03 {
             0 => "standby",
             1 => "charging",
@@ -1489,12 +1553,14 @@ fn log_charger_status(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Option<u16> {
     if let Some(adc) = pmic_read(i2c, ADC_ENABLE)
         && adc & 0x01 == 0
     {
-        let _ = i2c.write(0x34, &[ADC_ENABLE, adc | 0x01]);
+        let _ = i2c.write(AXP2101_ADDR, &[ADC_ENABLE, adc | 0x01]);
     }
-    let mv = ((pmic_read(i2c, VBAT_H)? as u16 & 0x3F) << 8) | pmic_read(i2c, VBAT_L)? as u16;
-    info!("PMIC vbat={}mV", mv);
+    let mv = pmic_read(i2c, VBAT_H)
+        .zip(pmic_read(i2c, VBAT_L))
+        .map(|(h, l)| ((h as u16 & 0x3F) << 8) | l as u16);
+    info!("PMIC vbat={:?}mV", mv);
     // A zero reading means the ADC has not sampled yet
-    (mv > 0).then_some(mv)
+    (mv.filter(|&mv| mv > 0), vbus, charging, full)
 }
 
 /// Compute a single hash for all widget data
@@ -1509,28 +1575,52 @@ fn hash_data(items: &WidgetData) -> u32 {
     hash
 }
 
-/// Enter deep sleep with timer and KEY button (GPIO4) wake sources
-fn enter_deep_sleep<P: esp_hal::gpio::RtcPinWithResistors>(
+/// Arm the charger wake and deep sleep for `seconds`, or until KEY or a charger change.
+///
+/// Wake sources: the timer, the KEY button (GPIO4, active low), and the AXP2101 IRQ line
+/// (GPIO21, active low) for USB plug/unplug and charge start/done.
+fn sleep_until_wake(
     rtc: &mut Rtc,
-    key_pin: P,
+    i2c: &mut I2c<'_, esp_hal::Blocking>,
     delay: &mut Delay,
     seconds: u64,
 ) -> ! {
-    // Configure wake sources
+    arm_charger_irq(i2c);
+
     let timer = TimerWakeupSource::new(CoreDuration::from_secs(seconds));
 
-    // Enable internal pull-up on GPIO4 so it doesn't float and trigger spurious wakes
+    // Reclaim the pins for the RTC domain; pull-ups keep them from floating
+    let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
     key_pin.rtcio_pullup(true);
     key_pin.rtcio_pulldown(false);
-
-    // GPIO4 KEY button is active low (button pulls to ground when pressed)
     let ext0 = Ext0WakeupSource::new(key_pin, WakeupLevel::Low);
 
-    // Small delay to let serial output flush
-    delay.delay_ms(100);
+    let mut irq_pin = unsafe { esp_hal::peripherals::GPIO21::steal() };
+    irq_pin.rtcio_pullup(true);
+    irq_pin.rtcio_pulldown(false);
+    let mut irq_pins: [&mut dyn esp_hal::gpio::RtcPin; 1] = [&mut irq_pin];
+    let ext1 = Ext1WakeupSource::new(&mut irq_pins, WakeupLevel::Low);
 
-    // Enter deep sleep (never returns - device reboots on wake)
-    rtc.sleep_deep(&[&timer, &ext0])
+    info!(
+        "Entering deep sleep for {} seconds (KEY or a charger change wakes early)...",
+        seconds
+    );
+    // Let serial output flush
+    delay.delay_ms(100);
+    rtc.sleep_deep(&[&timer, &ext0, &ext1])
+}
+
+/// Enable only the AXP2101 charger IRQs (VBUS insert/remove, charge start/done) and clear
+/// pending ones, so the IRQ line is high until the next charger change
+fn arm_charger_irq(i2c: &mut I2c<'_, esp_hal::Blocking>) {
+    const INTEN: [(u8, u8); 3] = [(0x40, 0x00), (0x41, 0xC0), (0x42, 0x18)];
+    const INTSTS: [u8; 3] = [0x48, 0x49, 0x4A];
+    for (reg, value) in INTEN {
+        let _ = i2c.write(AXP2101_ADDR, &[reg, value]);
+    }
+    for reg in INTSTS {
+        let _ = i2c.write(AXP2101_ADDR, &[reg, 0xFF]);
+    }
 }
 
 #[embassy_executor::task]
@@ -1655,7 +1745,7 @@ fn compose_screen<S: SpiDevice, D: DelayNs>(
     buf: &mut [u8],
     paths: &[&str],
     orientation: Orientation,
-    battery_percent: u8,
+    power: Power,
 ) -> bool {
     framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
     let drawn = paths
@@ -1663,13 +1753,13 @@ fn compose_screen<S: SpiDevice, D: DelayNs>(
         .enumerate()
         .all(|(slot, path)| draw_stored(cache, framebuffer, buf, path, orientation, slot as u8));
     if drawn {
-        draw_battery_icon(framebuffer, orientation, battery_percent);
+        draw_battery_icon(framebuffer, orientation, power);
     }
     drawn
 }
 
-/// Draw the battery icon: centered at the top in horizontal, top right in vertical
-fn draw_battery_icon(framebuffer: &mut Framebuffer, orientation: Orientation, percent: u8) {
+/// Battery icon position: centered at the top in horizontal, top right in vertical
+fn battery_origin(orientation: Orientation) -> (u16, u16) {
     let vertical = orientation == Orientation::Vertical;
     let (bat_w, _) = battery::battery_dimensions(vertical);
     let x = if vertical {
@@ -1677,7 +1767,31 @@ fn draw_battery_icon(framebuffer: &mut Framebuffer, orientation: Orientation, pe
     } else {
         (WIDTH as u16 - bat_w) / 2
     };
-    battery::draw_battery(framebuffer.as_mut_slice(), x, 8, percent, vertical);
+    (x, 8)
+}
+
+/// Draw the battery icon with its power symbol
+fn draw_battery_icon(framebuffer: &mut Framebuffer, orientation: Orientation, power: Power) {
+    let (x, y) = battery_origin(orientation);
+    battery::draw_battery(
+        framebuffer.as_mut_slice(),
+        x,
+        y,
+        power.percent,
+        orientation == Orientation::Vertical,
+        power.symbol,
+    );
+}
+
+/// Panel-aligned rect inside the battery body, covering the fill and bolt but no background
+fn battery_body_rect(orientation: Orientation) -> Rect {
+    let (x, y) = battery_origin(orientation);
+    match orientation {
+        // Body is 42x24 below the tip; x is cut to the 8-pixel window alignment
+        Orientation::Horizontal => Rect::new(x, y, 40, 24),
+        // Body is 24x42 below the 6px tip
+        Orientation::Vertical => Rect::new(x, y + 6, 24, 42),
+    }
 }
 
 /// TCP socket buffers for both sync connections, allocated in PSRAM and kept for the

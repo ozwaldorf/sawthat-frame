@@ -1,7 +1,6 @@
 //! Battery indicator for e-paper display
 //!
-//! Draws a battery icon with fill level and color based on percentage.
-//! Copies background from framebuffer for transparency.
+//! Draws a battery icon with fill level and color based on percentage, and a power symbol.
 
 use sawthat_render::OklabPalette;
 use sawthat_render::dither::floyd_steinberg;
@@ -83,13 +82,120 @@ fn draw_fill(
     }
 }
 
+/// Symbol drawn over the battery fill
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PowerSymbol {
+    None,
+    /// Charging from a charger
+    Bolt,
+    /// Connected to a computer
+    Usb,
+    /// Plugged in and fully charged
+    Full,
+}
+
+/// Symbols in screen orientation, '#' pixels drawn black with a white outline. Rasterized at
+/// 16px from the Phosphor `lightning` (fill), `usb` (bold) and `check` (bold) icons (MIT,
+/// phosphoricons.com); the bolt is turned 90 degrees clockwise to lie along the battery.
+const BOLT: [&str; 10] = [
+    "......##......",
+    ".....####.....",
+    ".....#####....",
+    "###########...",
+    ".###########..",
+    "..###########.",
+    "...###########",
+    "....#####.....",
+    ".....####.....",
+    "......##......",
+];
+const USB: [&str; 12] = [
+    ".......###......",
+    "....####.#......",
+    "...#####.#......",
+    "...##..###..#...",
+    "...##......####.",
+    "################",
+    "################",
+    "...##......####.",
+    "...##.####..#...",
+    "...#####.##.....",
+    "....####.##.....",
+    "......####......",
+];
+
+const CHECK: [&str; 9] = [
+    "...........##",
+    "..........##.",
+    ".........##..",
+    "........##...",
+    "#......##....",
+    "##....##.....",
+    ".##..##......",
+    "..####.......",
+    "...##........",
+];
+
+/// Draw a symbol bitmap centered on the battery body.
+///
+/// The bitmap is in screen orientation: horizontal screens are rotated 180 degrees in the
+/// framebuffer and vertical screens 90 degrees, so the symbol is mapped to match.
+fn draw_symbol<F>(fb: &mut [u8], set_pixel: &F, vertical: bool, bitmap: &[&str])
+where
+    F: Fn(&mut [u8], u16, u16, Color),
+{
+    let (w, h) = (bitmap[0].len() as i32, bitmap.len() as i32);
+    let lit = |x: i32, y: i32| {
+        (0..w).contains(&x)
+            && (0..h).contains(&y)
+            && bitmap[y as usize].as_bytes()[x as usize] == b'#'
+    };
+    // Body center in icon coordinates
+    let (cx, cy) = if vertical {
+        (BATTERY_WIDTH_V as i32 / 2, 6 + 42 / 2)
+    } else {
+        (42 / 2, BATTERY_HEIGHT_H as i32 / 2)
+    };
+    // Map a bitmap pixel to icon coordinates
+    let to_icon = |x: i32, y: i32| -> (u16, u16) {
+        let (dx, dy) = if vertical {
+            (y - h / 2, (w - 1 - x) - w / 2)
+        } else {
+            ((w - 1 - x) - w / 2, (h - 1 - y) - h / 2)
+        };
+        ((cx + dx) as u16, (cy + dy) as u16)
+    };
+
+    for y in -1..=h {
+        for x in -1..=w {
+            let color = if lit(x, y) {
+                Color::Black
+            } else if (-1..=1).any(|dy| (-1..=1).any(|dx| lit(x + dx, y + dy))) {
+                Color::White
+            } else {
+                continue;
+            };
+            let (ix, iy) = to_icon(x, y);
+            set_pixel(fb, ix, iy, color);
+        }
+    }
+}
+
 /// Draw battery icon directly into framebuffer
 ///
 /// - `framebuffer`: The main display framebuffer to draw into
 /// - `fb_x`, `fb_y`: Position in framebuffer where icon will be drawn
 /// - `percentage`: Battery level 0-100
 /// - `vertical`: If true, draw vertical battery (tip on top), else horizontal (tip on right)
-pub fn draw_battery(framebuffer: &mut [u8], fb_x: u16, fb_y: u16, percentage: u8, vertical: bool) {
+/// - `symbol`: Power symbol drawn over the fill
+pub fn draw_battery(
+    framebuffer: &mut [u8],
+    fb_x: u16,
+    fb_y: u16,
+    percentage: u8,
+    vertical: bool,
+    symbol: PowerSymbol,
+) {
     let orange = orange(percentage);
     let (buf_width, buf_height) = battery_dimensions(vertical);
 
@@ -129,6 +235,13 @@ pub fn draw_battery(framebuffer: &mut [u8], fb_x: u16, fb_y: u16, percentage: u8
             percentage,
             orange,
         );
+    }
+
+    match symbol {
+        PowerSymbol::None => {}
+        PowerSymbol::Bolt => draw_symbol(framebuffer, &set_pixel, vertical, &BOLT),
+        PowerSymbol::Usb => draw_symbol(framebuffer, &set_pixel, vertical, &USB),
+        PowerSymbol::Full => draw_symbol(framebuffer, &set_pixel, vertical, &CHECK),
     }
 }
 
@@ -274,184 +387,9 @@ fn draw_battery_horizontal<F>(
     );
 }
 
-/// Draw battery icon into a buffer, copying background from framebuffer
-///
-/// - `framebuffer`: The main display framebuffer to copy background from
-/// - `fb_x`, `fb_y`: Position in framebuffer where icon will be drawn
-/// - `percentage`: Battery level 0-100
-/// - `vertical`: If true, draw vertical battery (tip on top), else horizontal (tip on right)
-///
-/// Returns a buffer suitable for partial update at the battery location.
-pub fn draw_battery_icon(
-    framebuffer: &[u8],
-    fb_x: u16,
-    fb_y: u16,
-    percentage: u8,
-    vertical: bool,
-) -> [u8; BATTERY_BUFFER_SIZE] {
-    let mut buffer = [0u8; BATTERY_BUFFER_SIZE];
-
-    let (buf_width, buf_height) = battery_dimensions(vertical);
-
-    // Copy background from framebuffer
-    let fb_row_bytes = WIDTH as usize / 2;
-    for y in 0..buf_height {
-        let src_row = (fb_y + y) as usize;
-        let src_byte_start = src_row * fb_row_bytes + (fb_x as usize / 2);
-        let dst_byte_start = y as usize * (buf_width as usize / 2);
-
-        for x_byte in 0..(buf_width as usize / 2) {
-            let src_idx = src_byte_start + x_byte;
-            let dst_idx = dst_byte_start + x_byte;
-            if src_idx < framebuffer.len() && dst_idx < buffer.len() {
-                buffer[dst_idx] = framebuffer[src_idx];
-            }
-        }
-    }
-
-    // Helper to set a pixel in the buffer
-    let set_pixel = |buf: &mut [u8], x: u16, y: u16, color: Color| {
-        if x >= buf_width || y >= buf_height {
-            return;
-        }
-        let byte_idx = (y as usize * (buf_width as usize / 2)) + (x as usize / 2);
-        let is_high_nibble = x.is_multiple_of(2);
-        if is_high_nibble {
-            buf[byte_idx] = (buf[byte_idx] & 0x0F) | (color.to_4bit() << 4);
-        } else {
-            buf[byte_idx] = (buf[byte_idx] & 0xF0) | color.to_4bit();
-        }
-    };
-
-    if vertical {
-        // Vertical battery: tip on top, fill goes bottom to top
-        let body_width: u16 = BATTERY_WIDTH_V;
-        let body_height: u16 = 42;
-        let body_y_start: u16 = 6; // Leave room for tip at top
-
-        // Draw main body outline (2px border) and white interior
-        for x in 0..body_width {
-            for y in body_y_start..(body_y_start + body_height) {
-                let is_border = y < body_y_start + 2
-                    || y >= body_y_start + body_height - 2
-                    || x < 2
-                    || x >= body_width - 2;
-                set_pixel(
-                    &mut buffer,
-                    x,
-                    y,
-                    if is_border {
-                        Color::Black
-                    } else {
-                        Color::White
-                    },
-                );
-            }
-        }
-
-        // Draw battery tip (positive terminal) on top
-        let tip_width: u16 = 12;
-        let tip_height: u16 = 6;
-        let tip_x_start = (body_width - tip_width) / 2;
-
-        for x in tip_x_start..(tip_x_start + tip_width) {
-            for y in 0..tip_height {
-                let is_border = x < tip_x_start + 2 || x >= tip_x_start + tip_width - 2 || y < 2;
-                set_pixel(
-                    &mut buffer,
-                    x,
-                    y,
-                    if is_border {
-                        Color::Black
-                    } else {
-                        Color::White
-                    },
-                );
-            }
-        }
-
-        // Fill area (fills from bottom to top)
-        let fill_x_start: u16 = 4;
-        let fill_width: u16 = body_width - 8;
-        let fill_max_height: u16 = body_height - 8;
-        let fill_y_end: u16 = body_y_start + body_height - 4;
-        let fill_height = ((fill_max_height as u32 * percentage.min(100) as u32) / 100) as u16;
-        let fill_y_start = fill_y_end - fill_height;
-
-        draw_fill(
-            percentage,
-            orange(percentage),
-            (fill_x_start, fill_y_start, fill_width, fill_height),
-            |x, y, c| set_pixel(&mut buffer, x, y, c),
-        );
-    } else {
-        // Horizontal battery: tip on right, fill goes left to right
-        let body_width: u16 = 42;
-        let body_height: u16 = BATTERY_HEIGHT_H;
-
-        // Draw main body outline (2px border) and white interior
-        for x in 0..body_width {
-            for y in 0..body_height {
-                let is_border = y < 2 || y >= body_height - 2 || x < 2 || x >= body_width - 2;
-                set_pixel(
-                    &mut buffer,
-                    x,
-                    y,
-                    if is_border {
-                        Color::Black
-                    } else {
-                        Color::White
-                    },
-                );
-            }
-        }
-
-        // Draw battery tip (positive terminal) on right
-        let tip_x = body_width;
-        let tip_width: u16 = 6;
-        let tip_height: u16 = 12;
-        let tip_y_start = (body_height - tip_height) / 2;
-
-        for x in tip_x..(tip_x + tip_width) {
-            for y in tip_y_start..(tip_y_start + tip_height) {
-                let is_border = y < tip_y_start + 2
-                    || y >= tip_y_start + tip_height - 2
-                    || x >= tip_x + tip_width - 2;
-                set_pixel(
-                    &mut buffer,
-                    x,
-                    y,
-                    if is_border {
-                        Color::Black
-                    } else {
-                        Color::White
-                    },
-                );
-            }
-        }
-
-        // Fill area (fills from left to right)
-        let fill_x_start: u16 = 4;
-        let fill_y_start: u16 = 4;
-        let fill_max_width: u16 = body_width - 8;
-        let fill_height: u16 = body_height - 8;
-        let fill_width = ((fill_max_width as u32 * percentage.min(100) as u32) / 100) as u16;
-
-        draw_fill(
-            percentage,
-            orange(percentage),
-            (fill_x_start, fill_y_start, fill_width, fill_height),
-            |x, y, c| set_pixel(&mut buffer, x, y, c),
-        );
-    }
-
-    buffer
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::epd::BUFFER_SIZE;
 
     fn fill(percentage: u8) -> [usize; 8] {
         let mut counts = [0; 8];
@@ -470,19 +408,5 @@ mod tests {
         let orange = fill(30);
         assert!(orange[Color::Red as usize] > orange[Color::Yellow as usize]);
         assert!(orange[Color::Yellow as usize] > 100);
-    }
-
-    #[test]
-    fn test_buffer_size_vertical() {
-        let fb = [Color::White.to_dual_pixel(); BUFFER_SIZE];
-        let buffer = draw_battery_icon(&fb, 0, 0, 50, true);
-        assert_eq!(buffer.len(), BATTERY_BUFFER_SIZE);
-    }
-
-    #[test]
-    fn test_buffer_size_horizontal() {
-        let fb = [Color::White.to_dual_pixel(); BUFFER_SIZE];
-        let buffer = draw_battery_icon(&fb, 0, 0, 50, false);
-        assert_eq!(buffer.len(), BATTERY_BUFFER_SIZE);
     }
 }
