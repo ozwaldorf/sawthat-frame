@@ -346,13 +346,9 @@ fn flash_green(count: u8) {
     LED_SIGNAL.signal(LedCommand::GreenFlash(count));
 }
 
-/// Signal to wake button monitor task
-static BUTTON_MONITOR_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-
-/// Start button monitoring (signals the persistent task)
+/// Start acting on button presses
 fn start_button_monitor() {
     BUTTON_STATE.store(BUTTON_POLLING, Ordering::Relaxed);
-    BUTTON_MONITOR_SIGNAL.signal(());
 }
 
 /// Whether a tap or hold is waiting to be handled
@@ -363,65 +359,47 @@ fn button_pending() -> bool {
     )
 }
 
-/// Button monitor task - persistent task that monitors button when signaled
-/// Waits for signal when inactive (no polling), monitors button when active
+/// Button monitor task: classifies each press as a tap or hold while monitoring is active.
+/// One tap is queued at a time; a hold replaces a queued tap.
+///
+/// Presses are detected from pin edges (interrupt driven), so a tap is not missed while the
+/// main core is busy with a sync.
 #[embassy_executor::task]
-async fn button_monitor_task(key_input: &'static Input<'static>) {
+async fn button_monitor_task(key_input: &'static mut Input<'static>) {
     loop {
-        // Wait for signal to start monitoring (no polling when inactive)
-        BUTTON_MONITOR_SIGNAL.wait().await;
+        key_input.wait_for_falling_edge().await;
+        // A hold may replace a queued tap; a tap needs nothing queued
+        if !matches!(
+            BUTTON_STATE.load(Ordering::Relaxed),
+            BUTTON_POLLING | BUTTON_NEXT
+        ) {
+            continue;
+        }
 
-        // Monitor button until state changes from BUTTON_POLLING
-        while BUTTON_STATE.load(Ordering::Relaxed) == BUTTON_POLLING {
-            // Check if button is pressed
-            if key_input.is_low() {
-                let mut hold_time: u32 = 0;
-
-                // Button hold check
-                while key_input.is_low() {
-                    if hold_time >= HOLD_THRESHOLD_MS {
-                        // Button was held past the threshold, set the action state
-                        if BUTTON_STATE
-                            .compare_exchange(
-                                BUTTON_POLLING,
-                                BUTTON_FLIP,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            )
-                            .is_ok()
-                        {
-                            // Request 3 flashes for flip
-                            flash_green(3);
-                        }
-                        break;
-                    }
-
-                    hold_time += BUTTON_POLL_MS as u32;
-                    Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
-                }
-
-                // If we detected a hold, go back to waiting
-                if BUTTON_STATE.load(Ordering::Relaxed) != BUTTON_POLLING {
-                    break;
-                }
-
-                // Otherwise, tap detected, set the action state
-                if BUTTON_STATE
-                    .compare_exchange(
-                        BUTTON_POLLING,
-                        BUTTON_NEXT,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    // Request 1 flash for next
-                    flash_green(1);
-                }
-                break;
-            }
-
-            Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+        let held = with_timeout(
+            Duration::from_millis(HOLD_THRESHOLD_MS as u64),
+            key_input.wait_for_high(),
+        )
+        .await
+        .is_err();
+        let accepted = if held {
+            BUTTON_STATE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                    matches!(state, BUTTON_POLLING | BUTTON_NEXT).then_some(BUTTON_FLIP)
+                })
+                .is_ok()
+        } else {
+            BUTTON_STATE
+                .compare_exchange(
+                    BUTTON_POLLING,
+                    BUTTON_NEXT,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        };
+        if accepted {
+            flash_green(if held { 3 } else { 1 });
         }
     }
 }
@@ -486,12 +464,6 @@ async fn main(spawner: Spawner) -> ! {
     let led_green: &'static mut Output<'static> = mk_static!(Output<'static>, led_green);
     spawner.spawn(led_task(led_red, led_green)).ok();
 
-    // Make key_input static for use in button monitor task
-    let key_input: &'static Input<'static> = mk_static!(Input<'static>, key_input);
-
-    // Spawn persistent button monitor task (waits on signal when inactive)
-    spawner.spawn(button_monitor_task(key_input)).ok();
-
     // Check sleep state to get current orientation
     let (resuming, mut orientation) = unsafe {
         let state = &raw const SLEEP_STATE;
@@ -531,9 +503,18 @@ async fn main(spawner: Spawner) -> ! {
         }
     }
 
+    // Persistent button monitor; acts only while monitoring is started
+    spawner
+        .spawn(button_monitor_task(mk_static!(Input<'static>, key_input)))
+        .ok();
+
     // ==================== Normal Boot Sequence ====================
     // Now do the heavier initialization
-    info!("Boot! Wake reason: {:?}", wake_reason);
+    info!(
+        "Boot! Wake reason: {:?}, reset reason: {:?}",
+        wake_reason,
+        esp_hal::system::reset_reason()
+    );
 
     let mut delay = Delay;
     let cold_boot = !matches!(
@@ -966,6 +947,11 @@ async fn main(spawner: Spawner) -> ! {
                                     }
                                     epd.display_start(framebuffer.as_slice(), &mut delay).is_ok()
                                 };
+                                if from_items && !started {
+                                    // Skip a cached screen that could not be shown, so a
+                                    // waiting tap tries the next one
+                                    advance_full!();
+                                }
                                 if started {
                                     if from_items {
                                         advance_full!();
@@ -1034,6 +1020,7 @@ async fn main(spawner: Spawner) -> ! {
                                     }
                                     show_next!();
                                 } else if state == BUTTON_NEXT && !epd.is_busy() && show_next!() {
+                                    info!("Tap during sync: showing the next screen");
                                 } else if let Some(p) = progress.as_mut()
                                     && !epd.is_busy()
                                     && let Some((rect, region)) =
