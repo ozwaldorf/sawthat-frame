@@ -612,6 +612,7 @@ async fn main(spawner: Spawner) -> ! {
             if let Err(e) = cache.init() {
                 info!("SD cache init error: {:?}", e);
             }
+            cache.detect_font(&FONT_FILES);
             Some(cache)
         }
         Err(e) => {

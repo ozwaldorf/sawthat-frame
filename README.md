@@ -84,8 +84,8 @@ SAWTHAT_USER_ID=your-sawthat-user-id
 Lines are `KEY=VALUE`; blank lines and lines starting with `#` are ignored.
 
 To use a custom font for the concert text instead of IBM Plex Mono Bold, put `FONT.TTF` or
-`FONT.OTF` in the SD card root. An invalid font falls back to the built-in one. A new font only
-applies to artwork rendered after the change.
+`FONT.OTF` in the SD card root. An invalid font falls back to the built-in one. Adding,
+replacing or removing the font renders all artwork again on the next sync.
 
 If the card or `CONFIG.TXT` is missing, or a value is invalid, the frame shows a setup screen
 describing the problem. A missing `CONFIG.TXT` is replaced with the template. The next boot
@@ -199,9 +199,10 @@ If SawThat is unreachable, the last successful response stored on the SD card is
 ```
 
 Item paths are `YYYY-MM-DD-{band-id}`. Image filenames are 8-character hex hashes of the item
-path (FAT 8.3 compatible). Images are stored as a 4-byte header (width, height) followed by
-4-bit palette indices. Files for concerts that are no longer listed are removed after each
-sync.
+path and, with an SD card font, the font file's name, size and modification time (FAT 8.3
+compatible), so a font change makes every image stale. Images are stored as a 4-byte header
+(width, height) followed by 4-bit palette indices. Files for concerts that are no longer listed,
+or rendered with another font, are removed after each sync.
 
 ## Specifications
 

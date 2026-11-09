@@ -76,17 +76,28 @@ pub enum CacheError {
     Read,
 }
 
-/// Generate cache filename for an image
-/// Format: 8-char hash + .IMG (FAT 8.3 compatible)
-/// Uses djb2 hash of the path to create a short unique filename
-fn cache_filename(path: &str) -> String<16> {
-    // djb2 hash
-    let mut hash: u32 = 5381;
-    for byte in path.as_bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(*byte as u32);
+/// djb2 hash of `bytes`, continuing from `hash`
+fn djb2(hash: u32, bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .fold(hash, |h, &b| h.wrapping_mul(33).wrapping_add(b as u32))
+}
+
+/// Image identity: the item path, and the font it is rendered with (0 for the embedded font,
+/// which keeps the hash of the path alone)
+fn image_hash(path: &str, font_id: u32) -> u32 {
+    let hash = djb2(5381, path.as_bytes());
+    if font_id == 0 {
+        hash
+    } else {
+        djb2(hash, &font_id.to_le_bytes())
     }
+}
+
+/// Cache filename for an image: 8-char hash + .IMG (FAT 8.3 compatible)
+fn cache_filename(path: &str, font_id: u32) -> String<16> {
     let mut name: String<16> = String::new();
-    let _ = write!(name, "{:08X}.IMG", hash);
+    let _ = write!(name, "{:08X}.IMG", image_hash(path, font_id));
     name
 }
 
@@ -96,15 +107,6 @@ fn orientation_dir(orientation: Orientation) -> &'static str {
         Orientation::Horizontal => HORIZ_DIR,
         Orientation::Vertical => VERT_DIR,
     }
-}
-
-/// Compute hash for a path (same algorithm as cache_filename)
-fn path_hash(path: &str) -> u32 {
-    let mut hash: u32 = 5381;
-    for byte in path.as_bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(*byte as u32);
-    }
-    hash
 }
 
 /// Parse cache filename to extract hash value
@@ -143,6 +145,9 @@ where
 /// SD card image cache
 pub struct SdCache<SPI: SpiDevice, DELAY: embedded_hal::delay::DelayNs> {
     volume_mgr: VolumeManager<SdCard<SPI, DELAY>, DummyTimesource>,
+    /// Identity of the font artwork is rendered with, mixed into image filenames (see
+    /// [`SdCache::detect_font`])
+    font_id: u32,
 }
 
 impl<SPI, DELAY> SdCache<SPI, DELAY>
@@ -165,7 +170,10 @@ where
 
         let volume_mgr = VolumeManager::new(sd_card, DummyTimesource);
 
-        Ok(Self { volume_mgr })
+        Ok(Self {
+            volume_mgr,
+            font_id: 0,
+        })
     }
 
     /// Initialize cache directory structure: /concerts/horiz/ and /concerts/vert/
@@ -214,7 +222,7 @@ where
 
     /// Check if an image is cached
     pub fn has_image(&mut self, path: &str, orientation: Orientation) -> bool {
-        let filename = cache_filename(path);
+        let filename = cache_filename(path, self.font_id);
 
         let Ok(mut volume) = self.volume_mgr.open_volume(VolumeIdx(0)) else {
             return false;
@@ -245,7 +253,7 @@ where
         orientation: Orientation,
         buf: &mut [u8],
     ) -> Result<usize, CacheError> {
-        let filename = cache_filename(path);
+        let filename = cache_filename(path, self.font_id);
         let orient = orientation_dir(orientation);
 
         let mut volume = self
@@ -297,7 +305,7 @@ where
             .open_dir(orientation_dir(orientation))
             .map_err(|_| CacheError::Filesystem)?;
         orient_dir
-            .delete_file_in_dir(cache_filename(path).as_str())
+            .delete_file_in_dir(cache_filename(path, self.font_id).as_str())
             .map_err(|_| CacheError::NotFound)
     }
 
@@ -308,7 +316,7 @@ where
         orientation: Orientation,
         data: &[u8],
     ) -> Result<(), CacheError> {
-        let filename = cache_filename(path);
+        let filename = cache_filename(path, self.font_id);
         let orient = orientation_dir(orientation);
 
         let mut volume = self
@@ -445,6 +453,36 @@ where
         Some(buf)
     }
 
+    /// Identify the font images are rendered with: the first of `names` on the SD root, by
+    /// name, size and modification time, or the embedded font without one. Changing the font
+    /// changes every image filename, so all artwork is rendered again.
+    pub fn detect_font(&mut self, names: &[&str]) {
+        let found = (|| {
+            let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
+            let mut root_dir = volume.open_root_dir().ok()?;
+            names.iter().find_map(|&name| {
+                let entry = root_dir.find_directory_entry(name).ok()?;
+                let t = entry.mtime;
+                let stamp = [
+                    t.year_since_1970,
+                    t.zero_indexed_month,
+                    t.zero_indexed_day,
+                    t.hours,
+                    t.minutes,
+                    t.seconds,
+                ];
+                let id = djb2(djb2(5381, name.as_bytes()), &entry.size.to_le_bytes());
+                Some((name, djb2(id, &stamp)))
+            })
+        })();
+        // 0 is reserved for the embedded font
+        self.font_id = found.map_or(0, |(_, id)| id.max(1));
+        match found {
+            Some((name, id)) => info!("Artwork font: {} ({:08X})", name, id),
+            None => info!("Artwork font: embedded"),
+        }
+    }
+
     /// Release the SD card for raw block access
     pub fn into_card(self) -> SdCard<SPI, DELAY> {
         self.volume_mgr.free().0
@@ -516,7 +554,7 @@ where
         // Pre-compute hashes of valid items
         let mut valid_hashes: heapless::Vec<u32, 128> = heapless::Vec::new();
         for item in valid_items.iter() {
-            let _ = valid_hashes.push(path_hash(item.as_str()));
+            let _ = valid_hashes.push(image_hash(item.as_str(), self.font_id));
         }
 
         let mut volume = self
