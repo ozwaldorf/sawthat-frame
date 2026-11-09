@@ -3,7 +3,10 @@
 //! Environment variables required:
 //! - WIFI_SSID: WiFi network name
 //! - WIFI_PASS: WiFi password
-//! - SERVER_URL: Edge service URL (e.g., http://192.168.1.100:7676)
+//!
+//! Optional:
+//! - SAWTHAT_USER_ID: SawThat user whose concerts are shown
+//! - SAWTHAT_FONT (render crate): font file for artwork text
 
 #![no_std]
 #![no_main]
@@ -11,6 +14,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::time::Duration as CoreDuration;
 use log::info;
@@ -22,8 +26,9 @@ use embassy_net::{
     tcp::client::{TcpClient, TcpClientState},
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{Delay, Duration, Timer, with_timeout};
 use embedded_hal::delay::DelayNs;
+use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -51,10 +56,13 @@ use esp_radio::{
 use sawthat_frame_firmware::TimestampLogger;
 use sawthat_frame_firmware::battery;
 use sawthat_frame_firmware::cache::SdCache;
-use sawthat_frame_firmware::display::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
+use sawthat_frame_firmware::display;
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
+use sawthat_frame_firmware::progress;
+use sawthat_frame_firmware::sync::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::widget::{Orientation, WidgetData};
+use sawthat_render::Renderer;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -71,7 +79,21 @@ macro_rules! mk_static {
 // Environment configuration
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASS");
-const SERVER_URL: &str = env!("SERVER_URL");
+/// SawThat user whose concerts are shown
+const SAWTHAT_USER_ID: &str = match option_env!("SAWTHAT_USER_ID") {
+    Some(id) => id,
+    None => "a320940a-b493-4515-9f25-d393ebb540e6",
+};
+
+/// Maximum time to connect to WiFi and obtain an IP
+const WIFI_TIMEOUT: Duration = Duration::from_secs(60);
+/// TCP socket buffer sizes
+const TCP_RX_SIZE: usize = 8192;
+const TCP_TX_SIZE: usize = 1024;
+/// Largest stored image (vertical 480x800 at 4bpp plus header)
+const IMAGE_BUF_SIZE: usize = 480 * 800 / 2 + sawthat_render::IMAGE_HEADER;
+/// Half-screen partial update buffer (400x480 at 4bpp)
+const HALF_BUFFER_SIZE: usize = 400 * 480 / 2;
 
 /// Refresh interval between display updates (15 minutes)
 const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
@@ -363,12 +385,11 @@ async fn main(spawner: Spawner) -> ! {
     let wake_reason = esp_hal::rtc_cntl::wakeup_cause();
     let button_wake = matches!(wake_reason, esp_hal::system::SleepSource::Ext0);
 
-    // Initialize internal RAM heap (for smaller allocations)
+    // PSRAM is registered first so general allocations land there, leaving internal RAM
+    // for allocations that request it explicitly (WiFi buffers, RTOS task stacks)
+    esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 36 * 1024);
-
-    // Initialize PSRAM for large allocations (framebuffer, PNG buffer)
-    esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
 
     // RTOS provides the embassy time driver, so it must start before any Timer is awaited
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -443,10 +464,14 @@ async fn main(spawner: Spawner) -> ! {
     info!("Boot! Wake reason: {:?}", wake_reason);
 
     let mut delay = Delay;
+    let cold_boot = !matches!(
+        wake_reason,
+        esp_hal::system::SleepSource::Timer | esp_hal::system::SleepSource::Ext0
+    );
 
-    // ==================== SD Card Cache Initialization ====================
+    // ==================== SD Card Initialization ====================
     // SD card SPI pins: CS=GPIO38, CLK=GPIO39, MISO=GPIO40, MOSI=GPIO41
-    info!("Initializing SD card cache...");
+    info!("Initializing SD card...");
 
     let sd_spi = Spi::new(
         peripherals.SPI2,
@@ -470,22 +495,10 @@ async fn main(spawner: Spawner) -> ! {
             Some(cache)
         }
         Err(e) => {
-            info!("SD card init failed: {:?} (cache disabled)", e);
+            info!("SD card init failed: {:?} (artwork storage unavailable)", e);
             None
         }
     };
-
-    // Try to load widget data from cache (for cache-first boot)
-    let cached_items = sd_cache.as_mut().and_then(|c| c.load_widget_data());
-    let has_cached_data = cached_items.is_some();
-    info!(
-        "Cached widget data: {}",
-        if has_cached_data {
-            "found"
-        } else {
-            "not found"
-        }
-    );
 
     // Handle orientation persistence
     if BUTTON_STATE.load(Ordering::Relaxed) == BUTTON_FLIP {
@@ -583,12 +596,10 @@ async fn main(spawner: Spawner) -> ! {
     info!("EPD initialized!");
 
     // ==================== WiFi Setup (Deferred) ====================
-    // Keep WiFi peripheral for lazy initialization - saves ~500-1000ms on cached boots
+    // WiFi is only initialized when a sync is needed
     let mut wifi_peripheral: Option<esp_hal::peripherals::WIFI<'static>> = Some(peripherals.WIFI);
 
-    // WiFi state - will be initialized on first network access
-    // Note: _esp_radio_ctrl is a reference because it's stored in static memory
-    // It's kept alive to ensure the radio stays initialized
+    // Kept alive so the radio stays initialized
     let mut _esp_radio_ctrl: Option<&'static Controller<'static>> = None;
     let mut wifi_controller: Option<WifiController<'static>> = None;
     let mut wifi_connected = false;
@@ -596,46 +607,42 @@ async fn main(spawner: Spawner) -> ! {
     // ==================== RTC for Deep Sleep ====================
     let mut rtc = Rtc::new(peripherals.LPWR);
 
-    // ==================== Main Display Logic ====================
-    info!("Starting display update...");
-    info!("Server URL: {}", SERVER_URL);
     info!("Refresh interval: {} seconds", REFRESH_INTERVAL_SECS);
 
-    // Allocate framebuffer (uses PSRAM for the 192KB buffer)
-    info!("Allocating framebuffer...");
+    // Framebuffer (192KB, PSRAM)
     let mut framebuffer = Framebuffer::new();
-    info!("Framebuffer allocated!");
 
-    // Use RNG for shuffle seed
+    // Buffers for stored artwork and partial updates (PSRAM)
+    let mut image_buf: Box<[u8; IMAGE_BUF_SIZE]> = Box::new([0u8; IMAGE_BUF_SIZE]);
+    let mut half_buffer: Box<[u8; HALF_BUFFER_SIZE]> = Box::new([0u8; HALF_BUFFER_SIZE]);
+
     let rng = Rng::new();
 
-    // Allocate TLS buffers for HTTPS support (on heap to save stack)
+    // TLS buffers for HTTPS
     let mut tls_read_buf: Box<[u8; TLS_READ_BUF_SIZE]> = Box::new([0u8; TLS_READ_BUF_SIZE]);
     let mut tls_write_buf: Box<[u8; TLS_WRITE_BUF_SIZE]> = Box::new([0u8; TLS_WRITE_BUF_SIZE]);
 
-    // TCP client and DNS socket - created lazily after WiFi init
-    let mut tcp_client: Option<TcpClient<'static, 1, 1024, 1024>> = None;
+    // Network resources - created on first WiFi init
+    let mut tcp_client: Option<TcpClient<'static, 1, TCP_RX_SIZE, TCP_TX_SIZE>> = None;
     let mut dns_socket: Option<DnsSocket<'static>> = None;
-
-    // Network stack - created lazily on first WiFi init
     let mut net_stack: Option<Stack<'static>> = None;
 
-    // Helper macro to ensure WiFi is initialized (once) and connected
+    // Initialize WiFi (once) and connect, evaluating to whether it is connected
     macro_rules! ensure_wifi {
         () => {{
             if !wifi_connected {
                 if wifi_controller.is_none() {
-                    info!("Initializing WiFi (deferred)...");
-                    start_fast_blink(); // Visual feedback during slow init
+                    info!("Initializing WiFi...");
+                    start_fast_blink();
 
-                    // Initialize esp-radio (this is the slow part ~500-1000ms)
                     let ctrl = esp_radio::init().unwrap();
                     let ctrl = mk_static!(Controller<'static>, ctrl);
 
-                    // Create WiFi controller and interfaces
                     let wifi = wifi_peripheral.take().unwrap();
+                    // AMPDU RX bursts were dropped by the driver, stalling large downloads
+                    let wifi_config = WifiConfig::default().with_ampdu_rx_enable(false);
                     let (wifi_ctrl, ifaces) =
-                        esp_radio::wifi::new(ctrl, wifi, WifiConfig::default()).unwrap();
+                        esp_radio::wifi::new(ctrl, wifi, wifi_config).unwrap();
 
                     let (stk, runner) = embassy_net::new(
                         ifaces.sta,
@@ -645,8 +652,10 @@ async fn main(spawner: Spawner) -> ! {
                     );
                     spawner.spawn(net_task(runner)).ok();
 
-                    let tcp_state =
-                        mk_static!(TcpClientState<1, 1024, 1024>, TcpClientState::new());
+                    let tcp_state = mk_static!(
+                        TcpClientState<1, TCP_RX_SIZE, TCP_TX_SIZE>,
+                        TcpClientState::new()
+                    );
                     tcp_client = Some(TcpClient::new(stk, tcp_state));
                     dns_socket = Some(DnsSocket::new(stk));
                     net_stack = Some(stk);
@@ -654,680 +663,687 @@ async fn main(spawner: Spawner) -> ! {
                     wifi_controller = Some(wifi_ctrl);
                 }
 
-                // Connect, or reconnect after a disconnect during a display refresh
-                wifi_connect(wifi_controller.as_mut().unwrap()).await;
-                wait_for_ip(net_stack.unwrap()).await;
-                wifi_connected = true;
-                info!("WiFi ready!");
+                let stack = net_stack.unwrap();
+                let ctrl = wifi_controller.as_mut().unwrap();
+                wifi_connected = with_timeout(WIFI_TIMEOUT, async {
+                    wifi_connect(ctrl).await;
+                    wait_for_ip(stack).await;
+                })
+                .await
+                .is_ok();
+
+                if wifi_connected {
+                    info!("WiFi ready!");
+                } else {
+                    info!("WiFi connection timed out");
+                    wifi_disconnect(ctrl).await;
+                }
             }
+            wifi_connected
         }};
     }
 
-    // Fetch widget data (use cache if available, then refresh from network)
-    // Keep boxed to avoid 6KB on stack
-    info!("Fetching widget data...");
-    let mut items: Box<WidgetData> = if let Some(cached) = cached_items {
-        info!("Using cached widget data ({} items)", cached.len());
-        Box::new(cached)
-    } else {
-        // No cache - must fetch from network
-        ensure_wifi!();
+    // ==================== Item List ====================
+    let mut items: Box<WidgetData> = Box::new(
+        sd_cache
+            .as_mut()
+            .and_then(|c| c.load_widget_data(orientation))
+            .unwrap_or_default(),
+    );
+    info!("{} stored items for {:?}", items.len(), orientation);
+
+    {
+        // Get saved state if resuming
+        let (mut shuffle_seed, saved_index, saved_next_slot, saved_slot_items) = if resuming {
+            unsafe {
+                let state = &raw const SLEEP_STATE;
+                (
+                    (*state).shuffle_seed,
+                    (*state).index,
+                    (*state).get_next_slot(),
+                    (*state).get_slot_items(),
+                )
+            }
+        } else {
+            let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+            (seed, 0, 0u8, [0usize, 0usize])
+        };
+
+        // Shuffle items (same seed = same order)
+        display::shuffle_items(&mut items, shuffle_seed);
+
+        // Check if data matches (after shuffling, so items are in the same order)
+        let (data_matches, saved_orientation) = if resuming {
+            unsafe {
+                let state = &raw const SLEEP_STATE;
+                ((*state).matches_data(&items), (*state).get_orientation())
+            }
+        } else {
+            (false, Orientation::Horizontal)
+        };
+
+        // Sync on power-on, and whenever there is nothing to show
+        let mut need_sync = cold_boot || items.is_empty();
+
+        let can_partial = data_matches
+            && !need_sync
+            && orientation == Orientation::Horizontal
+            && saved_orientation == Orientation::Horizontal
+            && saved_index >= 2;
+
+        let (mut index, mut next_slot, mut slot_items, mut use_partial) = if can_partial {
+            info!(
+                "Resuming with partial update: slot={}, slot_items=[{}, {}], index={}",
+                saved_next_slot, saved_slot_items[0], saved_slot_items[1], saved_index
+            );
+            (saved_index, saved_next_slot, saved_slot_items, true)
+        } else if data_matches {
+            info!("Resuming from index {} (full refresh)", saved_index);
+            (saved_index, 0u8, [0usize, 0usize], false)
+        } else {
+            info!("Fresh start or data changed");
+            (0, 0u8, [0usize, 0usize], false)
+        };
+
+        let mut failures = 0usize;
+
+        // Track the items shown by a full refresh starting at `index`
+        macro_rules! advance_full {
+            () => {{
+                if orientation == Orientation::Horizontal {
+                    slot_items = [index % items.len(), (index + 1) % items.len()];
+                    next_slot = 0;
+                    index += 2;
+                    use_partial = true;
+                } else {
+                    index += 1;
+                }
+            }};
+        }
+
+        // Sync cycle: show the next cached screen (with the progress dialog when there is
+        // work), render missing artwork for the current orientation while the panel
+        // refreshes, show the first rendered screen if nothing was cached, then erase the
+        // dialog. Evaluates to whether a refresh was started.
+        macro_rules! sync_cycle {
+            ($battery:expr) => {{
+                let per_screen = screen_items(orientation);
+                let mut shown = false;
+                let mut synced: Option<Box<WidgetData>> = None;
+
+                // Compose the next cached screen now; it is shown once the work is known
+                let cached: Vec<&str> = (0..per_screen.min(items.len()))
+                    .map(|slot| items[(index + slot) % items.len()].as_str())
+                    .collect();
+                let cached_ready = !cached.is_empty()
+                    && sd_cache.as_mut().is_some_and(|c| {
+                        compose_screen(
+                            c,
+                            &mut framebuffer,
+                            &mut *image_buf,
+                            &cached,
+                            orientation,
+                            $battery,
+                        )
+                    });
+
+                if let Some(cache) = sd_cache.as_mut()
+                    && ensure_wifi!()
+                {
+                    start_blink();
+                    let mut net = sync::Net {
+                        tcp: tcp_client.as_ref().unwrap(),
+                        dns: dns_socket.as_ref().unwrap(),
+                        tls_read: &mut *tls_read_buf,
+                        tls_write: &mut *tls_write_buf,
+                    };
+
+                    let concerts = match sync::fetch_bands(&mut net, SAWTHAT_USER_ID)
+                        .await
+                        .ok()
+                        .and_then(|json| Some((sync::parse_concerts(&json)?, json)))
+                    {
+                        Some((concerts, json)) => {
+                            if let Err(e) = cache.store_bands(&json) {
+                                info!("Failed to store band data: {:?}", e);
+                            }
+                            Some(concerts)
+                        }
+                        None => {
+                            info!("Concert fetch failed, using stored band data");
+                            cache
+                                .load_bands()
+                                .and_then(|json| sync::parse_concerts(&json))
+                        }
+                    };
+
+                    if let Some(concerts) = concerts {
+                        let missing: Vec<usize> = (0..concerts.len())
+                            .filter(|&i| !cache.has_image(&concerts[i].path, orientation))
+                            .collect();
+                        let total = missing.len();
+                        info!(
+                            "{} of {} concerts need {:?} artwork",
+                            total,
+                            concerts.len(),
+                            orientation
+                        );
+
+                        let mut ready_flags = alloc::vec![true; concerts.len()];
+                        for &i in &missing {
+                            ready_flags[i] = false;
+                        }
+                        let mut progress =
+                            (total > 0).then(|| progress::Progress::new(orientation, total));
+
+                        // Show the cached screen, with the dialog when there is work
+                        if cached_ready {
+                            if let Some(p) = progress.as_mut() {
+                                p.draw(&mut framebuffer, 0);
+                            }
+                            if epd
+                                .display_start(framebuffer.as_slice(), &mut delay)
+                                .is_ok()
+                            {
+                                shown = true;
+                                advance_full!();
+                                start_button_monitor();
+                                if let Some(p) = progress.as_mut() {
+                                    p.confirm();
+                                }
+                            }
+                        } else {
+                            // No cached list: use artwork already on the card, if any
+                            let on_card: Vec<&str> = concerts
+                                .iter()
+                                .zip(&ready_flags)
+                                .filter(|&(_, &ready)| ready)
+                                .map(|(c, _)| c.path.as_str())
+                                .take(per_screen)
+                                .collect();
+                            if on_card.len() == per_screen
+                                && compose_screen(
+                                    cache,
+                                    &mut framebuffer,
+                                    &mut *image_buf,
+                                    &on_card,
+                                    orientation,
+                                    $battery,
+                                )
+                            {
+                                if let Some(p) = progress.as_mut() {
+                                    p.draw(&mut framebuffer, 0);
+                                }
+                                if epd
+                                    .display_start(framebuffer.as_slice(), &mut delay)
+                                    .is_ok()
+                                {
+                                    shown = true;
+                                    start_button_monitor();
+                                    if let Some(p) = progress.as_mut() {
+                                        p.confirm();
+                                    }
+                                }
+                            } else if let Some(p) = progress.as_mut() {
+                                let (rect, region) = p.draw(&mut framebuffer, 0);
+                                if epd.partial_update_start(&rect, &region, &mut delay).is_ok() {
+                                    p.confirm();
+                                }
+                            }
+                        }
+
+                        let renderer = Renderer::new();
+                        let mut albums = sync::AlbumCache::new();
+                        let mut rendered: Vec<usize> = Vec::new();
+                        for (done, &i) in missing.iter().enumerate() {
+                            // Refresh the new bar slice once the panel is free
+                            if let Some(p) = progress.as_mut()
+                                && !epd.is_busy()
+                                && let Some((rect, region)) = p.update(&mut framebuffer, done)
+                                && epd.partial_update_start(&rect, &region, &mut delay).is_ok()
+                            {
+                                p.confirm();
+                            }
+
+                            let concert = &concerts[i];
+                            match sync::render_concert(
+                                &mut net,
+                                &mut albums,
+                                &renderer,
+                                concert,
+                                layout_size(orientation),
+                            )
+                            .await
+                            {
+                                Ok(image) => {
+                                    match cache.write_image(&concert.path, orientation, &image) {
+                                        Ok(()) => {
+                                            ready_flags[i] = true;
+                                            rendered.push(i);
+                                        }
+                                        Err(e) => {
+                                            info!("Failed to store {}: {:?}", concert.path, e)
+                                        }
+                                    }
+                                }
+                                Err(e) => info!("Skipping {}: {:?}", concert.path, e),
+                            }
+
+                            // With nothing cached, show the first screen as soon as it renders
+                            if !shown && rendered.len() >= per_screen {
+                                while epd.is_busy() {
+                                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
+                                }
+                                let paths: Vec<&str> = rendered[..per_screen]
+                                    .iter()
+                                    .map(|&i| concerts[i].path.as_str())
+                                    .collect();
+                                if compose_screen(
+                                    cache,
+                                    &mut framebuffer,
+                                    &mut *image_buf,
+                                    &paths,
+                                    orientation,
+                                    $battery,
+                                ) {
+                                    if let Some(p) = progress.as_mut() {
+                                        p.draw(&mut framebuffer, done + 1);
+                                    }
+                                    if epd
+                                        .display_start(framebuffer.as_slice(), &mut delay)
+                                        .is_ok()
+                                    {
+                                        shown = true;
+                                        start_button_monitor();
+                                        if let Some(p) = progress.as_mut() {
+                                            p.confirm();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut ready: Box<WidgetData> = Box::new(heapless::Vec::new());
+                        let mut valid: Box<WidgetData> = Box::new(heapless::Vec::new());
+                        for (concert, &is_ready) in concerts.iter().zip(&ready_flags) {
+                            let mut path = heapless::String::new();
+                            if path.push_str(&concert.path).is_ok() {
+                                if is_ready {
+                                    let _ = ready.push(path.clone());
+                                }
+                                let _ = valid.push(path);
+                            }
+                        }
+                        info!("{} {:?} items ready", ready.len(), orientation);
+
+                        // Keep artwork for every current concert in both orientations
+                        match cache.cleanup_stale(&valid) {
+                            Ok(n) if n > 0 => info!("Removed {} stale files", n),
+                            Ok(_) => {}
+                            Err(e) => info!("Cleanup failed: {:?}", e),
+                        }
+                        if let Err(e) = cache.store_widget_data(orientation, &ready) {
+                            info!("Failed to store item list: {:?}", e);
+                        }
+
+                        // Erase the dialog
+                        if let Some(p) = progress.as_mut() {
+                            while epd.is_busy() {
+                                Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
+                            }
+                            if let Some((rect, region)) = p.restore(&mut framebuffer) {
+                                epd.partial_update_start(&rect, &region, &mut delay).ok();
+                            }
+                        }
+                        synced = Some(ready);
+                    }
+                    stop_blink();
+                }
+
+                if wifi_connected {
+                    if let Some(ctrl) = wifi_controller.as_mut() {
+                        wifi_disconnect(ctrl).await;
+                    }
+                    wifi_connected = false;
+                }
+
+                // Without a sync, still show the cached screen
+                if cached_ready
+                    && !shown
+                    && epd
+                        .display_start(framebuffer.as_slice(), &mut delay)
+                        .is_ok()
+                {
+                    shown = true;
+                    advance_full!();
+                    start_button_monitor();
+                }
+
+                if let Some(mut fresh) = synced {
+                    display::shuffle_items(&mut fresh, shuffle_seed);
+                    if *fresh != *items {
+                        info!("Item list changed ({} items), reshuffling", fresh.len());
+                        shuffle_seed = (rng.random() as u64) << 32 | rng.random() as u64;
+                        display::shuffle_items(&mut fresh, shuffle_seed);
+                        items = fresh;
+                        index = 0;
+                        slot_items = [0, 0];
+                        next_slot = 0;
+                    }
+                }
+                if shown {
+                    use_partial = orientation == Orientation::Horizontal;
+                }
+                shown
+            }};
+        }
 
         loop {
-            start_blink();
-            let result = display::fetch_widget_data(
-                tcp_client.as_ref().unwrap(),
-                dns_socket.as_ref().unwrap(),
-                &mut *tls_read_buf,
-                &mut *tls_write_buf,
-                SERVER_URL,
-                "concerts",
-            )
-            .await;
-            stop_blink();
-
-            match result {
-                Ok(data) => {
-                    // Store in cache for next boot
-                    if let Some(cache) = sd_cache.as_mut()
-                        && let Err(e) = cache.store_widget_data(&data)
-                    {
-                        info!("Failed to cache widget data: {:?}", e);
-                    }
-                    break data;
-                }
-                Err(e) => {
-                    info!("Failed to fetch widget data: {:?}, retrying in 30s...", e);
-                    Timer::after(Duration::from_secs(30)).await;
-                }
-            }
-        }
-    };
-
-    // Get saved state if resuming
-    let (shuffle_seed, saved_index, saved_next_slot, saved_slot_items) = if resuming {
-        unsafe {
-            let state = &raw const SLEEP_STATE;
-            (
-                (*state).shuffle_seed,
-                (*state).index,
-                (*state).get_next_slot(),
-                (*state).get_slot_items(),
-            )
-        }
-    } else {
-        // Fresh start with new shuffle seed
-        let seed = (rng.random() as u64) << 32 | rng.random() as u64;
-        (seed, 0, 0u8, [0usize, 0usize])
-    };
-
-    // Shuffle items (same seed = same order)
-    display::shuffle_items(&mut items, shuffle_seed);
-
-    // Now check if data matches (after shuffling, so cache_keys are in same order)
-    // Also get saved orientation for partial refresh check
-    let (data_matches, saved_orientation) = if resuming {
-        unsafe {
-            let state = &raw const SLEEP_STATE;
-            ((*state).matches_data(&items), (*state).get_orientation())
-        }
-    } else {
-        (false, Orientation::Horizontal)
-    };
-
-    let can_partial = data_matches
-        && orientation == Orientation::Horizontal
-        && saved_orientation == Orientation::Horizontal
-        && saved_index >= 2; // At least one full refresh has happened
-
-    let (mut index, mut next_slot, mut slot_items, mut use_partial) = if can_partial {
-        info!(
-            "Resuming with partial update: slot={}, slot_items=[{}, {}], index={}",
-            saved_next_slot, saved_slot_items[0], saved_slot_items[1], saved_index
-        );
-        (saved_index, saved_next_slot, saved_slot_items, true)
-    } else if data_matches {
-        info!("Resuming from index {} (full refresh)", saved_index);
-        (saved_index, 0u8, [0usize, 0usize], false)
-    } else {
-        info!("Fresh start or data changed");
-        (0, 0u8, [0usize, 0usize], false)
-    };
-
-    let total_items = items.len();
-    info!("Displaying {} items in shuffled order", total_items);
-
-    // Buffer for partial updates (400x480 = 96000 bytes)
-    const HALF_BUFFER_SIZE: usize = 400 * 480 / 2;
-
-    // Display loop - allows re-display on orientation change
-    loop {
-        // If we've shown all items, start over
-        if index >= total_items {
-            info!("All items shown, starting over");
-            index = 0;
-        }
-
-        // Wake up display
-        info!("Waking up display...");
-        epd.wake_up(&mut delay).expect("Failed to wake display");
-
-        // Read battery percentage
-        let battery_percent = {
-            let mut buf = [0u8; 1];
-            match i2c.write_read(AXP2101_ADDR, &[BAT_PERCENT_REG], &mut buf) {
-                Ok(()) => {
-                    info!("Battery: {}%", buf[0]);
-                    buf[0]
-                }
-                Err(e) => {
-                    info!("Failed to read battery: {:?}", e);
-                    50 // Default to 50% on error
-                }
-            }
-        };
-
-        let display_result = if use_partial && orientation == Orientation::Horizontal {
-            // ==================== Partial Refresh Mode (Cache-Aware) ====================
-            // Only update one half of the display with a single new item
-            let item_idx = index % total_items;
-            let item_path = items[item_idx].as_str();
-            info!(
-                "Partial update: slot={}, item={} of {}",
-                next_slot, item_idx, total_items
-            );
-
-            // PNG buffer for fetching/reading (256KB)
-            let mut png_buf: alloc::boxed::Box<[u8; 256 * 1024]> =
-                alloc::boxed::Box::new([0u8; 256 * 1024]);
-
-            start_blink();
-
-            // Check cache first
-            let cache_hit = sd_cache
-                .as_mut()
-                .is_some_and(|c| c.has_image(item_path, Orientation::Horizontal));
-            let png_len = if cache_hit {
-                info!("Cache HIT: {}", item_path);
-                sd_cache
-                    .as_mut()
-                    .and_then(|c| {
-                        c.read_image(item_path, Orientation::Horizontal, &mut *png_buf)
-                            .ok()
-                    })
-                    .unwrap_or_default()
-            } else {
-                info!("Cache MISS: {}", item_path);
-                // Initialize and connect WiFi if not already connected
-                ensure_wifi!();
-                match display::fetch_png(
-                    tcp_client.as_ref().unwrap(),
-                    dns_socket.as_ref().unwrap(),
-                    &mut *tls_read_buf,
-                    &mut *tls_write_buf,
-                    &mut *png_buf,
-                    SERVER_URL,
-                    "concerts",
-                    item_path,
-                    Orientation::Horizontal,
-                )
-                .await
-                {
-                    Ok(len) => {
-                        if let Some(cache) = sd_cache.as_mut()
-                            && let Err(e) = cache.write_image(
-                                item_path,
-                                Orientation::Horizontal,
-                                &png_buf[..len],
-                            )
-                        {
-                            info!("Cache store failed: {:?}", e);
-                        }
-                        len
-                    }
-                    Err(e) => {
-                        info!("Fetch failed: {:?}", e);
-                        0
-                    }
-                }
-            };
-
-            // Render to framebuffer
-            let fetch_result = if png_len > 0 {
-                display::render_png_to_framebuffer(
-                    &png_buf[..png_len],
-                    &mut framebuffer,
-                    next_slot,
-                    Orientation::Horizontal,
-                )
-            } else {
-                Err(display::DisplayError::Network)
-            };
-
-            // Draw battery indicator centered horizontally
-            if fetch_result.is_ok() {
-                let (bat_w, _bat_h) = battery::battery_dimensions(false);
-                let battery_x = (WIDTH as u16 - bat_w) / 2;
-                let battery_y = 8;
-                battery::draw_battery(
-                    framebuffer.as_mut_slice(),
-                    battery_x,
-                    battery_y,
-                    battery_percent,
-                    false,
-                );
+            // After showing every item, sync before starting over
+            if !items.is_empty() && index >= items.len() {
+                info!("All items shown");
+                index = 0;
+                need_sync = true;
             }
 
-            // Start partial update
-            let display_started = match fetch_result {
-                Ok(()) => {
-                    // Extract the half we need to update
-                    let mut half_buffer = [0u8; HALF_BUFFER_SIZE];
-                    framebuffer.extract_half(next_slot, &mut half_buffer);
+            info!("Waking up display...");
+            epd.wake_up(&mut delay).expect("Failed to wake display");
 
-                    // Create rect for the half (left: x=0, right: x=400)
-                    let x_offset = if next_slot == 0 { 0 } else { 400 };
-                    let rect = Rect::new(x_offset, 0, 400, 480);
-
-                    info!("Partial refresh: x={}, w={}, h={}", x_offset, 400, 480);
-
-                    epd.partial_update_start(&rect, &half_buffer, &mut delay)
-                        .is_ok()
+            let battery_percent = match log_charger_status(&mut i2c) {
+                Some(mv) => battery_percent_from_mv(mv),
+                None => {
+                    let mut buf = [0u8; 1];
+                    i2c.write_read(AXP2101_ADDR, &[BAT_PERCENT_REG], &mut buf)
+                        .map(|_| buf[0])
+                        .unwrap_or(50)
                 }
-                Err(_) => false,
             };
+            info!("Battery: {}%", battery_percent);
 
-            // Update slot tracking early so prefetch uses correct next index
-            if display_started {
-                slot_items[next_slot as usize] = item_idx;
-                next_slot = (next_slot + 1) % 2;
-                index += 1; // Advance by 1 for partial updates
-            }
-
-            // Spawn button monitor task and do work while it runs
-            if display_started {
-                // Start button monitoring
-                start_button_monitor();
-
-                // Initialize and connect WiFi now if we deferred it
-                ensure_wifi!();
-
-                // Prefetch next image (only if cache is available)
-                if let Some(cache) = sd_cache.as_mut() {
-                    let prefetch_idx = index % total_items;
-                    let prefetch_path = items[prefetch_idx].as_str();
-                    if !cache.has_image(prefetch_path, Orientation::Horizontal) {
-                        info!("Prefetching next image: {}", prefetch_path);
-                        let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
-                        if let Ok(len) = display::fetch_png(
-                            tcp_client.as_ref().unwrap(),
-                            dns_socket.as_ref().unwrap(),
-                            &mut *tls_read_buf,
-                            &mut *tls_write_buf,
-                            &mut *prefetch_buf,
-                            SERVER_URL,
-                            "concerts",
-                            prefetch_path,
-                            Orientation::Horizontal,
-                        )
-                        .await
-                        {
-                            if let Err(e) = cache.write_image(
-                                prefetch_path,
-                                Orientation::Horizontal,
-                                &prefetch_buf[..len],
-                            ) {
-                                info!("Prefetch cache store failed: {:?}", e);
-                            } else {
-                                info!("Prefetched and cached: {}", prefetch_path);
-                            }
-                        }
-                    }
+            let display_started = if need_sync {
+                need_sync = false;
+                info!("Syncing {:?} artwork", orientation);
+                let shown = sync_cycle!(battery_percent);
+                if !shown && !items.is_empty() {
+                    // Synced without showing a screen: display normally
+                    continue;
                 }
-
-                // Refresh widget data from server if we used cached data
-                if has_cached_data {
-                    info!("Refreshing widget data from server...");
-                    if let Ok(fresh_items) = display::fetch_widget_data(
-                        tcp_client.as_ref().unwrap(),
-                        dns_socket.as_ref().unwrap(),
-                        &mut *tls_read_buf,
-                        &mut *tls_write_buf,
-                        SERVER_URL,
-                        "concerts",
-                    )
-                    .await
-                        && (fresh_items.len() != items.len()
-                            || fresh_items
-                                .iter()
-                                .zip(items.iter())
-                                .any(|(a, b)| a.as_str() != b.as_str()))
-                    {
-                        info!("Widget data changed, updating cache");
-                        if let Some(cache) = sd_cache.as_mut() {
-                            if let Err(e) = cache.store_widget_data(&fresh_items) {
-                                info!("Failed to update widget data cache: {:?}", e);
-                            }
-                            if let Ok(count) = cache.cleanup_stale(&fresh_items)
-                                && count > 0
-                            {
-                                info!("Invalidated {} stale cache entries", count);
-                            }
-                        }
-                    }
-                }
-
-                // Disconnect WiFi to save power during display refresh wait
-                if wifi_connected {
-                    if let Some(ctrl) = wifi_controller.as_mut() {
-                        info!("Disconnecting WiFi (display refreshing)...");
-                        wifi_disconnect(ctrl).await;
-                    }
-                    wifi_connected = false;
-                }
-
-                // Wait for display busy (button task handles button detection separately)
-                while epd.is_busy() {
-                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
-                }
-            }
-
-            // Finish display
-            let result = if display_started {
-                epd.refresh_wait(&mut delay)
-                    .map_err(|_| display::DisplayError::Network)
-            } else {
-                Err(display::DisplayError::Network)
-            };
-            stop_blink();
-            embassy_futures::yield_now().await;
-
-            result
-        } else {
-            // ==================== Full Refresh Mode (Cache-Aware) ====================
-            // Update entire display with 2 items (horizontal) or 1 item (vertical)
-            info!(
-                "Full refresh: items {} and {} of {}",
-                index,
-                (index + 1).min(total_items - 1),
-                total_items
-            );
-
-            // Clear framebuffer
-            framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
-
-            // PNG buffer for fetching/reading (256KB)
-            let mut png_buf: alloc::boxed::Box<[u8; 256 * 1024]> =
-                alloc::boxed::Box::new([0u8; 256 * 1024]);
-
-            start_blink();
-
-            // Number of items to display
-            let items_per_screen = match orientation {
-                Orientation::Horizontal => 2,
-                Orientation::Vertical => 1,
-            };
-
-            let mut fetch_ok = true;
-            for slot in 0..items_per_screen {
-                let item_idx = (index + slot) % total_items;
+                shown
+            } else if items.is_empty() {
+                false
+            } else if use_partial && orientation == Orientation::Horizontal {
+                // ==================== Partial Refresh ====================
+                // Update one half of the display with a single new item
+                let item_idx = index % items.len();
                 let item_path = items[item_idx].as_str();
-
-                // Check cache first
-                let cache_hit = sd_cache
-                    .as_mut()
-                    .is_some_and(|c| c.has_image(item_path, orientation));
-                let png_len = if cache_hit {
-                    info!("Cache HIT: {}", item_path);
-                    sd_cache
-                        .as_mut()
-                        .and_then(|c| c.read_image(item_path, orientation, &mut *png_buf).ok())
-                        .unwrap_or_default()
-                } else {
-                    info!("Cache MISS: {}", item_path);
-                    // Initialize and connect WiFi if not already connected
-                    ensure_wifi!();
-                    // Fetch from network
-                    match display::fetch_png(
-                        tcp_client.as_ref().unwrap(),
-                        dns_socket.as_ref().unwrap(),
-                        &mut *tls_read_buf,
-                        &mut *tls_write_buf,
-                        &mut *png_buf,
-                        SERVER_URL,
-                        "concerts",
-                        item_path,
-                        orientation,
-                    )
-                    .await
-                    {
-                        Ok(len) => {
-                            // Store in cache
-                            if let Some(cache) = sd_cache.as_mut()
-                                && let Err(e) =
-                                    cache.write_image(item_path, orientation, &png_buf[..len])
-                            {
-                                info!("Cache store failed: {:?}", e);
-                            }
-                            len
-                        }
-                        Err(e) => {
-                            info!("Fetch failed: {:?}", e);
-                            0
-                        }
-                    }
-                };
-
-                // Decode and render to framebuffer
-                if png_len > 0 {
-                    if let Err(e) = display::render_png_to_framebuffer(
-                        &png_buf[..png_len],
-                        &mut framebuffer,
-                        slot as u8,
-                        orientation,
-                    ) {
-                        info!("Render failed: {:?}", e);
-                        fetch_ok = false;
-                    }
-                } else {
-                    fetch_ok = false;
-                }
-            }
-
-            let fetch_result: Result<(), display::DisplayError> = if fetch_ok {
-                Ok(())
-            } else {
-                Err(display::DisplayError::Network)
-            };
-
-            // Draw battery indicator into framebuffer
-            if fetch_result.is_ok() {
-                let vertical = orientation == Orientation::Vertical;
-                let (bat_w, _bat_h) = battery::battery_dimensions(vertical);
-                // Centered horizontally in horizontal mode, right-aligned in vertical
-                let battery_x = if vertical {
-                    WIDTH as u16 - bat_w - 8
-                } else {
-                    (WIDTH as u16 - bat_w) / 2
-                };
-                let battery_y = 8;
-                battery::draw_battery(
-                    framebuffer.as_mut_slice(),
-                    battery_x,
-                    battery_y,
-                    battery_percent,
-                    vertical,
+                info!(
+                    "Partial update: slot={}, item={} of {}",
+                    next_slot,
+                    item_idx,
+                    items.len()
                 );
-            }
 
-            // Start display update
-            let display_started = match fetch_result {
-                Ok(()) => {
-                    info!("Updating display (full refresh)...");
-                    epd.display_start(framebuffer.as_slice(), &mut delay)
-                        .is_ok()
-                }
-                Err(_) => false,
-            };
-
-            // Update slot tracking for horizontal mode (enables partial updates next time)
-            if display_started && orientation == Orientation::Horizontal {
-                slot_items[0] = index % total_items;
-                slot_items[1] = (index + 1) % total_items;
-                next_slot = 0;
-                index += 2;
-                use_partial = true; // Enable partial updates for subsequent refreshes
-            } else if display_started {
-                index += 1; // Vertical mode: advance by 1
-            }
-
-            // Spawn button monitor task and do work while it runs
-            if display_started {
-                // Start button monitoring
-                start_button_monitor();
-
-                // Initialize and connect WiFi now if we deferred it (using cached data path)
-                ensure_wifi!();
-
-                // Prefetch next image (only if cache is available)
-                if let Some(cache) = sd_cache.as_mut() {
-                    let prefetch_idx = index % total_items;
-                    let prefetch_path = items[prefetch_idx].as_str();
-                    if !cache.has_image(prefetch_path, orientation) {
-                        info!("Prefetching next image: {}", prefetch_path);
-                        let mut prefetch_buf: Box<[u8; 256 * 1024]> = Box::new([0u8; 256 * 1024]);
-                        if let Ok(len) = display::fetch_png(
-                            tcp_client.as_ref().unwrap(),
-                            dns_socket.as_ref().unwrap(),
-                            &mut *tls_read_buf,
-                            &mut *tls_write_buf,
-                            &mut *prefetch_buf,
-                            SERVER_URL,
-                            "concerts",
-                            prefetch_path,
-                            orientation,
-                        )
-                        .await
-                        {
-                            if let Err(e) =
-                                cache.write_image(prefetch_path, orientation, &prefetch_buf[..len])
-                            {
-                                info!("Prefetch cache store failed: {:?}", e);
-                            } else {
-                                info!("Prefetched and cached: {}", prefetch_path);
-                            }
-                        }
-                    }
-                }
-                embassy_futures::yield_now().await;
-
-                // Refresh widget data from server if we used cached data
-                if has_cached_data {
-                    info!("Refreshing widget data from server...");
-                    if let Ok(fresh_items) = display::fetch_widget_data(
-                        tcp_client.as_ref().unwrap(),
-                        dns_socket.as_ref().unwrap(),
-                        &mut *tls_read_buf,
-                        &mut *tls_write_buf,
-                        SERVER_URL,
-                        "concerts",
+                let drawn = sd_cache.as_mut().is_some_and(|c| {
+                    draw_stored(
+                        c,
+                        &mut framebuffer,
+                        &mut *image_buf,
+                        item_path,
+                        Orientation::Horizontal,
+                        next_slot,
                     )
-                    .await
-                    {
-                        // Check if data changed
-                        if fresh_items.len() != items.len()
-                            || fresh_items
-                                .iter()
-                                .zip(items.iter())
-                                .any(|(a, b)| a.as_str() != b.as_str())
-                        {
-                            info!("Widget data changed, updating cache");
-                            if let Some(cache) = sd_cache.as_mut() {
-                                if let Err(e) = cache.store_widget_data(&fresh_items) {
-                                    info!("Failed to update widget data cache: {:?}", e);
-                                }
-                                // Invalidate stale image cache entries
-                                if let Ok(count) = cache.cleanup_stale(&fresh_items)
-                                    && count > 0
-                                {
-                                    info!("Invalidated {} stale cache entries", count);
-                                }
-                            }
-                        }
+                });
+                if !drawn {
+                    failures += 1;
+                    index += 1;
+                    if failures >= items.len() {
+                        info!("No displayable items");
+                        break;
                     }
+                    continue;
                 }
-                stop_blink();
+                draw_battery_icon(&mut framebuffer, orientation, battery_percent);
 
-                // Disconnect WiFi to save power during display refresh wait
-                if wifi_connected {
-                    if let Some(ctrl) = wifi_controller.as_mut() {
-                        info!("Disconnecting WiFi (display refreshing)...");
-                        wifi_disconnect(ctrl).await;
-                    }
-                    wifi_connected = false;
+                framebuffer.extract_half(next_slot, &mut *half_buffer);
+                let x_offset = if next_slot == 0 { 0 } else { 400 };
+                let rect = Rect::new(x_offset, 0, 400, 480);
+                info!("Partial refresh: x={}, w={}, h={}", x_offset, 400, 480);
+
+                let started = epd
+                    .partial_update_start(&rect, &*half_buffer, &mut delay)
+                    .is_ok();
+                if started {
+                    slot_items[next_slot as usize] = item_idx;
+                    next_slot = (next_slot + 1) % 2;
+                    index += 1;
+                    start_button_monitor();
                 }
-
-                // Wait for display busy (button task handles button detection separately)
-                while epd.is_busy() {
-                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
-                }
-            }
-
-            // Finish display
-            let result = if display_started {
-                epd.finish_display(&mut delay)
-                    .map_err(|_| display::DisplayError::Network)
+                started
             } else {
-                Err(display::DisplayError::Network)
+                // ==================== Full Refresh ====================
+                // Update entire display with 2 items (horizontal) or 1 item (vertical)
+                let paths: Vec<&str> = (0..screen_items(orientation))
+                    .map(|slot| items[(index + slot) % items.len()].as_str())
+                    .collect();
+                info!(
+                    "Full refresh: {} item(s) from index {} of {}",
+                    paths.len(),
+                    index,
+                    items.len()
+                );
+
+                let drawn = sd_cache.as_mut().is_some_and(|c| {
+                    compose_screen(
+                        c,
+                        &mut framebuffer,
+                        &mut *image_buf,
+                        &paths,
+                        orientation,
+                        battery_percent,
+                    )
+                });
+                if !drawn {
+                    failures += 1;
+                    index += 1;
+                    if failures >= items.len() {
+                        info!("No displayable items");
+                        break;
+                    }
+                    continue;
+                }
+
+                info!("Updating display (full refresh)...");
+                let started = epd
+                    .display_start(framebuffer.as_slice(), &mut delay)
+                    .is_ok();
+                if started {
+                    advance_full!();
+                    start_button_monitor();
+                }
+                started
             };
 
-            embassy_futures::yield_now().await;
-
-            result
-        };
-
-        match display_result {
-            Ok(()) => info!("Display refresh successful!"),
-            Err(e) => info!("Display refresh failed: {:?}", e),
-        }
-
-        // Put display to sleep
-        info!("Putting display to sleep...");
-        epd.sleep(&mut delay).expect("Failed to sleep display");
-
-        // Check button state and cancel task if still polling
-        let button_state = BUTTON_STATE.swap(BUTTON_CANCELLED, Ordering::Relaxed);
-
-        // Handle button action detected during display update
-        // (LED feedback already provided by button monitor task)
-        match button_state {
-            BUTTON_FLIP => {
-                info!("Button held during update! Toggling orientation...");
-                orientation = orientation.toggle();
-                // Save to SD card
-                if let Some(cache) = sd_cache.as_mut()
-                    && let Err(e) = cache.store_orientation(orientation)
-                {
-                    info!("Failed to store orientation: {:?}", e);
-                }
-                // Reset partial mode on orientation change
-                use_partial = false;
-                slot_items = [0, 0];
-                next_slot = 0;
-
-                info!("Re-displaying with orientation: {:?}", orientation);
-                // Continue loop to re-display
-            }
-            BUTTON_NEXT => {
-                info!("Button tap during update, next item (index={})", index);
-                // Continue loop to show next item
-            }
-            _ => {
-                // No button press (POLLING or CANCELLED), exit loop and go to deep sleep
-                info!("No button press, entering deep sleep");
+            if !display_started {
+                info!("No artwork available, will retry after sleep");
+                epd.sleep(&mut delay).ok();
                 break;
             }
-        }
-        // Loop back to re-display
-    }
+            failures = 0;
 
-    // Save state for next wake (index already advanced in the loop)
-    unsafe {
-        let state = &raw mut SLEEP_STATE;
-        (*state).save(
+            // Wait for the panel while the button monitor runs
+            while epd.is_busy() {
+                Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
+            }
+            match epd.finish_display(&mut delay) {
+                Ok(()) => info!("Display refresh successful!"),
+                Err(e) => info!("Display refresh failed: {:?}", e),
+            }
+
+            info!("Putting display to sleep...");
+            epd.sleep(&mut delay).expect("Failed to sleep display");
+
+            // Check button state and stop monitoring
+            let button_state = BUTTON_STATE.swap(BUTTON_CANCELLED, Ordering::Relaxed);
+
+            // LED feedback was already provided by the button monitor task
+            match button_state {
+                BUTTON_FLIP => {
+                    info!("Button held during update! Toggling orientation...");
+                    orientation = orientation.toggle();
+                    if let Some(cache) = sd_cache.as_mut()
+                        && let Err(e) = cache.store_orientation(orientation)
+                    {
+                        info!("Failed to store orientation: {:?}", e);
+                    }
+
+                    // Each orientation has its own artwork; sync if none is cached
+                    *items = sd_cache
+                        .as_mut()
+                        .and_then(|c| c.load_widget_data(orientation))
+                        .unwrap_or_default();
+                    display::shuffle_items(&mut items, shuffle_seed);
+                    need_sync = items.is_empty();
+                    index = 0;
+                    use_partial = false;
+                    slot_items = [0, 0];
+                    next_slot = 0;
+                    info!(
+                        "Re-displaying with orientation: {:?} ({} items)",
+                        orientation,
+                        items.len()
+                    );
+                }
+                BUTTON_NEXT => {
+                    info!("Button tap during update, next item (index={})", index);
+                }
+                _ => {
+                    info!("No button press, entering deep sleep");
+                    break;
+                }
+            }
+        }
+
+        // Save state for next wake (index already advanced in the loop)
+        unsafe {
+            let state = &raw mut SLEEP_STATE;
+            (*state).save(
+                index,
+                items.len(),
+                shuffle_seed,
+                orientation,
+                next_slot,
+                slot_items,
+                &items,
+            );
+        }
+        info!(
+            "Saved state: index={}, total={}, orientation={:?}, next_slot={}, slot_items=[{}, {}]",
             index,
-            total_items,
-            shuffle_seed,
+            items.len(),
             orientation,
             next_slot,
-            slot_items,
-            &items,
+            slot_items[0],
+            slot_items[1]
         );
     }
-    info!(
-        "Saved state: index={}, total={}, orientation={:?}, next_slot={}, slot_items=[{}, {}]",
-        index, total_items, orientation, next_slot, slot_items[0], slot_items[1]
-    );
 
-    // Disconnect WiFi before deep sleep (only if still connected)
-    if wifi_connected {
-        if let Some(ctrl) = wifi_controller.as_mut() {
-            info!("Disconnecting WiFi for deep sleep...");
-            wifi_disconnect(ctrl).await;
-        }
-    } else {
-        info!("WiFi already disconnected, skipping");
+    if wifi_connected && let Some(ctrl) = wifi_controller.as_mut() {
+        info!("Disconnecting WiFi for deep sleep...");
+        wifi_disconnect(ctrl).await;
     }
 
     // Reclaim GPIO4 for deep sleep wake source
     let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
 
-    // Enter deep sleep
     info!(
         "Entering deep sleep for {} seconds (press button to wake early)...",
         REFRESH_INTERVAL_SECS
     );
     enter_deep_sleep(&mut rtc, key_pin, &mut delay, REFRESH_INTERVAL_SECS);
+}
+
+/// Approximate Li-ion state of charge from resting cell voltage
+fn battery_percent_from_mv(mv: u16) -> u8 {
+    const CURVE: [(u16, u8); 8] = [
+        (3300, 0),
+        (3600, 10),
+        (3700, 30),
+        (3800, 55),
+        (3900, 70),
+        (4000, 82),
+        (4100, 93),
+        (4200, 100),
+    ];
+    if mv <= CURVE[0].0 {
+        return 0;
+    }
+    for pair in CURVE.windows(2) {
+        let ((v0, p0), (v1, p1)) = (pair[0], pair[1]);
+        if mv <= v1 {
+            return p0 + ((mv - v0) as u32 * (p1 - p0) as u32 / (v1 - v0) as u32) as u8;
+        }
+    }
+    100
+}
+
+/// Read one AXP2101 register, retrying on bus errors
+fn pmic_read(i2c: &mut I2c<'_, esp_hal::Blocking>, reg: u8) -> Option<u8> {
+    let mut buf = [0u8; 1];
+    for attempt in 0..3 {
+        match i2c.write_read(0x34, &[reg], &mut buf) {
+            Ok(()) => return Some(buf[0]),
+            Err(e) => info!("PMIC read {:#04x} attempt {} failed: {:?}", reg, attempt, e),
+        }
+    }
+    None
+}
+
+/// Log AXP2101 charger state and VBUS presence, returning battery voltage in mV
+fn log_charger_status(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Option<u16> {
+    const STATUS1: u8 = 0x00;
+    const STATUS2: u8 = 0x01;
+    const ADC_ENABLE: u8 = 0x30;
+    const VBAT_H: u8 = 0x34;
+    const VBAT_L: u8 = 0x35;
+
+    if let Some(s1) = pmic_read(i2c, STATUS1) {
+        info!(
+            "PMIC status1={:#04x}: vbus_good={} battery_present={}",
+            s1,
+            s1 & 0x20 != 0,
+            s1 & 0x08 != 0
+        );
+    }
+
+    if let Some(s2) = pmic_read(i2c, STATUS2) {
+        let direction = match (s2 >> 5) & 0x03 {
+            0 => "standby",
+            1 => "charging",
+            2 => "discharging",
+            _ => "unknown",
+        };
+        let stage = match s2 & 0x07 {
+            0 => "trickle",
+            1 => "pre-charge",
+            2 => "constant-current",
+            3 => "constant-voltage",
+            4 => "done",
+            5 => "not charging",
+            _ => "unknown",
+        };
+        info!("PMIC status2={:#04x}: {} ({})", s2, direction, stage);
+    }
+
+    // Battery voltage ADC channel must be enabled to read VBAT
+    if let Some(adc) = pmic_read(i2c, ADC_ENABLE)
+        && adc & 0x01 == 0
+    {
+        let _ = i2c.write(0x34, &[ADC_ENABLE, adc | 0x01]);
+    }
+    let mv = ((pmic_read(i2c, VBAT_H)? as u16 & 0x3F) << 8) | pmic_read(i2c, VBAT_L)? as u16;
+    info!("PMIC vbat={}mV", mv);
+    // A zero reading means the ADC has not sampled yet
+    (mv > 0).then_some(mv)
 }
 
 /// Compute a single hash for all widget data
@@ -1436,4 +1452,76 @@ async fn wait_for_ip(stack: Stack<'static>) {
         // 1500ms polling is sufficient - DHCP takes seconds anyway
         Timer::after(Duration::from_millis(1500)).await;
     }
+}
+
+/// Items shown per screen: two halves in horizontal, one full screen in vertical
+fn screen_items(orientation: Orientation) -> usize {
+    match orientation {
+        Orientation::Horizontal => 2,
+        Orientation::Vertical => 1,
+    }
+}
+
+/// Artwork dimensions for an orientation
+fn layout_size(orientation: Orientation) -> (u32, u32) {
+    match orientation {
+        Orientation::Horizontal => sawthat_render::HORIZ_SIZE,
+        Orientation::Vertical => sawthat_render::VERT_SIZE,
+    }
+}
+
+/// Read a stored image and draw it into a framebuffer slot
+fn draw_stored<S: SpiDevice, D: DelayNs>(
+    cache: &mut SdCache<S, D>,
+    framebuffer: &mut Framebuffer,
+    buf: &mut [u8],
+    path: &str,
+    orientation: Orientation,
+    slot: u8,
+) -> bool {
+    match cache.read_image(path, orientation, buf) {
+        Ok(len) => match display::render_stored(&buf[..len], framebuffer, slot, orientation) {
+            Ok(()) => true,
+            Err(e) => {
+                info!("Bad stored image {}: {:?}", path, e);
+                false
+            }
+        },
+        Err(e) => {
+            info!("Failed to read {}: {:?}", path, e);
+            false
+        }
+    }
+}
+
+/// Compose a full screen: stored artwork for each slot plus the battery icon
+fn compose_screen<S: SpiDevice, D: DelayNs>(
+    cache: &mut SdCache<S, D>,
+    framebuffer: &mut Framebuffer,
+    buf: &mut [u8],
+    paths: &[&str],
+    orientation: Orientation,
+    battery_percent: u8,
+) -> bool {
+    framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
+    let drawn = paths
+        .iter()
+        .enumerate()
+        .all(|(slot, path)| draw_stored(cache, framebuffer, buf, path, orientation, slot as u8));
+    if drawn {
+        draw_battery_icon(framebuffer, orientation, battery_percent);
+    }
+    drawn
+}
+
+/// Draw the battery icon: centered at the top in horizontal, top right in vertical
+fn draw_battery_icon(framebuffer: &mut Framebuffer, orientation: Orientation, percent: u8) {
+    let vertical = orientation == Orientation::Vertical;
+    let (bat_w, _) = battery::battery_dimensions(vertical);
+    let x = if vertical {
+        WIDTH as u16 - bat_w - 8
+    } else {
+        (WIDTH as u16 - bat_w) / 2
+    };
+    battery::draw_battery(framebuffer.as_mut_slice(), x, 8, percent, vertical);
 }

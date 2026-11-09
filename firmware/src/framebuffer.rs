@@ -5,7 +5,7 @@
 //!
 //! The framebuffer is allocated dynamically from PSRAM to avoid exhausting internal SRAM.
 
-use crate::epd::{BUFFER_SIZE, Color, HEIGHT, WIDTH};
+use crate::epd::{BUFFER_SIZE, Color, HEIGHT, Rect, WIDTH};
 use alloc::boxed::Box;
 
 extern crate alloc;
@@ -147,6 +147,26 @@ impl Framebuffer {
     /// Fill the right half of the display (400x480) with a color
     pub fn fill_right_half(&mut self, color: Color) {
         self.fill_rect(400, 0, 400, HEIGHT, color);
+    }
+
+    /// Copy a byte-aligned region (even x and width) for partial update
+    pub fn extract_rect(&self, rect: &Rect) -> alloc::vec::Vec<u8> {
+        let row_bytes = WIDTH as usize / 2;
+        let (x, w) = (rect.x as usize / 2, rect.width as usize / 2);
+        (rect.y as usize..(rect.y + rect.height) as usize)
+            .flat_map(|y| &self.buffer[y * row_bytes + x..y * row_bytes + x + w])
+            .copied()
+            .collect()
+    }
+
+    /// Write back a region previously copied with [`Self::extract_rect`]
+    pub fn write_rect(&mut self, rect: &Rect, data: &[u8]) {
+        let row_bytes = WIDTH as usize / 2;
+        let (x, w) = (rect.x as usize / 2, rect.width as usize / 2);
+        for (row, src) in data.chunks_exact(w).enumerate() {
+            let start = (rect.y as usize + row) * row_bytes + x;
+            self.buffer[start..start + w].copy_from_slice(src);
+        }
     }
 
     /// Extract half of the framebuffer for partial update.

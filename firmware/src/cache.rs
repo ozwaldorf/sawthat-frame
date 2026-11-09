@@ -1,14 +1,15 @@
 //! SD card-based image cache
 //!
-//! Stores PNG images directly on the SD card's FAT filesystem.
+//! Stores pre-rendered artwork directly on the SD card's FAT filesystem.
 //! Directory structure mirrors the API paths:
 //!
 //! /concerts/
-//!   widget.json              - JSON array of item paths
+//!   HORIZ.JSN / VERT.JSN     - JSON arrays of items with artwork per orientation
+//!   BANDS.JSN                - raw SawThat bands response
 //!   horiz/
-//!     {item-path}.png        - horizontal orientation images
+//!     {hash}.IMG             - horizontal artwork (see sawthat_render::pack_image)
 //!   vert/
-//!     {item-path}.png        - vertical orientation images
+//!     {hash}.IMG             - vertical artwork
 
 use core::fmt::Write as FmtWrite;
 
@@ -28,11 +29,19 @@ const HORIZ_DIR: &str = "horiz";
 /// Vertical orientation subdirectory
 const VERT_DIR: &str = "vert";
 
-/// Widget data filename (JSON array of item paths) - 8.3 format
-const WIDGET_FILE: &str = "WIDGET.JSN";
+/// Ready item list filename per orientation (JSON array of item paths) - 8.3 format
+fn items_file(orientation: Orientation) -> &'static str {
+    match orientation {
+        Orientation::Horizontal => "HORIZ.JSN",
+        Orientation::Vertical => "VERT.JSN",
+    }
+}
 
 /// Orientation state filename - 8.3 format
 const ORIENT_FILE: &str = "ORIENT.DAT";
+
+/// Raw SawThat bands response - 8.3 format
+const BANDS_FILE: &str = "BANDS.JSN";
 
 /// Dummy time source (SD cards need timestamps but we don't care)
 pub struct DummyTimesource;
@@ -68,7 +77,7 @@ pub enum CacheError {
 }
 
 /// Generate cache filename for an image
-/// Format: 8-char hash + .PNG (FAT 8.3 compatible)
+/// Format: 8-char hash + .IMG (FAT 8.3 compatible)
 /// Uses djb2 hash of the path to create a short unique filename
 fn cache_filename(path: &str) -> String<16> {
     // djb2 hash
@@ -77,7 +86,7 @@ fn cache_filename(path: &str) -> String<16> {
         hash = hash.wrapping_mul(33).wrapping_add(*byte as u32);
     }
     let mut name: String<16> = String::new();
-    let _ = write!(name, "{:08X}.PNG", hash);
+    let _ = write!(name, "{:08X}.IMG", hash);
     name
 }
 
@@ -99,13 +108,13 @@ fn path_hash(path: &str) -> u32 {
 }
 
 /// Parse cache filename to extract hash value
-/// Input: ABCD1234.PNG
+/// Input: ABCD1234.IMG
 /// Output: hash value as u32
 fn parse_cache_filename(filename: &str) -> Option<u32> {
-    // Remove .png suffix (FAT filesystems uppercase extensions)
+    // FAT filesystems uppercase extensions
     let name = filename
-        .strip_suffix(".PNG")
-        .or_else(|| filename.strip_suffix(".png"))?;
+        .strip_suffix(".IMG")
+        .or_else(|| filename.strip_suffix(".img"))?;
 
     // Parse hex string
     u32::from_str_radix(name.trim(), 16).ok()
@@ -297,18 +306,18 @@ where
         Ok(())
     }
 
-    /// Load widget data from cache (JSON array of item paths)
-    pub fn load_widget_data(&mut self) -> Option<WidgetData> {
+    /// Load the list of items with artwork for an orientation
+    pub fn load_widget_data(&mut self, orientation: Orientation) -> Option<WidgetData> {
         let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
         let mut root_dir = volume.open_root_dir().ok()?;
         let mut concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
 
         let mut file = concerts_dir
-            .open_file_in_dir(WIDGET_FILE, Mode::ReadOnly)
+            .open_file_in_dir(items_file(orientation), Mode::ReadOnly)
             .ok()?;
 
-        // Read file into buffer (max ~6KB for 128 items)
-        let mut buf = [0u8; 6144];
+        // Read file into buffer (128 items of up to 48 chars plus quoting)
+        let mut buf = alloc::vec![0u8; 8192];
         let mut total_read = 0;
         loop {
             match file.read(&mut buf[total_read..]) {
@@ -330,8 +339,12 @@ where
         }
     }
 
-    /// Store widget data to cache (JSON array of item paths)
-    pub fn store_widget_data(&mut self, items: &WidgetData) -> Result<(), CacheError> {
+    /// Store the list of items with artwork for an orientation
+    pub fn store_widget_data(
+        &mut self,
+        orientation: Orientation,
+        items: &WidgetData,
+    ) -> Result<(), CacheError> {
         let mut volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
@@ -344,7 +357,7 @@ where
             .map_err(|_| CacheError::Filesystem)?;
 
         let mut file = concerts_dir
-            .open_file_in_dir(WIDGET_FILE, Mode::ReadWriteCreateOrTruncate)
+            .open_file_in_dir(items_file(orientation), Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| CacheError::Write)?;
 
         // Write JSON array manually (simple format)
@@ -361,6 +374,46 @@ where
 
         info!("Stored {} widget items to cache JSON", items.len());
         Ok(())
+    }
+
+    /// Store the raw SawThat bands response
+    pub fn store_bands(&mut self, json: &[u8]) -> Result<(), CacheError> {
+        let mut volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| CacheError::Filesystem)?;
+        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let mut concerts_dir = root_dir
+            .open_dir(ROOT_DIR)
+            .map_err(|_| CacheError::Filesystem)?;
+        let mut file = concerts_dir
+            .open_file_in_dir(BANDS_FILE, Mode::ReadWriteCreateOrTruncate)
+            .map_err(|_| CacheError::Write)?;
+        file.write(json).map_err(|_| CacheError::Write)?;
+        info!("Stored {} bytes of band data", json.len());
+        Ok(())
+    }
+
+    /// Load the stored SawThat bands response
+    pub fn load_bands(&mut self) -> Option<alloc::vec::Vec<u8>> {
+        let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
+        let mut root_dir = volume.open_root_dir().ok()?;
+        let mut concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
+        let mut file = concerts_dir
+            .open_file_in_dir(BANDS_FILE, Mode::ReadOnly)
+            .ok()?;
+
+        let mut buf = alloc::vec![0u8; file.length() as usize];
+        let mut total = 0;
+        while total < buf.len() {
+            match file.read(&mut buf[total..]).ok()? {
+                0 => break,
+                n => total += n,
+            }
+        }
+        buf.truncate(total);
+        info!("Loaded {} bytes of stored band data", total);
+        Some(buf)
     }
 
     /// Load orientation from cache
@@ -432,7 +485,7 @@ where
                 continue;
             };
 
-            let mut to_delete: heapless::Vec<heapless::String<16>, 64> = heapless::Vec::new();
+            let mut to_delete: alloc::vec::Vec<heapless::String<16>> = alloc::vec::Vec::new();
 
             // Find stale files
             orient_dir
@@ -451,11 +504,11 @@ where
                                 }
                             }
 
-                            // Parse to get hash and check if valid
-                            if let Some(file_hash) = parse_cache_filename(full_name.as_str())
-                                && !valid_hashes.contains(&file_hash)
+                            // Remove anything that is not a current artwork file
+                            if !parse_cache_filename(full_name.as_str())
+                                .is_some_and(|h| valid_hashes.contains(&h))
                             {
-                                let _ = to_delete.push(full_name);
+                                to_delete.push(full_name);
                             }
                         }
                     }

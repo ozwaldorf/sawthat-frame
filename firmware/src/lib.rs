@@ -7,6 +7,8 @@ pub mod cache;
 pub mod display;
 pub mod epd;
 pub mod framebuffer;
+pub mod progress;
+pub mod sync;
 pub mod widget;
 
 /// Timestamped logger for the `log` crate - adds timestamps to all log messages

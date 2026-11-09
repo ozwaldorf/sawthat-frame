@@ -79,8 +79,9 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde-json-core = "0.6"
 heapless = "0.8"
 
-# PNG decoding (no_std, no alloc)
-minipng = "0.1"
+
+# On-device artwork rendering
+sawthat-render = { path = "../render" }
 
 # SD card storage for caching
 embedded-sdmmc = "0.8"
