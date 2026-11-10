@@ -1,13 +1,14 @@
-# SawThat Frame
+<div align="center">
+  <img src="site/logo.svg" width="112" alt="SawThat Frame logo" />
+  <h1>SawThat Frame</h1>
+  <p>
+    E-paper frame showing album art for the concerts you have logged on
+    <a href="https://sawthat.band">sawthat.band</a>, running on the
+    <a href="https://www.waveshare.com/esp32-s3-photopainter.htm">Waveshare ESP32-S3-PhotoPainter</a>.
+  </p>
+</div>
 
-E-paper frame showing album art for the concerts you have logged on
-[sawthat.band](https://sawthat.band). It fetches concerts, finds album art on Deezer, renders it
-for the 6-color display and caches it on the SD card, all on the device.
-
-Runs on the [Waveshare ESP32-S3-PhotoPainter](https://www.waveshare.com/esp32-s3-photopainter.htm)
-(7.3" Spectra 6 e-paper, ESP32-S3, SD card reader).
-
-## Examples
+## Preview Gallery
 
 <table>
   <tr>
