@@ -21,14 +21,20 @@ on Deezer, renders it for the 6-color display, and caches the result on the SD c
 
 ### Rendered Artwork
 
-<img width="150" alt="Santana" src="docs/examples/santana_2012_horiz.png" />
-<img width="150" alt="Primus" src="docs/examples/primus_2014_horiz.png" />
-<img width="150" alt="Billy Strings" src="docs/examples/billy_strings_2017_horiz.png" />
-<img width="150" alt="Korn" src="docs/examples/korn_2022_horiz.png" />
-<img width="150" alt="GRiZ" src="docs/examples/griz_2022_horiz.png" />
-<img width="150" alt="Yonder Mountain" src="docs/examples/yonder_mountain_2024_horiz.png" />
-<img width="150" alt="Atmosphere" src="docs/examples/atmosphere_2025_horiz.png" />
-<img width="150" alt="Phish" src="docs/examples/phish_2025_horiz.png" />
+<table>
+  <tr>
+    <td><img width="150" alt="Santana" src="docs/examples/santana_2012_horiz.png" /></td>
+    <td><img width="150" alt="Primus" src="docs/examples/primus_2014_horiz.png" /></td>
+    <td><img width="150" alt="Billy Strings" src="docs/examples/billy_strings_2017_horiz.png" /></td>
+    <td><img width="150" alt="Korn" src="docs/examples/korn_2022_horiz.png" /></td>
+  </tr>
+  <tr>
+    <td><img width="150" alt="GRiZ" src="docs/examples/griz_2022_horiz.png" /></td>
+    <td><img width="150" alt="Yonder Mountain" src="docs/examples/yonder_mountain_2024_horiz.png" /></td>
+    <td><img width="150" alt="Atmosphere" src="docs/examples/atmosphere_2025_horiz.png" /></td>
+    <td><img width="150" alt="Phish" src="docs/examples/phish_2025_horiz.png" /></td>
+  </tr>
+</table>
 
 ## Usage
 
