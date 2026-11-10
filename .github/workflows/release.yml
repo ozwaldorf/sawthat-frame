@@ -46,9 +46,15 @@ jobs:
         run: |
           name="sawthat-frame-${GITHUB_REF_NAME}"
           elf=crates/firmware/target/xtensa-esp32s3-none-elf/release/sawthat-frame-firmware
+          image() {
+            espflash save-image --chip esp32s3 --flash-size 16mb -S \
+              --partition-table crates/firmware/partitions.csv "$@"
+          }
           mkdir dist
           cp "$elf" "dist/${name}.elf"
-          espflash save-image --chip esp32s3 --flash-size 16mb --merge --skip-padding -S "$elf" "dist/${name}.bin"
+          # Full flash image for the web installer, and the app alone for updates over WiFi
+          image --merge --skip-padding "$elf" "dist/${name}.bin"
+          image "$elf" "dist/${name}.app.bin"
           cd dist && sha256sum -- * > SHA256SUMS
 
       - uses: actions/upload-artifact@v4
@@ -62,8 +68,57 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
 
-  pages:
+  # Signs the app image for updates over WiFi (see ota.rs). The key is only available to the
+  # release environment, which only v* tags can use.
+  sign:
     needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: dist
+
+      - name: Sign app image
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+        run: |
+          if [ -z "$OTA_SIGNING_KEY" ]; then
+            echo "::error::The OTA_SIGNING_KEY secret is not set"
+            exit 1
+          fi
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$OTA_SIGNING_KEY" > "$key"
+          # The firmware only accepts updates signed with the key it was built with
+          public=$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | od -An -tx1 -v | tr -d ' \n')
+          expected=$(sed -n '/^const PUBLIC_KEY/,/^];/p' crates/firmware/src/ota.rs | grep -o '0x[0-9a-f]\{2\}' | sed 's/^0x//' | tr -d '\n')
+          if [ "$public" != "$expected" ]; then
+            echo "::error::OTA_SIGNING_KEY does not match PUBLIC_KEY in ota.rs"
+            exit 1
+          fi
+          app="dist/sawthat-frame-${GITHUB_REF_NAME}.app.bin"
+          size=$(stat -c %s "$app")
+          sha256=$(sha256sum "$app" | cut -d ' ' -f 1)
+          printf 'sawthat-frame %s %s %s' "$GITHUB_REF_NAME" "$size" "$sha256" > "$RUNNER_TEMP/message"
+          signature=$(openssl pkeyutl -sign -inkey "$key" -rawin -in "$RUNNER_TEMP/message" | od -An -tx1 -v | tr -d ' \n')
+          mkdir signed
+          jq -n --argjson size "$size" --arg sha256 "$sha256" --arg signature "$signature" \
+            '{size: $size, sha256: $sha256, signature: $signature}' > signed/ota.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signature
+          path: signed/
+
+  pages:
+    needs: [build, sign]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
@@ -81,20 +136,30 @@ jobs:
           name: firmware
           path: dist
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: signature
+          path: signed
+
       - name: Assemble site
         run: |
           cp -r site _site
           cp -r docs/examples docs/photos docs/CONFIG.TXT _site/
           # Named after the version and commit, so browsers never reuse a cached older build
-          firmware="sawthat-frame-${GITHUB_REF_NAME}-${GITHUB_SHA::10}.bin"
+          stem="sawthat-frame-${GITHUB_REF_NAME}-${GITHUB_SHA::10}"
+          firmware="$stem.bin"
+          app="$stem.app.bin"
           cp "dist/sawthat-frame-${GITHUB_REF_NAME}.bin" "_site/$firmware"
-          jq -n --arg version "$GITHUB_REF_NAME" --arg revision "${GITHUB_SHA::10}" --arg firmware "$firmware" '{
+          cp "dist/sawthat-frame-${GITHUB_REF_NAME}.app.bin" "_site/$app"
+          jq -n --arg version "$GITHUB_REF_NAME" --arg revision "${GITHUB_SHA::10}" --arg firmware "$firmware" \
+            --arg app "$app" --slurpfile ota signed/ota.json '{
             name: "SawThat Frame",
             version: $version,
             revision: $revision,
             new_install_prompt_erase: true,
             new_install_improv_wait_time: 0,
-            builds: [{chipFamily: "ESP32-S3", parts: [{path: $firmware, offset: 0}]}]
+            builds: [{chipFamily: "ESP32-S3", parts: [{path: $firmware, offset: 0}]}],
+            ota: ({path: $app} + $ota[0])
           }' > _site/manifest.json
 
       - uses: actions/configure-pages@v5
