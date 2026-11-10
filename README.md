@@ -72,12 +72,21 @@ config. The serial console is unavailable while the drive is shown.
 |-------|--------|
 | Tap KEY | Next item |
 | Hold KEY | Toggle orientation |
-| Press BOOT | Toggle USB drive mode (connected to a computer) |
+| Tap BOOT | Toggle USB drive mode (connected to a computer) |
+| Hold BOOT | Check for a firmware update and install it |
 
 Do not hold BOOT while the frame powers on: that enters ESP32 download mode.
 
+### Firmware Updates
+
+Each sync checks for a newer release and shows a notice in the top-right corner when there is
+one. Holding BOOT downloads it over WiFi, checks its signature, writes it to the spare app slot and
+restarts into it. An update that crashes, or restarts three times before refreshing the screen,
+switches back to the previous firmware.
+
 The green LED flashes once for a press and three times for a rotation. The red LED is solid when
-idle, blinks while syncing and blinks fast while connecting to WiFi.
+idle, blinks while syncing and blinks fast while connecting to WiFi. Both flash together while a
+firmware update installs.
 
 On a crash the frame shows the panic and stack trace with a QR code for a pre-filled GitHub
 issue, then turns off until KEY is pressed.
@@ -221,7 +230,10 @@ cargo run --release
 
 The runner embeds function names (`crates/symtab`) so crash reports show a named stack trace.
 
-Publishing a GitHub release attaches the firmware to it and deploys the web installer.
+Publishing a GitHub release attaches the firmware to it, signs the app image for updates over
+WiFi and deploys the web installer. Signing uses the `OTA_SIGNING_KEY` secret (an Ed25519 PEM key)
+of the `release` environment, which only `v*` tags can use; its public key is `PUBLIC_KEY` in
+`crates/firmware/src/ota.rs`. The flash layout is `crates/firmware/partitions.csv`.
 
 ### Maintenance
 

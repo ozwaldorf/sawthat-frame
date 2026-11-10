@@ -12,6 +12,7 @@ pub mod fat_label;
 pub mod framebuffer;
 pub mod installer;
 pub mod orientation;
+pub mod ota;
 pub mod progress;
 pub mod sleep;
 pub mod symbols;

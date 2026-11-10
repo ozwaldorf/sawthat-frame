@@ -195,9 +195,11 @@
       <dl class="controls card">
         <dt>Tap <kbd>KEY</kbd></dt><dd>Show the next concert</dd>
         <dt>Hold <kbd>KEY</kbd></dt><dd>Switch between horizontal and vertical</dd>
-        <dt>Press <kbd>BOOT</kbd></dt><dd>Show the SD card as a USB drive while connected to a computer</dd>
+        <dt>Tap <kbd>BOOT</kbd></dt><dd>Show the SD card as a USB drive while connected to a computer</dd>
+        <dt>Hold <kbd>BOOT</kbd></dt><dd>Check for a firmware update and install it</dd>
         <dt>Red light</dt><dd>Solid when idle, blinking while syncing, fast blink while joining WiFi</dd>
         <dt>Green light</dt><dd>One flash for the next concert, three when the orientation changes</dd>
+        <dt>Both lights</dt><dd>Flashing together while a firmware update installs</dd>
       </dl>
       <p class="muted">Refresh interval, orientation and custom fonts are covered in the <a href="https://github.com/ozwaldorf/sawthat-frame#configuration">README</a>.</p>
     </section>
@@ -248,13 +250,15 @@
       settings.hidden = keepSettings.checked;
     });
 
-    // Settings the firmware applies to CONFIG.TXT on its first start (see installer.rs)
-    const SETTINGS_OFFSET = 0xfff000;
+    // Settings the firmware applies to CONFIG.TXT on its first start (see installer.rs), in the
+    // settings partition (see partitions.csv)
+    const SETTINGS_OFFSET = 0x810000;
     const SETTINGS_MAGIC = "SAWTHAT-CONFIG-1";
     const SECTOR = 4096;
 
-    // Font copied to the SD card when the frame first starts (see installer.rs)
-    const FONT_OFFSET = 0xb00000;
+    // Font copied to the SD card when the frame first starts (see installer.rs), in the font
+    // partition (see partitions.csv)
+    const FONT_OFFSET = 0x820000;
     const FONT_MAGIC = "SAWTHAT-FONT-001";
     const MAX_FONT = 4 * 1024 * 1024;
 

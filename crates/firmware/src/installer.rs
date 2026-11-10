@@ -1,33 +1,31 @@
 //! Files written by the web installer.
 //!
-//! The installer can flash two things past the app, for the firmware to apply at boot:
+//! The installer can flash two things besides the firmware, for it to apply at boot, each in its
+//! own partition (see `partitions.csv`):
 //!
-//! - Config settings, as `KEY=VALUE` lines in the last sector of the flash, applied to
-//!   `CONFIG.TXT` on the SD card.
-//! - A font for the artwork, in the end of the app partition, copied to the SD card.
+//! - Config settings, as `KEY=VALUE` lines in the `settings` partition, applied to `CONFIG.TXT`
+//!   on the SD card.
+//! - A font for the artwork, in the `font` partition, copied to the SD card.
 //!
 //! Each is erased once applied, so it applies once and the WiFi password does not stay in flash.
 //! Each starts with a magic, so anything else there, such as erased flash, holds nothing.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use esp_hal::peripherals::FLASH;
+use esp_bootloader_esp_idf::partitions::{PARTITION_TABLE_MAX_LEN, read_partition_table};
 use esp_storage::FlashStorage;
 
 const SECTOR: u32 = FlashStorage::SECTOR_SIZE;
 
-/// Start of the settings sector: the last 4 KB of the 16 MB flash. Layout, little endian: the
-/// magic, the length of the lines, an FNV-1a hash of them, then the lines.
-pub const SETTINGS_OFFSET: u32 = 0xFF_F000;
+/// Settings layout, little endian: the magic, the length of the lines, an FNV-1a hash of them,
+/// then the lines
 const SETTINGS_MAGIC: [u8; 16] = *b"SAWTHAT-CONFIG-1";
 const SETTINGS_HEADER: usize = SETTINGS_MAGIC.len() + 8;
 
-/// Start of the font area, 11 MB into the app partition, which ends at 0xFB0000. Layout, little
-/// endian: the magic, the file extension padded with zeros, the font length, an FNV-1a hash of
-/// the font, then the font.
-pub const FONT_OFFSET: u32 = 0xB0_0000;
-const FONT_END: u32 = 0xFB_0000;
+/// Font layout, little endian: the magic, the file extension padded with zeros, the font length,
+/// an FNV-1a hash of the font, then the font
 const FONT_MAGIC: [u8; 16] = *b"SAWTHAT-FONT-001";
 const FONT_HEADER: usize = FONT_MAGIC.len() + 12;
 
@@ -43,36 +41,71 @@ const KEYS: [&str; 5] = [
 /// Font file names the installer may write
 pub const FONT_NAMES: [&str; 2] = ["FONT.TTF", "FONT.OTF"];
 
-/// The flash areas the installer writes
-pub struct Installer(FlashStorage<'static>);
+/// A partition's offset and length in flash
+#[derive(Clone, Copy)]
+struct Area {
+    offset: u32,
+    len: u32,
+}
 
-impl Installer {
-    pub fn new(flash: FLASH<'static>) -> Self {
-        // The render task runs on the other core, which must pause while the flash is busy
-        Self(FlashStorage::new(flash).multicore_auto_park())
+/// The flash partitions the installer writes
+pub struct Installer<'a> {
+    flash: &'a mut FlashStorage<'static>,
+    settings: Option<Area>,
+    font: Option<Area>,
+}
+
+impl<'a> Installer<'a> {
+    /// Find the installer partitions in the partition table
+    pub fn new(flash: &'a mut FlashStorage<'static>) -> Self {
+        let mut buf = Box::new([0u8; PARTITION_TABLE_MAX_LEN]);
+        let (settings, font) = match read_partition_table(flash, &mut *buf) {
+            Ok(table) => {
+                let find = |label: &str| {
+                    table
+                        .iter()
+                        .find(|part| part.label_as_str() == label)
+                        .map(|part| Area {
+                            offset: part.offset(),
+                            len: part.len(),
+                        })
+                };
+                (find("settings"), find("font"))
+            }
+            Err(e) => {
+                log::info!("Failed to read the partition table: {:?}", e);
+                (None, None)
+            }
+        };
+        Self {
+            flash,
+            settings,
+            font,
+        }
     }
 
     /// Read `buf.len()` bytes at `offset`, logging a failure
     fn read(&mut self, offset: u32, buf: &mut [u8]) -> Option<()> {
-        self.0
+        self.flash
             .read(offset, buf)
             .map_err(|e| log::info!("Failed to read installer data at {:#x}: {:?}", offset, e))
             .ok()
     }
 
-    /// The settings as (key, value) pairs, or `None` if the sector holds none
+    /// The settings as (key, value) pairs, or `None` if the partition holds none
     pub fn settings(&mut self) -> Option<Vec<(String, String)>> {
+        let area = self.settings?;
         let mut header = [0u8; SETTINGS_HEADER];
-        self.read(SETTINGS_OFFSET, &mut header)?;
+        self.read(area.offset, &mut header)?;
         if header[..SETTINGS_MAGIC.len()] != SETTINGS_MAGIC {
             return None;
         }
         let len = le_u32(&header, SETTINGS_MAGIC.len()) as usize;
-        if len > SECTOR as usize - SETTINGS_HEADER {
+        if len > area.len as usize - SETTINGS_HEADER {
             return None;
         }
         let mut lines = alloc::vec![0u8; len];
-        self.read(SETTINGS_OFFSET + SETTINGS_HEADER as u32, &mut lines)?;
+        self.read(area.offset + SETTINGS_HEADER as u32, &mut lines)?;
         if fnv1a(&lines) != le_u32(&header, SETTINGS_MAGIC.len() + 4) {
             return None;
         }
@@ -89,13 +122,16 @@ impl Installer {
 
     /// Erase the settings once applied
     pub fn clear_settings(&mut self) {
-        self.erase(SETTINGS_OFFSET, SETTINGS_OFFSET + SECTOR);
+        if let Some(area) = self.settings {
+            self.erase(area.offset, area.offset + area.len);
+        }
     }
 
     /// The font as its file name on the SD card and its contents, or `None` if there is none
     pub fn font(&mut self) -> Option<(&'static str, Vec<u8>)> {
+        let area = self.font?;
         let mut header = [0u8; FONT_HEADER];
-        self.read(FONT_OFFSET, &mut header)?;
+        self.read(area.offset, &mut header)?;
         if header[..FONT_MAGIC.len()] != FONT_MAGIC {
             return None;
         }
@@ -105,11 +141,11 @@ impl Installer {
             .into_iter()
             .find(|name| name.as_bytes()[5..] == ext[..3] && ext[3] == 0)?;
         let len = le_u32(&header, FONT_MAGIC.len() + 4);
-        if len as u64 + (FONT_OFFSET as usize + FONT_HEADER) as u64 > FONT_END as u64 {
+        if len as u64 + FONT_HEADER as u64 > area.len as u64 {
             return None;
         }
         let mut font = alloc::vec![0u8; len as usize];
-        self.read(FONT_OFFSET + FONT_HEADER as u32, &mut font)?;
+        self.read(area.offset + FONT_HEADER as u32, &mut font)?;
         if fnv1a(&font) != le_u32(&header, FONT_MAGIC.len() + 8) {
             return None;
         }
@@ -118,12 +154,14 @@ impl Installer {
 
     /// Erase a font of `len` bytes once copied
     pub fn clear_font(&mut self, len: usize) {
-        let end = (FONT_OFFSET + (FONT_HEADER + len) as u32).div_ceil(SECTOR) * SECTOR;
-        self.erase(FONT_OFFSET, end.min(FONT_END));
+        if let Some(area) = self.font {
+            let end = (FONT_HEADER as u32 + len as u32).div_ceil(SECTOR) * SECTOR;
+            self.erase(area.offset, area.offset + end.min(area.len));
+        }
     }
 
     fn erase(&mut self, from: u32, to: u32) {
-        if let Err(e) = self.0.erase(from, to) {
+        if let Err(e) = self.flash.erase(from, to) {
             log::info!("Failed to clear installer data at {:#x}: {:?}", from, e);
         }
     }

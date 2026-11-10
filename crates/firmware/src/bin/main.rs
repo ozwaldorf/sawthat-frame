@@ -51,6 +51,7 @@ use esp_radio::wifi::{
     WifiController, sta::StationConfig,
 };
 use esp_rtos::embassy::Executor;
+use esp_storage::FlashStorage;
 use sawthat_frame_firmware::TimestampLogger;
 use sawthat_frame_firmware::battery;
 use sawthat_frame_firmware::cache::ConcertList;
@@ -61,6 +62,7 @@ use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
 use sawthat_frame_firmware::installer::Installer;
 use sawthat_frame_firmware::orientation::Orientation;
+use sawthat_frame_firmware::ota;
 use sawthat_frame_firmware::progress;
 use sawthat_frame_firmware::sync::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::usb_drive;
@@ -117,6 +119,8 @@ const ALDO4: u8 = 1 << 3;
 const BATTERY_LOG: &str = "BATTERY.CSV";
 /// Display busy polling interval in milliseconds (display refresh takes seconds)
 const DISPLAY_BUSY_POLL_MS: u64 = 200;
+/// Longest a refresh may keep the panel busy
+const PANEL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Magic number to validate RTC memory state
 const SLEEP_STATE_MAGIC: u32 = 0xCAFE_F00D;
 
@@ -135,6 +139,10 @@ static mut SETUP_PENDING: bool = false;
 /// Hash of the setup screen on the panel (see `message_hash`), so an unchanged one is not redrawn
 #[esp_hal::ram(unstable(rtc_fast))]
 static mut SETUP_SHOWN: u32 = 0;
+
+/// Latest released firmware version from the last successful update check
+#[esp_hal::ram(unstable(rtc_fast))]
+static mut LATEST_VERSION: [u16; 3] = [0; 3];
 
 /// State persisted in RTC memory across deep sleep
 #[repr(C)]
@@ -221,8 +229,10 @@ impl SleepState {
 /// Button monitor state
 static BUTTON_STATE: AtomicU8 = AtomicU8::new(BUTTON_CANCELLED);
 
-/// Set by a BOOT press while awake; enters or leaves USB drive mode when a computer is connected
+/// Set by a BOOT tap while awake; enters or leaves USB drive mode when a computer is connected
 static BOOT_PRESSED: AtomicBool = AtomicBool::new(false);
+/// Set by a BOOT hold while awake; checks for and installs a firmware update
+static BOOT_HELD: AtomicBool = AtomicBool::new(false);
 
 /// Last station disconnect reason, and whether the station joined the network
 static WIFI_REASON: critical_section::Mutex<Cell<Option<DisconnectReason>>> =
@@ -246,6 +256,8 @@ enum LedCommand {
     RedSolid,
     /// Alternate red and green at interval (ms)
     Alternate(u16),
+    /// Flash red and green together at interval (ms)
+    Together(u16),
 }
 
 /// Signal to wake LED task when commands are sent
@@ -312,6 +324,8 @@ async fn led_task(led_red: &'static mut Output<'static>, led_green: &'static mut
         RedBlink(u64),
         /// Red and green alternating at the interval (ms)
         Alternate(u64),
+        /// Red and green flashing together at the interval (ms)
+        Together(u64),
     }
 
     // LEDs are active low
@@ -319,7 +333,7 @@ async fn led_task(led_red: &'static mut Output<'static>, led_green: &'static mut
     loop {
         let cmd = match mode {
             Mode::Solid => Some(LED_SIGNAL.wait().await),
-            Mode::RedBlink(ms) | Mode::Alternate(ms) => {
+            Mode::RedBlink(ms) | Mode::Alternate(ms) | Mode::Together(ms) => {
                 match select(LED_SIGNAL.wait(), Timer::after(Duration::from_millis(ms))).await {
                     Either::First(cmd) => Some(cmd),
                     Either::Second(()) => None,
@@ -329,7 +343,7 @@ async fn led_task(led_red: &'static mut Output<'static>, led_green: &'static mut
         match cmd {
             None => {
                 led_red.toggle();
-                if matches!(mode, Mode::Alternate(_)) {
+                if matches!(mode, Mode::Alternate(_) | Mode::Together(_)) {
                     led_green.toggle();
                 }
             }
@@ -340,20 +354,28 @@ async fn led_task(led_red: &'static mut Output<'static>, led_green: &'static mut
                     led_green.set_high();
                     Timer::after(Duration::from_millis(100)).await;
                 }
-                // Keep alternating out of phase with red
-                if matches!(mode, Mode::Alternate(_)) && led_red.is_set_high() {
-                    led_green.set_low();
+                // Keep alternating out of phase with red, or flashing in phase
+                match mode {
+                    Mode::Alternate(_) if led_red.is_set_high() => led_green.set_low(),
+                    Mode::Together(_) if led_red.is_set_low() => led_green.set_low(),
+                    _ => {}
                 }
             }
             Some(LedCommand::RedBlink(ms)) => mode = Mode::RedBlink(ms as u64),
             Some(LedCommand::RedSolid) => {
                 mode = Mode::Solid;
                 led_red.set_low();
+                led_green.set_high();
             }
             Some(LedCommand::Alternate(ms)) => {
                 mode = Mode::Alternate(ms as u64);
                 led_red.set_low();
                 led_green.set_high();
+            }
+            Some(LedCommand::Together(ms)) => {
+                mode = Mode::Together(ms as u64);
+                led_red.set_low();
+                led_green.set_low();
             }
         }
     }
@@ -372,6 +394,11 @@ fn start_fast_blink() {
 /// Alternate red and green LEDs (USB drive mode)
 fn start_alternate() {
     LED_SIGNAL.signal(LedCommand::Alternate(250));
+}
+
+/// Flash red and green LEDs together (firmware update)
+fn start_together() {
+    LED_SIGNAL.signal(LedCommand::Together(250));
 }
 
 /// Stop blinking and keep red LED solid on
@@ -397,13 +424,24 @@ fn button_pending() -> bool {
     )
 }
 
-/// Records BOOT presses from pin edges in `BOOT_PRESSED`
+/// Records BOOT taps in `BOOT_PRESSED` and holds in `BOOT_HELD`
 #[embassy_executor::task]
 async fn boot_monitor_task(boot: &'static mut Input<'static>) {
     loop {
         boot.wait_for_falling_edge().await;
-        BOOT_PRESSED.store(true, Ordering::Relaxed);
-        flash_green(1);
+        let held = with_timeout(
+            Duration::from_millis(HOLD_THRESHOLD_MS as u64),
+            boot.wait_for_high(),
+        )
+        .await
+        .is_err();
+        if held {
+            BOOT_HELD.store(true, Ordering::Relaxed);
+            flash_green(3);
+        } else {
+            BOOT_PRESSED.store(true, Ordering::Relaxed);
+            flash_green(1);
+        }
         boot.wait_for_high().await;
         Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
     }
@@ -577,6 +615,20 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO0,
         InputConfig::default().with_pull(Pull::Up),
     );
+
+    // BOOT held at wake: check for and install a firmware update; a tap enters drive mode
+    let mut update_requested = false;
+    if boot_wake {
+        let mut hold_time_ms: u32 = 0;
+        while boot_input.is_low() && hold_time_ms < HOLD_THRESHOLD_MS {
+            Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+            hold_time_ms += BUTTON_POLL_MS as u32;
+        }
+        update_requested = hold_time_ms >= HOLD_THRESHOLD_MS;
+        if update_requested {
+            flash_green(3);
+        }
+    }
     spawner.spawn(boot_monitor_task(mk_static!(Input<'static>, boot_input)).unwrap());
 
     // ==================== Normal Boot Sequence ====================
@@ -612,7 +664,12 @@ async fn main(spawner: Spawner) -> ! {
     let sd_cs = Output::new(peripherals.GPIO38, Level::High, OutputConfig::default());
     let sd_spi_device = ExclusiveDevice::new_no_delay(sd_spi, sd_cs).unwrap();
 
-    let mut installer = Installer::new(peripherals.FLASH);
+    // The render task runs on the other core, which must pause while the flash is busy
+    let mut flash = FlashStorage::new(peripherals.FLASH).multicore_auto_park();
+    // An update that crashed or keeps restarting goes back to the previous firmware
+    ota::check_boot(&mut flash, crash::pending().is_some());
+
+    let mut installer = Installer::new(&mut flash);
     let mut sd_cache = match SdCache::new(sd_spi_device, delay.clone()) {
         Ok(mut cache) => {
             if let Err(e) = cache.init() {
@@ -779,7 +836,11 @@ async fn main(spawner: Spawner) -> ! {
                 let exit = usb_drive::serve(
                     cache.into_card(),
                     usb,
-                    || button_pending() || BOOT_PRESSED.load(Ordering::Relaxed),
+                    || {
+                        button_pending()
+                            || BOOT_PRESSED.load(Ordering::Relaxed)
+                            || BOOT_HELD.load(Ordering::Relaxed)
+                    },
                     $tick,
                 )
                 .await;
@@ -830,6 +891,7 @@ async fn main(spawner: Spawner) -> ! {
                 match epd.display_start(framebuffer.as_slice(), &mut delay) {
                     Ok(()) => {
                         unsafe { SETUP_SHOWN = shown };
+                        ota::confirm(&mut flash);
                         panel_busy = true;
                     }
                     Err(e) => info!("Setup screen refresh failed: {:?}", e),
@@ -911,9 +973,9 @@ async fn main(spawner: Spawner) -> ! {
     };
     info!("Refresh interval: {} minutes", config.refresh_minutes);
 
-    // BOOT pressed during sleep: enter drive mode if a computer is connected, otherwise sleep
+    // BOOT tapped during sleep: enter drive mode if a computer is connected, otherwise sleep
     // until the timer wake that was already scheduled
-    if boot_wake {
+    if boot_wake && !update_requested {
         info!("Woken by BOOT");
         let host = usb_host_connected().await;
         if host {
@@ -1013,6 +1075,100 @@ async fn main(spawner: Spawner) -> ! {
             }
             wifi_connected
         }};
+    }
+
+    // Wait for a refresh to finish, giving up on a panel that stays busy
+    macro_rules! wait_for_panel {
+        () => {{
+            with_timeout(PANEL_TIMEOUT, async {
+                while epd.is_busy() {
+                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| info!("Panel still busy"));
+        }};
+    }
+
+    // Redraw the update notice for `$version`, as installing or not
+    macro_rules! show_update_notice {
+        ($version:expr, $installing:expr) => {{
+            let rect = progress::draw_update(&mut framebuffer, orientation, $version, $installing);
+            let region = framebuffer.extract_rect(&rect);
+            if epd.partial_update_start(&rect, &region, &mut delay).is_ok() {
+                wait_for_panel!();
+            }
+        }};
+    }
+
+    // Check for a firmware update and install it if it is newer, restarting into it
+    macro_rules! update_firmware {
+        () => {{
+            info!("Checking for a firmware update");
+            if ensure_wifi!() {
+                let mut net = sync::Net {
+                    tcp: tcp_client.as_ref().unwrap(),
+                    dns: dns_socket.as_ref().unwrap(),
+                    tls_read: &mut *tls_read_buf,
+                    tls_write: &mut *tls_write_buf,
+                    cover_tls_read: &mut *cover_tls_read_buf,
+                    cover_tls_write: &mut *cover_tls_write_buf,
+                };
+                match sync::fetch_manifest(&mut net).await {
+                    Err(e) => info!("Update check failed: {:?}", e),
+                    Ok(update) => {
+                        unsafe { LATEST_VERSION = update.version };
+                        let [major, minor, patch] = update.version;
+                        let version = alloc::format!("v{major}.{minor}.{patch}");
+                        let newer = update.is_newer();
+                        match update.release {
+                            _ if !newer => info!("Firmware is up to date ({})", version),
+                            None => info!("Release {} has no signed image", version),
+                            Some(release) => {
+                                start_together();
+                                show_update_notice!(&version, true);
+                                let installed =
+                                    match sync::download_release(&mut net, &release).await {
+                                        Err(e) => {
+                                            info!("Update download failed: {:?}", e);
+                                            false
+                                        }
+                                        Ok(image) => {
+                                            let result = match ota::check_image(&release, &image) {
+                                                Ok(()) => ota::install(&mut flash, &image).await,
+                                                Err(e) => Err(e),
+                                            };
+                                            result
+                                                .map_err(|e| info!("Update not installed: {:?}", e))
+                                                .is_ok()
+                                        }
+                                    };
+                                if installed {
+                                    // The next boot initializes the panel again
+                                    info!("Restarting into the update");
+                                    delay.delay_ms(100);
+                                    esp_hal::system::software_reset();
+                                }
+                                show_update_notice!(&version, false);
+                            }
+                        }
+                    }
+                }
+                wifi_stop(&mut wifi_controller).await;
+                wifi_connected = false;
+            }
+            stop_blink();
+        }};
+    }
+
+    // BOOT held during sleep: update, then sleep until the timer wake that was already scheduled
+    if update_requested {
+        info!("Woken by a BOOT hold");
+        update_firmware!();
+        if resuming {
+            power_down_panel!();
+            sleep_until_scheduled(&mut rtc, &mut i2c);
+        }
     }
 
     // ==================== Concert List ====================
@@ -1189,6 +1345,19 @@ async fn main(spawner: Spawner) -> ! {
                         cover_tls_write: &mut *cover_tls_write_buf,
                     };
 
+                    // Before the cached screen is shown, so it carries the notice
+                    match sync::fetch_manifest(&mut net).await {
+                        Ok(update) => {
+                            let [major, minor, patch] = update.version;
+                            info!("Latest firmware: v{}.{}.{}", major, minor, patch);
+                            unsafe { LATEST_VERSION = update.version };
+                            if cached_ready {
+                                draw_update_notice(&mut framebuffer, orientation);
+                            }
+                        }
+                        Err(e) => info!("Update check failed: {:?}", e),
+                    }
+
                     let concerts = match sync::fetch_bands(&mut net, &config.user_id)
                         .await
                         .ok()
@@ -1319,6 +1488,7 @@ async fn main(spawner: Spawner) -> ! {
                             ));
                             framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
                             draw_battery_icon(&mut framebuffer, orientation, $battery);
+                            draw_update_notice(&mut framebuffer, orientation);
                             p.draw(&mut framebuffer, 0);
                             if epd
                                 .display_start(framebuffer.as_slice(), &mut delay)
@@ -1579,6 +1749,7 @@ async fn main(spawner: Spawner) -> ! {
                     continue;
                 }
                 draw_battery_icon(&mut framebuffer, orientation, power);
+                draw_update_notice(&mut framebuffer, orientation);
 
                 framebuffer.extract_half(next_slot, &mut *half_buffer);
                 let x_offset = if next_slot == 0 { 0 } else { 400 };
@@ -1650,7 +1821,10 @@ async fn main(spawner: Spawner) -> ! {
                 Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
             }
             match epd.finish_display(&mut delay) {
-                Ok(()) => info!("Display refresh successful!"),
+                Ok(()) => {
+                    info!("Display refresh successful!");
+                    ota::confirm(&mut flash);
+                }
                 Err(e) => info!("Display refresh failed: {:?}", e),
             }
 
@@ -1718,6 +1892,13 @@ async fn main(spawner: Spawner) -> ! {
             slot_items[0],
             slot_items[1]
         );
+    }
+
+    // BOOT held while awake: check for and install a firmware update
+    if BOOT_HELD.swap(false, Ordering::Relaxed) {
+        info!("BOOT held");
+        epd.wake_up(&mut delay).ok();
+        update_firmware!();
     }
 
     if wifi_connected {
@@ -1975,7 +2156,7 @@ fn save_orientation<S: SpiDevice, D: DelayNs>(cache: &mut SdCache<S, D>, orienta
 /// none, then erase them. They stay in flash for the next boot if the card cannot be written.
 fn apply_installer_settings<S: SpiDevice, D: DelayNs>(
     cache: &mut SdCache<S, D>,
-    installer: &mut Installer,
+    installer: &mut Installer<'_>,
 ) {
     let Some(settings) = installer.settings() else {
         return;
@@ -2013,7 +2194,7 @@ fn apply_installer_settings<S: SpiDevice, D: DelayNs>(
 /// It stays in flash for the next boot if the card cannot be written.
 fn apply_installer_font<S: SpiDevice, D: DelayNs>(
     cache: &mut SdCache<S, D>,
-    installer: &mut Installer,
+    installer: &mut Installer<'_>,
 ) {
     let Some((name, font)) = installer.font() else {
         return;
@@ -2328,8 +2509,29 @@ fn compose_screen<S: SpiDevice, D: DelayNs>(
         .all(|(slot, path)| draw_stored(cache, framebuffer, buf, path, orientation, slot as u8));
     if drawn {
         draw_battery_icon(framebuffer, orientation, power);
+        draw_update_notice(framebuffer, orientation);
     }
     drawn
+}
+
+/// Draw the firmware notice: the version just installed on the first screen after an update, or
+/// a newer firmware than this one if one was found
+fn draw_update_notice(framebuffer: &mut Framebuffer, orientation: Orientation) {
+    let [major, minor, patch] = unsafe { LATEST_VERSION };
+    if ota::is_new() {
+        progress::draw_installed(
+            framebuffer,
+            orientation,
+            &alloc::format!("v{}", crash::FIRMWARE_VERSION),
+        );
+    } else if ota::is_newer([major, minor, patch]) {
+        progress::draw_update(
+            framebuffer,
+            orientation,
+            &alloc::format!("v{major}.{minor}.{patch}"),
+            false,
+        );
+    }
 }
 
 /// Battery icon position: centered at the top in horizontal, top right in vertical

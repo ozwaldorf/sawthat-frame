@@ -21,7 +21,7 @@ use reqwless::response::Response;
 use sawthat_render::concerts::{self, Album, Concert};
 use sawthat_render::{ConcertInfo, Renderer, cover_size, decode_jpeg, primary_color};
 
-use crate::config;
+use crate::{config, ota};
 
 /// TLS buffer sizes
 pub const TLS_READ_BUF_SIZE: usize = 16640;
@@ -49,6 +49,8 @@ pub enum SyncError {
     NoImage,
     /// The SawThat profile page has no user ID
     NoUserId,
+    /// The installer manifest has no valid version
+    BadManifest,
 }
 
 /// Run one request stage, failing if it makes no progress within `STAGE_TIMEOUT`
@@ -126,6 +128,34 @@ pub async fn fetch_bands<T: TcpConnect, D: Dns>(
 ) -> Result<Vec<u8>, SyncError> {
     let url = format!("{}{}", concerts::SAWTHAT_BANDS_URL, user_id);
     net.get(&url, MAX_JSON).await
+}
+
+/// Web installer manifest, naming the latest release and its signed app image. Test builds may
+/// point elsewhere.
+const MANIFEST_URL: &str = match option_env!("SAWTHAT_MANIFEST_URL") {
+    Some(url) => url,
+    None => "https://ozwaldorf.github.io/sawthat-frame/manifest.json",
+};
+const MAX_MANIFEST: usize = 16 * 1024;
+/// Largest app image, the size of an app slot
+const MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// Fetch the latest release from the web installer manifest, in one attempt
+pub async fn fetch_manifest<T: TcpConnect, D: Dns>(
+    net: &mut Net<'_, T, D>,
+) -> Result<ota::Update, SyncError> {
+    let body = net.get_once(MANIFEST_URL, MAX_MANIFEST).await?;
+    ota::parse_manifest(&body).ok_or(SyncError::BadManifest)
+}
+
+/// Download a release's app image
+pub async fn download_release<T: TcpConnect, D: Dns>(
+    net: &mut Net<'_, T, D>,
+    release: &ota::Release,
+) -> Result<Vec<u8>, SyncError> {
+    let base = &MANIFEST_URL[..MANIFEST_URL.rfind('/').unwrap_or(0) + 1];
+    let url = format!("{base}{}", release.path);
+    net.get(&url, release.size.min(MAX_IMAGE_SIZE)).await
 }
 
 /// Look up the user ID of SawThat user `name` from the avatar URL on their profile page

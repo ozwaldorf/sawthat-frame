@@ -1,6 +1,6 @@
 //! Sync progress dialogs: a small box in the top-left screen corner, or a larger centered
-//! welcome box with usage instructions for a first sync, and a setup box for a missing or
-//! invalid configuration.
+//! welcome box with usage instructions for a first sync, a setup box for a missing or
+//! invalid configuration, and an update notice in the top-right corner.
 //!
 //! The dialog ("Syncing N concerts..." and a progress bar) is drawn once, either as part of a
 //! full refresh or as its own partial refresh. Later updates only refresh the newly filled
@@ -63,6 +63,27 @@ const DRIVE_LINES: [&str; 3] = [
     "Eject it or press BOOT to finish,",
     "then the frame restarts and syncs.",
 ];
+
+/// Update notice line after the title, before and during the install
+const UPDATE_HINT: &str = "Hold BOOT to install";
+const UPDATE_INSTALLING: &str = "Installing firmware...";
+
+/// Where a notice box is placed on the screen: centered, or a compact box in the top-right corner
+#[derive(Clone, Copy)]
+enum Anchor {
+    Center,
+    TopRight,
+}
+
+impl Anchor {
+    /// Title size, note size, and gap below the title
+    fn sizes(self) -> (f32, f32, u32) {
+        match self {
+            Self::Center => (TITLE_SIZE, NOTE_SIZE, SECTION_GAP / 2),
+            Self::TopRight => (20.0, 16.0, 0),
+        }
+    }
+}
 
 /// Panel partial window alignment in framebuffer x
 const ALIGN: u32 = 8;
@@ -170,6 +191,7 @@ pub fn draw_setup(framebuffer: &mut Framebuffer, orientation: Orientation, error
         "SawThat Frame Setup",
         Some(error),
         &SETUP_LINES,
+        Anchor::Center,
     );
 }
 
@@ -182,7 +204,41 @@ pub fn draw_drive_mode(framebuffer: &mut Framebuffer, orientation: Orientation) 
         "USB Drive Mode",
         None,
         &DRIVE_LINES,
+        Anchor::Center,
     )
+}
+
+/// Draw a box in the top-right corner saying firmware `version` is available
+pub fn draw_update(
+    framebuffer: &mut Framebuffer,
+    orientation: Orientation,
+    version: &str,
+    installing: bool,
+) -> Rect {
+    draw_notice(
+        framebuffer,
+        orientation,
+        &format!("Update {version} available"),
+        None,
+        &[if installing {
+            UPDATE_INSTALLING
+        } else {
+            UPDATE_HINT
+        }],
+        Anchor::TopRight,
+    )
+}
+
+/// Draw a box in the top-right corner saying firmware `version` was just installed
+pub fn draw_installed(framebuffer: &mut Framebuffer, orientation: Orientation, version: &str) {
+    draw_notice(
+        framebuffer,
+        orientation,
+        &format!("Installed {version}"),
+        None,
+        &[],
+        Anchor::TopRight,
+    );
 }
 
 /// Crash screen margin, text sizes, and gap between the text and the QR code
@@ -464,29 +520,35 @@ fn wrap(text: &str, max_chars: usize) -> Vec<String> {
     lines
 }
 
-/// Draw a centered box with a title, an optional red line, and notes, returning its
-/// framebuffer region
+/// Draw a box with a title, an optional red line, and notes, returning its framebuffer region
 fn draw_notice(
     framebuffer: &mut Framebuffer,
     orientation: Orientation,
     title: &str,
     alert: Option<&str>,
     notes: &[&str],
+    anchor: Anchor,
 ) -> Rect {
     let font = font();
     let mut lines = Vec::new();
+    let (title_size, note_size, title_gap) = anchor.sizes();
     let mut y = PADDING;
-    lines.push((String::from(title), TITLE_SIZE, BLACK, y));
-    y += line_h(TITLE_SIZE) + SECTION_GAP / 2;
+    lines.push((String::from(title), title_size, BLACK, y));
+    y += line_h(title_size) + title_gap;
     if let Some(alert) = alert {
-        lines.push((String::from(alert), NOTE_SIZE, RED, y));
-        y += line_h(NOTE_SIZE) + SECTION_GAP - LINE_GAP;
+        lines.push((String::from(alert), note_size, RED, y));
+        y += line_h(note_size) + SECTION_GAP - LINE_GAP;
     }
     for &text in notes {
-        lines.push((String::from(text), NOTE_SIZE, BLACK, y));
-        y += line_h(NOTE_SIZE);
+        lines.push((String::from(text), note_size, BLACK, y));
+        y += line_h(note_size);
     }
     let box_h = y + PADDING - LINE_GAP;
+    // A corner box is redrawn alone, so its refresh window must not reach past it
+    let box_h = match anchor {
+        Anchor::Center => box_h,
+        Anchor::TopRight => box_h.div_ceil(ALIGN) * ALIGN,
+    };
 
     let content_w = lines
         .iter()
@@ -514,7 +576,10 @@ fn draw_notice(
         );
     }
 
-    let origin = (sw.saturating_sub(box_w) / 2, sh.saturating_sub(box_h) / 2);
+    let origin = match anchor {
+        Anchor::Center => (sw.saturating_sub(box_w) / 2, sh.saturating_sub(box_h) / 2),
+        Anchor::TopRight => (sw.saturating_sub(box_w + MARGIN), MARGIN),
+    };
     for y in 0..box_h {
         for x in 0..box_w {
             let (fx, fy) = to_framebuffer(orientation, origin.0 + x, origin.1 + y);

@@ -1,0 +1,10 @@
+# Name,   Type, SubType,   Offset,   Size
+# Selects the app slot to boot
+otadata,  data, ota,       0x9000,   0x2000
+# Two app slots: one runs while an update is written to the other
+ota_0,    app,  ota_0,     0x10000,  0x400000
+ota_1,    app,  ota_1,     0x410000, 0x400000
+# Settings from the web installer, applied to CONFIG.TXT on the first start
+settings, data, undefined, 0x810000, 0x10000
+# Artwork font from the web installer, copied to the SD card on the first start
+font,     data, undefined, 0x820000, 0x7E0000
