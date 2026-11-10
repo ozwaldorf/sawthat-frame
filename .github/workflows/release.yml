@@ -48,7 +48,7 @@ jobs:
           elf=crates/firmware/target/xtensa-esp32s3-none-elf/release/sawthat-frame-firmware
           mkdir dist
           cp "$elf" "dist/${name}.elf"
-          espflash save-image --chip esp32s3 --merge --skip-padding -S "$elf" "dist/${name}.bin"
+          espflash save-image --chip esp32s3 --flash-size 16mb --merge --skip-padding -S "$elf" "dist/${name}.bin"
           cd dist && sha256sum -- * > SHA256SUMS
 
       - uses: actions/upload-artifact@v4
@@ -61,3 +61,45 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  pages:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: dist
+
+      - name: Assemble site
+        run: |
+          cp -r site _site
+          cp -r docs/examples docs/CONFIG.TXT _site/
+          cp "dist/sawthat-frame-${GITHUB_REF_NAME}.bin" _site/firmware.bin
+          jq -n --arg version "$GITHUB_REF_NAME" --arg revision "${GITHUB_SHA::10}" '{
+            name: "SawThat Frame",
+            version: $version,
+            revision: $revision,
+            new_install_prompt_erase: true,
+            new_install_improv_wait_time: 0,
+            builds: [{chipFamily: "ESP32-S3", parts: [{path: "firmware.bin", offset: 0}]}]
+          }' > _site/manifest.json
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

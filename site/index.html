@@ -1,0 +1,606 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SawThat Frame</title>
+  <meta name="description" content="E-paper frame showing album art for the concerts you have been to, from sawthat.band. Install the firmware from your browser.">
+  <link rel="icon" href="logo.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;700&family=IBM+Plex+Sans:wght@400;600;700&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="wordmark" href="#">
+        <img src="logo.svg" width="42" height="30" alt="">
+        SawThat Frame
+      </a>
+      <nav class="topnav">
+        <a href="#artwork">Artwork</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/ozwaldorf/sawthat-frame">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="wrap hero">
+      <div class="hero-text">
+        <p class="eyebrow">Firmware for the ESP32-S3 PhotoPainter</p>
+        <h1>The concerts you saw, on your wall.</h1>
+        <p class="lede">
+          An e-paper frame that shows album art for the shows you have been to, pulled from
+          <a href="https://sawthat.band">sawthat.band</a>. It fetches your concerts, finds the
+          artwork, dithers it for the 6-color panel and caches it on the SD card, all on the device.
+        </p>
+        <div class="actions">
+          <a class="button primary" href="#install">Install firmware</a>
+          <a class="button" href="https://github.com/ozwaldorf/sawthat-frame">View source</a>
+        </div>
+        <p class="meta" id="version" hidden></p>
+      </div>
+      <img class="hero-photo" src="https://github.com/user-attachments/assets/1339362c-3e16-41e8-9678-fdbbde66b622" alt="The frame on a shelf showing two concert posters side by side">
+    </section>
+
+    <section class="wrap section split">
+      <img class="split-photo" src="https://github.com/user-attachments/assets/48a749e5-eb84-4dd3-bde5-b50005cf1192" alt="The frame in vertical orientation showing one concert poster" loading="lazy">
+      <div>
+        <div class="section-head">
+          <p class="eyebrow">How it works</p>
+          <h2>Set it up once, then leave it</h2>
+        </div>
+        <ul class="features">
+          <li>
+            <h3>Runs on the device</h3>
+            <p>No server or app. The frame talks to SawThat and Deezer directly over WiFi.</p>
+          </li>
+          <li>
+            <h3>Asleep between refreshes</h3>
+            <p>It wakes to show the next concert, and only syncs once it has shown them all. The rest of the time artwork comes from the SD card.</p>
+          </li>
+          <li>
+            <h3>Settings in a text file</h3>
+            <p><code>CONFIG.TXT</code> on the SD card. Press <kbd>BOOT</kbd> while connected to a computer to edit it as a USB drive.</p>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="wrap section" id="artwork">
+      <div class="section-head">
+        <p class="eyebrow">Artwork</p>
+        <h2>Rendered on the frame</h2>
+        <p>Album art is resized, color adjusted and dithered to the Spectra 6 palette, with the band, date and venue set underneath.</p>
+      </div>
+      <div class="gallery">
+        <img src="examples/santana_2012_horiz.png" alt="Santana, 2012" loading="lazy">
+        <img src="examples/primus_2014_horiz.png" alt="Primus, 2014" loading="lazy">
+        <img src="examples/billy_strings_2017_horiz.png" alt="Billy Strings, 2017" loading="lazy">
+        <img src="examples/korn_2022_horiz.png" alt="Korn, 2022" loading="lazy">
+        <img src="examples/griz_2022_horiz.png" alt="GRiZ, 2022" loading="lazy">
+        <img src="examples/yonder_mountain_2024_horiz.png" alt="Yonder Mountain String Band, 2024" loading="lazy">
+        <img src="examples/atmosphere_2025_horiz.png" alt="Atmosphere, 2025" loading="lazy">
+        <img src="examples/phish_2025_horiz.png" alt="Phish, 2025" loading="lazy">
+      </div>
+    </section>
+
+    <section class="wrap section" id="install">
+      <div class="section-head">
+        <p class="eyebrow">Install</p>
+        <h2>Flash from your browser</h2>
+      </div>
+      <ol class="steps">
+        <li class="card">
+          <span class="step-num">01</span>
+          <div>
+            <h3>Requirements</h3>
+            <ul class="requirements">
+              <li>The <a href="https://www.waveshare.com/esp32-s3-photopainter.htm">Waveshare ESP32-S3-PhotoPainter</a></li>
+              <li>An SD card up to 32 GB (4 GB recommended)</li>
+              <li>A USB-C data cable</li>
+              <li>A Chromium-based web browser</li>
+            </ul>
+          </div>
+        </li>
+        <li class="card">
+          <span class="step-num">02</span>
+          <div>
+            <h3>Prepare the SD card</h3>
+            <p>Cards up to 32 GB come formatted as FAT32 and work as is. Larger cards come as exFAT and need reformatting as FAT32. The frame keeps its settings and the artwork it downloads on the card.</p>
+          </div>
+        </li>
+        <li class="card">
+          <span class="step-num">03</span>
+          <div>
+            <h3>Connect the frame</h3>
+            <p>Insert the SD card and plug the frame into this computer over USB-C.</p>
+          </div>
+        </li>
+        <li class="card">
+          <span class="step-num">04</span>
+          <div>
+            <div class="step-head">
+              <h3>Flash the firmware</h3>
+              <label class="check" id="install-keep">
+                <input type="checkbox" id="install-keep-settings">
+                This frame is already set up, keep its settings
+              </label>
+            </div>
+            <form class="installer" id="installer" novalidate>
+              <div class="install-form" id="install-form">
+                <fieldset class="settings" id="install-settings">
+                  <p class="muted">Written to <code>CONFIG.TXT</code> on the SD card when the frame first starts.</p>
+                  <label class="field">
+                    <span>WiFi Network</span>
+                    <input id="setting-ssid" autocomplete="off" spellcheck="false">
+                  </label>
+                  <label class="field">
+                    <span>WiFi Password <small>leave empty for an open network</small></span>
+                    <!-- Text masked with CSS, so browsers do not offer to save it as a password -->
+                    <input id="setting-pass" class="masked" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
+                  </label>
+                  <label class="field wide">
+                    <span>SawThat User ID <small>or your username</small></span>
+                    <input id="setting-user" autocomplete="off" spellcheck="false">
+                  </label>
+                  <label class="field wide">
+                    <span>Artwork Font <small>optional, TTF or OTF up to 4 MB</small></span>
+                    <input id="setting-font" type="file" accept=".ttf,.otf">
+                  </label>
+                </fieldset>
+                <div class="install-actions">
+                  <p>Choose the frame's serial port when asked, usually <em>USB JTAG/serial debug unit</em>. If it doesn't show up, you may need to press a button on the frame.</p>
+                  <button class="button primary large" id="install-button" type="submit">Connect and install</button>
+                </div>
+              </div>
+              <div class="install-status" id="install-status" role="status" aria-live="polite" hidden>
+                <div class="install-line">
+                  <span id="install-message"></span>
+                  <span class="install-pct" id="install-pct"></span>
+                </div>
+                <div class="progress" id="install-progress"><div class="progress-fill"></div></div>
+                <p class="install-detail" id="install-detail" hidden></p>
+              </div>
+              <div class="install-log" id="install-log" hidden>
+                <div class="install-log-head">
+                  <span>Frame log</span>
+                  <span class="install-log-state" id="install-log-state"></span>
+                  <button class="link" id="install-log-stop" type="button" hidden>Stop</button>
+                </div>
+                <pre id="install-log-text"></pre>
+              </div>
+            </form>
+            <p class="callout" id="install-unsupported" hidden>This browser cannot flash devices. Open this page in a Chromium-based web browser, such as Chrome or Edge.</p>
+            <p class="callout" id="install-insecure" hidden>Flashing needs a secure connection. Open this page over https.</p>
+          </div>
+        </li>
+        <li class="card">
+          <span class="step-num">05</span>
+          <div>
+            <h3>Wait for the first sync</h3>
+            <p>The frame joins WiFi, fetches your concerts and renders the artwork with a progress bar on screen. If a setting is missing or the network fails, it shows a setup screen naming the problem.</p>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section class="wrap section">
+      <div class="section-head">
+        <p class="eyebrow">Controls</p>
+        <h2>Buttons and lights</h2>
+      </div>
+      <dl class="controls card">
+        <dt>Tap <kbd>KEY</kbd></dt><dd>Show the next concert</dd>
+        <dt>Hold <kbd>KEY</kbd></dt><dd>Switch between horizontal and vertical</dd>
+        <dt>Press <kbd>BOOT</kbd></dt><dd>Show the SD card as a USB drive while connected to a computer</dd>
+        <dt>Red light</dt><dd>Solid when idle, blinking while syncing, fast blink while joining WiFi</dd>
+        <dt>Green light</dt><dd>One flash for the next concert, three when the orientation changes</dd>
+      </dl>
+      <p class="muted">Refresh interval, orientation and custom fonts are covered in the <a href="https://github.com/ozwaldorf/sawthat-frame#configuration">README</a>.</p>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <span>SawThat Frame</span>
+      <a href="https://github.com/ozwaldorf/sawthat-frame">github.com/ozwaldorf/sawthat-frame</a>
+    </div>
+  </footer>
+
+  <script>
+    fetch("manifest.json")
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((m) => {
+        const el = document.getElementById("version");
+        el.textContent = `Latest release ${m.version}`;
+        el.hidden = false;
+      })
+      .catch(() => {});
+  </script>
+  <script type="module">
+    // Espressif's prebuilt esptool-js, the flasher that esp-web-tools uses, driven by this page
+    const ESPTOOL = "https://cdn.jsdelivr.net/npm/esptool-js@0.6.1/bundle.js";
+
+    const $ = (id) => document.getElementById(id);
+    const button = $("install-button");
+    const status = $("install-status");
+    const message = $("install-message");
+    const pct = $("install-pct");
+    const progress = $("install-progress");
+    const detail = $("install-detail");
+    const log = $("install-log");
+    const logText = $("install-log-text");
+    const logState = $("install-log-state");
+    const stopLog = $("install-log-stop");
+    const settings = $("install-settings");
+    const keepSettings = $("install-keep-settings");
+    const ssid = $("setting-ssid");
+    const pass = $("setting-pass");
+    const user = $("setting-user");
+    const fontInput = $("setting-font");
+
+    const form = $("install-form");
+
+    keepSettings.addEventListener("change", () => {
+      settings.hidden = keepSettings.checked;
+    });
+
+    // Settings the firmware applies to CONFIG.TXT on its first start (see installer.rs)
+    const SETTINGS_OFFSET = 0xfff000;
+    const SETTINGS_MAGIC = "SAWTHAT-CONFIG-1";
+    const SECTOR = 4096;
+
+    // Font copied to the SD card when the frame first starts (see installer.rs)
+    const FONT_OFFSET = 0xb00000;
+    const FONT_MAGIC = "SAWTHAT-FONT-001";
+    const MAX_FONT = 4 * 1024 * 1024;
+
+    // The font area for the chosen file: magic, extension, length and FNV-1a hash (little
+    // endian), then the font, or null without a file. Invalid files mark the field instead.
+    let fontData = null;
+    fontInput.addEventListener("change", async () => {
+      fontData = null;
+      fontInput.setCustomValidity("");
+      const file = fontInput.files[0];
+      if (!file) return;
+      if (file.size > MAX_FONT) {
+        fontInput.setCustomValidity("Fonts can be at most 4 MB.");
+      } else {
+        const font = new Uint8Array(await file.arrayBuffer());
+        const tag = String.fromCharCode(...font.subarray(0, 4));
+        const ext = tag === "OTTO" ? "OTF" : tag === "\0\x01\0\0" || tag === "true" ? "TTF" : null;
+        if (ext) {
+          fontData = fontArea(font, ext);
+        } else {
+          fontInput.setCustomValidity("Choose a TTF or OTF font file.");
+        }
+      }
+      fontInput.reportValidity();
+    });
+
+    function fontArea(font, ext) {
+      let hash = 0x811c9dc5;
+      for (const byte of font) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+      const header = FONT_MAGIC.length + 12;
+      const area = new Uint8Array(Math.ceil((header + font.length) / 4) * 4).fill(0xff);
+      area.set(new TextEncoder().encode(FONT_MAGIC));
+      area.set(new TextEncoder().encode(ext), FONT_MAGIC.length);
+      area[FONT_MAGIC.length + 3] = 0;
+      const view = new DataView(area.buffer);
+      view.setUint32(FONT_MAGIC.length + 4, font.length, true);
+      view.setUint32(FONT_MAGIC.length + 8, hash, true);
+      area.set(font, header);
+      return area;
+    }
+
+    // Checks the fields like the firmware does, marking the first invalid one
+    function validSettings() {
+      const bytes = (text) => new TextEncoder().encode(text).length;
+      ssid.setCustomValidity(
+        !ssid.value.trim()
+          ? "Enter the WiFi network name."
+          : bytes(ssid.value.trim()) > 32
+            ? "WiFi network names are at most 32 bytes."
+            : "",
+      );
+      const length = pass.value.trim().length;
+      pass.setCustomValidity(
+        length && (length < 8 || length > 63) ? "WiFi passwords are 8 to 63 characters." : "",
+      );
+      user.setCustomValidity(user.value.trim() ? "" : "Enter your SawThat user ID.");
+      return [ssid, pass, user].every((field) => field.reportValidity());
+    }
+
+    // The settings sector: magic, length and FNV-1a hash of the lines (little endian), the lines
+    function settingsSector() {
+      const lines = new TextEncoder().encode(
+        `WIFI_SSID=${ssid.value.trim()}\nWIFI_PASS=${pass.value.trim()}\nSAWTHAT_USER_ID=${user.value.trim()}\n`,
+      );
+      let hash = 0x811c9dc5;
+      for (const byte of lines) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+      const sector = new Uint8Array(SECTOR).fill(0xff);
+      sector.set(new TextEncoder().encode(SETTINGS_MAGIC));
+      const view = new DataView(sector.buffer);
+      view.setUint32(SETTINGS_MAGIC.length, lines.length, true);
+      view.setUint32(SETTINGS_MAGIC.length + 4, hash, true);
+      sector.set(lines, SETTINGS_MAGIC.length + 8);
+      return sector;
+    }
+
+    if (!("serial" in navigator)) {
+      $("installer").hidden = true;
+      $("install-unsupported").hidden = false;
+    } else if (!window.isSecureContext) {
+      $("installer").hidden = true;
+      $("install-insecure").hidden = false;
+    }
+
+    // Shows a step of the install. `percent` null shows a moving bar for steps without progress.
+    function show(text, { percent = null, tone = "", note = "" } = {}) {
+      status.hidden = false;
+      status.dataset.tone = tone;
+      message.textContent = text;
+      if (percent === null) {
+        progress.dataset.indeterminate = "";
+        pct.textContent = "";
+      } else {
+        delete progress.dataset.indeterminate;
+        progress.style.setProperty("--p", `${percent}%`);
+        pct.textContent = `${percent}%`;
+      }
+      detail.textContent = note;
+      detail.hidden = !note;
+    }
+
+    // An install failure with the message to show
+    class InstallError extends Error {
+      constructor(text, cause) {
+        super(text, { cause });
+      }
+    }
+
+    // Each step either completes or throws an InstallError saying what failed
+    async function step(text, work) {
+      try {
+        return await work();
+      } catch (err) {
+        throw err instanceof InstallError ? err : new InstallError(text, err);
+      }
+    }
+
+    // Installs the firmware, with `settingsData` and `fontData` in their areas if given
+    async function install(port, settingsData, fontData) {
+      show("Loading the installer");
+      const { ESPLoader, Transport } = await step(
+        "Couldn't load the installer. Check your connection and try again.",
+        () => import(ESPTOOL),
+      );
+      const manifestUrl = new URL("manifest.json", location.href);
+      const manifest = await step("Couldn't load the firmware manifest.", async () => {
+        const response = await fetch(manifestUrl);
+        if (!response.ok) throw new Error(`manifest.json: ${response.status}`);
+        return response.json();
+      });
+
+      const transport = new Transport(port);
+      const loader = new ESPLoader({ transport, baudrate: 115200, enableTracing: false });
+      try {
+        show("Connecting to the frame");
+        await step(
+          "Couldn't connect to the frame. Hold BOOT, press RESET, release BOOT, then try again.",
+          async () => {
+            await loader.main();
+            await loader.flashId();
+          },
+        );
+        const chip = loader.chip.CHIP_NAME;
+        const build = manifest.builds.find((b) => b.chipFamily === chip);
+        if (!build) {
+          throw new InstallError(`This board (${chip}) isn't supported. The frame uses an ESP32-S3.`);
+        }
+
+        show("Downloading the firmware");
+        const files = await step(
+          "Couldn't download the firmware. Check your connection and try again.",
+          () =>
+            Promise.all(
+              build.parts.map(async (part) => {
+                const response = await fetch(new URL(part.path, manifestUrl));
+                if (!response.ok) throw new Error(`${part.path}: ${response.status}`);
+                const data = new Uint8Array(await response.arrayBuffer());
+                return { data, address: part.offset };
+              }),
+            ),
+        );
+        if (settingsData) files.push({ data: settingsData, address: SETTINGS_OFFSET });
+        if (fontData) files.push({ data: fontData, address: FONT_OFFSET });
+        const total = files.reduce((sum, file) => sum + file.data.length, 0);
+
+        // Always erase, so nothing from earlier firmware stays in flash
+        show("Erasing the frame, this can take a minute");
+        await step("Erasing failed. Reconnect the frame and try again.", () => loader.eraseFlash());
+
+        show("Writing the firmware", { percent: 0 });
+        let finished = 0;
+        await step(
+          "Writing stopped partway. Reconnect the frame and try again; it won't start until a write completes.",
+          () =>
+            loader.writeFlash({
+              fileArray: files,
+              flashSize: "keep",
+              flashMode: "keep",
+              flashFreq: "keep",
+              eraseAll: false,
+              compress: true,
+              // `written` counts compressed bytes; scale to the file to report overall progress
+              reportProgress: (index, written, size) => {
+                const done = finished + (written / size) * files[index].data.length;
+                if (written === size) finished += files[index].data.length;
+                show("Writing the firmware", { percent: Math.floor((done / total) * 100) });
+              },
+            }),
+        );
+
+        show("Restarting the frame");
+      } finally {
+        // Restart the frame into the new firmware, or back into the old one after a failure
+        try {
+          await transport.setRTS(true);
+          await sleep(100);
+          await loader.after();
+        } catch {}
+        await transport.disconnect().catch(() => {});
+      }
+
+      const revision = manifest.revision ? ` (${manifest.revision})` : "";
+      const installed = `Installed ${manifest.name} ${manifest.version}${revision}`;
+      form.hidden = true;
+      $("install-keep").hidden = true;
+      // Flashing is over; watching the log is safe to leave
+      busy = false;
+      await watchFrame(port.getInfo(), (boot) => {
+        let note = "";
+        if (!boot) {
+          note =
+            "Written, but the frame didn't report back. If its screen doesn't change within a minute, press RESET.";
+        } else if (
+          boot.version &&
+          (`v${boot.version}` !== manifest.version ||
+            (manifest.revision && boot.revision !== manifest.revision))
+        ) {
+          note = `The frame is running v${boot.version} (${boot.revision}), not the version just written. Try installing again.`;
+        }
+        show(installed, { percent: 100, tone: "done", note });
+      });
+    }
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // Most of the log kept on the page, in characters
+    const LOG_LIMIT = 200000;
+
+    // Adds frame output to the log, following it unless the reader scrolled up
+    function appendLog(text) {
+      const follow = logText.scrollHeight - logText.scrollTop - logText.clientHeight < 24;
+      logText.textContent = (logText.textContent + text.replaceAll("\r", "")).slice(-LOG_LIMIT);
+      if (follow) logText.scrollTop = logText.scrollHeight;
+    }
+
+    // Reopens the frame's serial port after the reset and streams its output into the log until
+    // the frame goes away or Stop is pressed. `report` is called once with what the boot showed:
+    // the version and revision from the line "Firmware v<version> (<revision>)", `{}` if it logs
+    // without that line (the port opened after it), or null if nothing is heard in 20 seconds.
+    async function watchFrame(info, report) {
+      show("Waiting for the frame to start");
+      const deadline = Date.now() + 20000;
+      let port = null;
+      while (!port && Date.now() < deadline) {
+        port = await openFrame(info);
+        if (!port) await sleep(500);
+      }
+      if (!port) {
+        report(null);
+        return;
+      }
+
+      let reported = false;
+      const once = (boot) => {
+        if (reported) return;
+        reported = true;
+        clearTimeout(silence);
+        clearTimeout(versionWait);
+        report(boot);
+      };
+      const silence = setTimeout(() => once(null), Math.max(0, deadline - Date.now()));
+      let versionWait;
+      let heard = "";
+
+      log.hidden = false;
+      logState.textContent = "Connected";
+      const reader = port.readable.getReader();
+      stopLog.hidden = false;
+      stopLog.onclick = () => reader.cancel();
+      const decoder = new TextDecoder();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const text = decoder.decode(value, { stream: true });
+          appendLog(text);
+          if (reported) continue;
+          heard = (heard + text).slice(-4096);
+          const version = heard.match(/Firmware v(\S+) \(([^)\s]+)\)/);
+          if (version) {
+            once({ version: version[1], revision: version[2] });
+          } else if (!versionWait && /\]\s+INFO - /.test(heard)) {
+            // Logging without the version line: give it a moment in case it is still coming
+            versionWait = setTimeout(() => once({}), 3000);
+          }
+        }
+        logState.textContent = "Stopped";
+      } catch {
+        logState.textContent = "The frame disconnected, likely asleep or in USB drive mode";
+      } finally {
+        stopLog.hidden = true;
+        reader.releaseLock();
+        await port.close().catch(() => {});
+        once(heard ? {} : null);
+      }
+    }
+
+    // The frame's serial port once it is back, opened, or null if it is not yet
+    async function openFrame(info) {
+      const port = (await navigator.serial.getPorts()).find((candidate) => {
+        const id = candidate.getInfo();
+        return id.usbVendorId === info.usbVendorId && id.usbProductId === info.usbProductId;
+      });
+      if (!port) return null;
+      try {
+        await port.open({ baudRate: 115200 });
+        return port;
+      } catch {
+        return null; // Not back yet, or still closing
+      }
+    }
+
+    // Leaving the page mid-write would leave the frame without working firmware
+    let busy = false;
+    window.addEventListener("beforeunload", (event) => {
+      if (busy) event.preventDefault();
+    });
+
+    $("installer").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!keepSettings.checked && !validSettings()) return;
+      if (!keepSettings.checked && !fontInput.reportValidity()) return;
+      const settingsData = keepSettings.checked ? null : settingsSector();
+      let port;
+      try {
+        port = await navigator.serial.requestPort();
+      } catch {
+        return; // No port chosen
+      }
+
+      busy = true;
+      button.disabled = settings.disabled = keepSettings.disabled = true;
+      try {
+        await install(port, settingsData, keepSettings.checked ? null : fontData);
+      } catch (err) {
+        const known = err instanceof InstallError;
+        const cause = known ? err.cause : err;
+        show(known ? err.message : "The install failed. Reconnect the frame and try again.", {
+          tone: "error",
+          note: cause ? String(cause.message ?? cause) : "",
+        });
+        button.textContent = "Try again";
+      } finally {
+        busy = false;
+        button.disabled = settings.disabled = keepSettings.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

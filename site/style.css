@@ -1,0 +1,777 @@
+:root {
+  /* Carburetor regular */
+  --bg: #161616;
+  --surface: #262626;
+  --sunken: #0b0b0b;
+  --text: #f4f4f4;
+  --muted: #a8a8a8;
+  --border: #393939;
+  --accent: #78a9ff;
+  --on-accent: #161616;
+  --warn: #fddc69;
+  --ok: #42be65;
+  --error: #ff8389;
+
+  --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  /* 4px spacing scale */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+  --s8: 96px;
+
+  --radius: 4px;
+  --radius-sm: 2px;
+
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* Components that set a display value would otherwise ignore the attribute */
+[hidden] {
+  display: none !important;
+}
+
+/* Anchor jumps land below the sticky top bar */
+html {
+  scroll-padding-top: calc(64px + var(--s4));
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 400 17px/1.6 var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+p,
+ul,
+ol,
+dl,
+dd,
+pre {
+  margin: 0;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+}
+
+h1 {
+  font-size: clamp(2.25rem, 5vw, 2.75rem);
+  text-wrap: balance;
+}
+
+h2 {
+  font-size: clamp(1.625rem, 3vw, 2rem);
+}
+
+h3 {
+  font-size: 1.0625rem;
+  letter-spacing: 0;
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: 3px;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  font-weight: 500;
+}
+
+code,
+kbd {
+  background: var(--sunken);
+  border-radius: var(--radius-sm);
+  padding: 1px var(--s1);
+}
+
+kbd {
+  border: 1px solid var(--border);
+}
+
+pre {
+  background: var(--sunken);
+  border-radius: var(--radius-sm);
+  padding: var(--s3) var(--s4);
+  overflow-x: auto;
+  line-height: 1.7;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+
+.wrap {
+  /* Content width matches the gallery: 4 x 200px tiles + 3 gaps */
+  max-width: calc(4 * 200px + 3 * var(--s5) + 2 * var(--s4));
+  margin-inline: auto;
+  padding-inline: var(--s4);
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+/* Top bar */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s4);
+  height: 64px;
+}
+
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.topnav {
+  display: flex;
+  gap: var(--s5);
+  font-size: 0.9375rem;
+}
+
+.topnav a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.topnav a:hover {
+  color: var(--text);
+}
+
+/* Buttons */
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s3);
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  height: 44px;
+  padding-inline: var(--s5);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: 600 0.9375rem var(--font-sans);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.button:hover {
+  border-color: var(--muted);
+}
+
+.button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.button.primary:hover {
+  filter: brightness(1.08);
+}
+
+.button.large {
+  height: 72px;
+  padding-inline: var(--s6);
+  font-size: 1.0625rem;
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+  filter: none;
+}
+
+/* Hero */
+
+.hero {
+  display: grid;
+  grid-template-columns: 7fr 6fr;
+  align-items: center;
+  gap: var(--s7);
+  padding-block: var(--s8);
+}
+
+.hero-text {
+  display: grid;
+  gap: var(--s5);
+}
+
+.lede {
+  font-size: 1.125rem;
+  color: var(--muted);
+}
+
+.meta {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+.hero-photo {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: var(--radius);
+}
+
+/* Sections */
+
+.section {
+  padding-block: var(--s7);
+}
+
+.section-head {
+  display: grid;
+  gap: var(--s3);
+  max-width: 640px;
+  margin-bottom: var(--s6);
+}
+
+.section-head p:not(.eyebrow) {
+  color: var(--muted);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--s5);
+}
+
+/* Gallery */
+
+/* Half of the 400x480 source, so resampling averages whole 2x2 blocks of dither */
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(4, 200px);
+  gap: var(--s5);
+}
+
+.gallery img {
+  width: 200px;
+  aspect-ratio: 400 / 480;
+  border-radius: var(--radius-sm);
+}
+
+/* Split */
+
+.split {
+  display: grid;
+  grid-template-columns: 5fr 7fr;
+  align-items: center;
+  gap: var(--s7);
+}
+
+.split-photo {
+  width: 100%;
+  aspect-ratio: 4 / 5;
+  object-fit: cover;
+  border-radius: var(--radius);
+}
+
+.split .section-head {
+  margin-bottom: var(--s5);
+}
+
+.features {
+  list-style: none;
+  padding: 0;
+  display: grid;
+}
+
+.features li {
+  display: grid;
+  gap: var(--s1);
+  padding-block: var(--s4);
+  border-top: 1px solid var(--border);
+}
+
+.features li:last-child {
+  border-bottom: 1px solid var(--border);
+}
+
+.features p {
+  color: var(--muted);
+}
+
+/* Install steps */
+
+.steps {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: var(--s4);
+}
+
+.steps .card {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  gap: var(--s4);
+}
+
+.steps .card > div {
+  display: grid;
+  gap: var(--s3);
+  justify-items: start;
+  min-width: 0;
+}
+
+.steps pre {
+  justify-self: stretch;
+}
+
+/* A step title with a control on its right */
+.steps .step-head {
+  justify-self: stretch;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s2) var(--s4);
+}
+
+.requirements {
+  margin: 0;
+  padding-left: var(--s5);
+  display: grid;
+  gap: var(--s1);
+}
+
+.requirements li::marker {
+  color: var(--accent);
+}
+
+.step-num {
+  font-family: var(--font-mono);
+  font-size: 1.0625rem;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--accent);
+}
+
+.callout {
+  border-left: 3px solid var(--warn);
+  background: var(--sunken);
+  border-radius: var(--radius-sm);
+  padding: var(--s3) var(--s4);
+}
+
+/* Installer */
+
+/* The install form and its progress, across the step */
+.installer {
+  justify-self: stretch;
+  display: grid;
+  gap: var(--s5);
+}
+
+.install-form {
+  justify-self: stretch;
+  display: grid;
+  gap: var(--s5);
+  justify-items: start;
+}
+
+/* Help text on the left, the install button on the right */
+.install-actions {
+  justify-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s5);
+}
+
+.install-actions .button {
+  flex-shrink: 0;
+}
+
+/* The settings, in a box hidden as a whole when the frame keeps its own */
+.settings {
+  justify-self: stretch;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s4);
+  min-width: 0;
+  margin: 0;
+  padding: var(--s5);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* The intro, the user ID and the font span both columns */
+.settings > p,
+.settings .wide {
+  grid-column: 1 / -1;
+}
+
+.field {
+  display: grid;
+  gap: var(--s1);
+  font-size: 0.9375rem;
+}
+
+.field span {
+  font-weight: 600;
+}
+
+.field small {
+  margin-left: var(--s2);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+}
+
+.field input {
+  height: 40px;
+  padding-inline: var(--s3);
+  background: var(--sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font: 500 0.9375rem var(--font-mono);
+}
+
+/* Masked like a password, without being one a browser offers to save */
+.field input.masked {
+  -webkit-text-security: disc;
+}
+
+.field input[type="file"] {
+  height: auto;
+  padding: var(--s2);
+  font-family: var(--font-sans);
+  color: var(--muted);
+}
+
+.field input[type="file"]::file-selector-button {
+  margin-right: var(--s3);
+  padding: var(--s1) var(--s4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font: 600 0.875rem var(--font-sans);
+  cursor: pointer;
+}
+
+.field input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  color: var(--muted);
+  font-size: 0.9375rem;
+  cursor: pointer;
+}
+
+.check input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.install-status {
+  justify-self: stretch;
+  display: grid;
+  gap: var(--s2);
+  background: var(--sunken);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: var(--s3) var(--s4);
+}
+
+.install-status[data-tone="done"] {
+  border-left-color: var(--ok);
+}
+
+.install-status[data-tone="error"] {
+  border-left-color: var(--error);
+}
+
+.install-line {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s4);
+  font-weight: 600;
+}
+
+.install-pct {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.install-detail {
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.progress {
+  height: 4px;
+  overflow: hidden;
+  background: var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.progress-fill {
+  width: var(--p, 0%);
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+
+.install-status[data-tone="done"] .progress-fill {
+  background: var(--ok);
+}
+
+.install-status[data-tone="error"] .progress {
+  display: none;
+}
+
+.install-log {
+  display: grid;
+  gap: var(--s2);
+  min-width: 0;
+}
+
+.install-log-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s3);
+  font-weight: 600;
+}
+
+.install-log-state {
+  flex: 1;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+}
+
+.install-log pre {
+  max-height: 320px;
+  overflow: auto;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* A button that reads as a link */
+.link {
+  padding: 0;
+  background: none;
+  border: 0;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 400;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+/* Steps without progress: a segment sweeping across */
+.progress[data-indeterminate] .progress-fill {
+  width: 30%;
+  transition: none;
+  animation: sweep 1.2s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress[data-indeterminate] .progress-fill {
+    width: 100%;
+    opacity: 0.4;
+    animation: none;
+  }
+}
+
+/* Controls */
+
+.controls {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  padding-block: 0;
+  margin-bottom: var(--s4);
+}
+
+.controls dt,
+.controls dd {
+  padding-block: var(--s3);
+  border-top: 1px solid var(--border);
+}
+
+.controls dt {
+  font-weight: 600;
+  padding-right: var(--s6);
+}
+
+.controls dt:first-of-type,
+.controls dd:first-of-type {
+  border-top: 0;
+}
+
+/* Footer */
+
+.footer {
+  border-top: 1px solid var(--border);
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+.footer-inner {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--s3);
+  padding-block: var(--s6);
+}
+
+.footer a {
+  color: var(--muted);
+}
+
+@media (max-width: 800px) {
+  .hero,
+  .split {
+    grid-template-columns: 1fr;
+    gap: var(--s6);
+  }
+
+  .hero {
+    padding-block: var(--s7);
+  }
+
+  .section {
+    padding-block: var(--s6);
+  }
+
+  .gallery {
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--s3);
+  }
+
+  .gallery img {
+    width: 100%;
+  }
+
+  .split-photo {
+    aspect-ratio: 4 / 3;
+  }
+
+  .settings {
+    grid-template-columns: 1fr;
+  }
+
+  .install-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .install-actions .button {
+    align-self: center;
+  }
+
+  .topnav a:not([href="#install"]) {
+    display: none;
+  }
+
+  .steps .card {
+    grid-template-columns: 1fr;
+    gap: var(--s2);
+  }
+
+  .controls {
+    grid-template-columns: 1fr;
+  }
+
+  .controls dt {
+    padding-bottom: 0;
+  }
+
+  .controls dd {
+    border-top: 0;
+    padding-top: var(--s1);
+  }
+}
+
+

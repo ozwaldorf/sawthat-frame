@@ -36,7 +36,8 @@ Installation:
 
 1. Prepare a FAT32 SD card with a `CONFIG.TXT` in its root (see [Configuration](#configuration))
 2. Insert the SD card into the frame
-3. Flash the firmware (see [Build and flash](#build-and-flash)) and wait for the first sync
+3. Flash the firmware from the browser at <https://ozwaldorf.github.io/sawthat-frame/> (Chrome
+   or Edge), or build it yourself (see [Build and flash](#build-and-flash)), and wait for the first sync
    to finish on the device
 
 Step 1 can also be done on the device: with a blank FAT32 card, the frame writes a
