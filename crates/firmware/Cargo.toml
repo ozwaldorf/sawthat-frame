@@ -1,7 +1,7 @@
 [package]
 edition      = "2024"
 name         = "sawthat-frame-firmware"
-rust-version = "1.88"
+rust-version = "1.95"
 version      = "0.2.0"
 
 [[bin]]
@@ -9,9 +9,9 @@ name = "sawthat-frame-firmware"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "~1.0", features = ["esp32s3", "log-04", "unstable", "psram"] }
+esp-hal = { version = "~1.2", features = ["esp32s3", "log-04", "unstable"] }
 
-esp-rtos = { version = "0.2.0", features = [
+esp-rtos = { version = "0.4.0", features = [
   "embassy",
   "esp-alloc",
   "esp-radio",
@@ -19,12 +19,12 @@ esp-rtos = { version = "0.2.0", features = [
   "log-04",
 ] }
 
-esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3", "log-04"] }
-log                    = "0.4.27"
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3", "log-04"] }
+log                    = "0.4.35"
 
 # Pinned: alloc_tcp_state in main.rs relies on TcpClientState being valid when zeroed.
 # Re-check that against embassy-net source before upgrading.
-embassy-net = { version = "=0.8.0", features = [
+embassy-net = { version = "=0.9.1", features = [
   "dhcpv4",
   "dns",
   "log",
@@ -32,29 +32,28 @@ embassy-net = { version = "=0.8.0", features = [
   "tcp",
   "udp",
 ] }
-embedded-io = "0.7"
+embedded-io = "0.7.1"
 embedded-io-async = "0.7"
-esp-alloc = "0.9.0"
-esp-backtrace = { version = "0.18.1", features = [
+esp-alloc = "0.11.0"
+esp-backtrace = { version = "0.20.0", features = [
   "esp32s3",
   "panic-handler",
   "println",
 ] }
-esp-println = { version = "0.16.1", features = ["esp32s3", "log-04"] }
+esp-println = { version = "0.18.0", features = ["esp32s3", "log-04"] }
 # for more networking protocol support see https://crates.io/crates/edge-net
-embassy-executor = { version = "0.9.1", features = ["log"] }
-embassy-futures = "0.1"
-embassy-time = { version = "0.5.0", features = ["log"] }
-embassy-sync = "0.7"
-esp-radio = { version = "0.17.0", features = [
+embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-futures = "0.1.2"
+embassy-time = { version = "0.5.1", features = ["log"] }
+embassy-sync = "0.8"
+esp-radio = { version = "1.0.0-beta.1", features = [
   "esp-alloc",
   "esp32s3",
   "log-04",
-  "smoltcp",
   "unstable",
   "wifi",
 ] }
-smoltcp = { version = "0.12.0", default-features = false, features = [
+smoltcp = { version = "0.13.0", default-features = false, features = [
   "log",
   "medium-ethernet",
   "multicast",
@@ -73,28 +72,29 @@ static_cell      = "2.1.1"
 
 # E-paper display (using local epd module)
 embedded-hal = "1.0"
-embedded-hal-bus = "0.2"
+embedded-hal-bus = "0.3"
 embedded-graphics-core = "0.4"
 
 # JSON parsing (no_std)
 serde = { version = "1.0", default-features = false, features = ["derive"] }
-serde-json-core = "0.6"
-heapless = "0.8"
+serde-json-core = "0.7"
+heapless = "0.9"
 
 
 # On-device artwork rendering
 sawthat-render = { path = "../render" }
 
 # SD card storage for caching
-embedded-sdmmc = "0.8"
+embedded-sdmmc = "0.10"
 
 # USB drive mode for setup: exposes the SD card over USB OTG
-usb-device   = "0.3"
-usbd-storage = { version = "2", features = ["bbb", "scsi"] }
+embassy-usb = { version = "0.6", default-features = false }
 
-# HTTP client with TLS support (use git for embedded-nal-async 0.9 compatibility)
-reqwless = { git = "https://github.com/drogue-iot/reqwless", default-features = false, features = ["embedded-tls", "alloc"] }
+# HTTP client with TLS support
+reqwless = { version = "0.14", default-features = false, features = ["embedded-tls", "alloc"] }
 embedded-nal-async = "0.9"
+# embedded-tls 0.18 uses der types gated behind this feature without enabling it
+der = { version = "0.8", default-features = false, features = ["heapless"] }
 
 
 

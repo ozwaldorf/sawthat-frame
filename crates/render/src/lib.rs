@@ -59,7 +59,8 @@ pub fn decode_jpeg(data: &[u8]) -> Result<RgbImage, RenderError> {
     use zune_jpeg::JpegDecoder;
 
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
-    let mut decoder = JpegDecoder::new_with_options(data, options);
+    let mut decoder =
+        JpegDecoder::new_with_options(zune_core::bytestream::ZCursor::new(data), options);
     let pixels = decoder.decode().map_err(|_| RenderError::Jpeg)?;
     let (w, h) = decoder.dimensions().ok_or(RenderError::Jpeg)?;
     if pixels.len() != w * h * 3 {

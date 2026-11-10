@@ -11,8 +11,8 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use core::time::Duration as CoreDuration;
 use log::info;
 
 use embassy_executor::Spawner;
@@ -30,32 +30,25 @@ use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_alloc as _;
 use esp_backtrace as _;
-use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::system::Stack as CoreStack;
 use esp_hal::{
     clock::CpuClock,
-    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull, RtcPinWithResistors},
+    gpio::{Input, InputConfig, InputPin, Level, Output, OutputConfig, Pull},
     i2c::master::{Config as I2cConfig, I2c},
-    otg_fs::Usb,
     ram,
     rng::Rng,
-    rtc_cntl::{
-        Rtc,
-        sleep::{Ext0WakeupSource, Ext1WakeupSource, TimerWakeupSource, WakeupLevel},
-    },
+    rtc_cntl::{Rtc, WakeupSource},
     spi::{
         Mode,
         master::{Config as SpiConfig, Spi},
     },
     time::Rate,
     timer::timg::TimerGroup,
+    usb::otg::Usb,
 };
-use esp_radio::wifi::event::{EventExt, StaDisconnected};
-use esp_radio::{
-    Controller,
-    wifi::{
-        AuthMethod, ClientConfig, Config as WifiConfig, ModeConfig, WifiController, WifiDevice,
-    },
+use esp_radio::wifi::{
+    AuthenticationMethodConfig, Config as WifiConfig, ConnectionError, DisconnectReason, Interface,
+    WifiController, sta::StationConfig,
 };
 use esp_rtos::embassy::Executor;
 use sawthat_frame_firmware::TimestampLogger;
@@ -66,6 +59,7 @@ use sawthat_frame_firmware::display;
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
 use sawthat_frame_firmware::progress;
+use sawthat_frame_firmware::sleep;
 use sawthat_frame_firmware::sync::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::usb_drive;
 use sawthat_frame_firmware::widget::{Orientation, WidgetData};
@@ -79,7 +73,7 @@ macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
         #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
+        let x = STATIC_CELL.uninit().write($val);
         x
     }};
 }
@@ -227,11 +221,10 @@ static BUTTON_STATE: AtomicU8 = AtomicU8::new(BUTTON_CANCELLED);
 
 /// Set by a BOOT press while awake; enters or leaves USB drive mode when a computer is connected
 static BOOT_PRESSED: AtomicBool = AtomicBool::new(false);
-/// BOOT (GPIO0) bit in the RTC pin wake status
-const BOOT_RTC_PIN_MASK: u32 = 1 << 0;
 
-/// Last ESP-IDF station disconnect reason, and whether the station joined the network
-static WIFI_REASON: AtomicU8 = AtomicU8::new(0);
+/// Last station disconnect reason, and whether the station joined the network
+static WIFI_REASON: critical_section::Mutex<Cell<Option<DisconnectReason>>> =
+    critical_section::Mutex::new(Cell::new(None));
 static WIFI_LINKED: AtomicBool = AtomicBool::new(false);
 /// Whether an attempt in the current connection failed authentication
 static WIFI_AUTH_FAILED: AtomicBool = AtomicBool::new(false);
@@ -439,7 +432,7 @@ async fn button_monitor_task(key_input: &'static mut Input<'static>) {
         .is_err();
         let accepted = if held {
             BUTTON_STATE
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
                     matches!(state, BUTTON_POLLING | BUTTON_NEXT).then_some(BUTTON_FLIP)
                 })
                 .is_ok()
@@ -469,45 +462,43 @@ async fn main(spawner: Spawner) -> ! {
 
     // Check wake reason immediately
     let wake_reason = esp_hal::rtc_cntl::wakeup_cause();
-    let button_wake = matches!(wake_reason, esp_hal::system::SleepSource::Ext0);
-    // Ext1 wakes on BOOT or the charger IRQ; the status register holds the RTC pins that fired
-    let boot_wake = matches!(wake_reason, esp_hal::system::SleepSource::Ext1)
-        && esp_hal::peripherals::LPWR::regs()
-            .ext_wakeup1_status()
-            .read()
-            .ext_wakeup1_status()
-            .bits()
-            & BOOT_RTC_PIN_MASK
-            != 0;
-    let wake_label = match wake_reason {
-        esp_hal::system::SleepSource::Timer => "timer",
-        esp_hal::system::SleepSource::Ext0 => "button",
-        esp_hal::system::SleepSource::Ext1 if boot_wake => "boot",
-        esp_hal::system::SleepSource::Ext1 => "charger",
-        _ => "reset",
+    // KEY, BOOT, and the charger IRQ share a wake path, so the pins tell which one fired
+    let button_wake = caused_wakeup(sleep::key_pin());
+    let boot_wake = caused_wakeup(sleep::boot_pin());
+    let charger_wake = caused_wakeup(sleep::charger_irq_pin());
+    let wake_label = if wake_reason.contains(WakeupSource::Timer) {
+        "timer"
+    } else if button_wake {
+        "button"
+    } else if boot_wake {
+        "boot"
+    } else if charger_wake {
+        "charger"
+    } else {
+        "reset"
     };
 
     // PSRAM is registered first so general allocations land there, leaving internal RAM
     // for allocations that request it explicitly (WiFi buffers, RTOS task stacks)
-    esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
+    esp_alloc::psram_allocator!(
+        peripherals.PSRAM,
+        esp_hal::psram,
+        esp_hal::psram::PsramConfig {
+            mode: esp_hal::psram::PsramMode::OctalSpi,
+            ..Default::default()
+        }
+    );
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 36 * 1024);
 
     // RTOS provides the embassy time driver, so it must start before any Timer is awaited
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(
-        timg0.timer0,
-        #[cfg(target_arch = "riscv32")]
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT)
-            .software_interrupt0,
-    );
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
     // The second core renders artwork while this core handles the network during sync
-    let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
-        sw_ints.software_interrupt0,
-        sw_ints.software_interrupt1,
+        peripherals.FROM_CPU_INTR1,
         // Taken once at boot; `&mut STATIC` is rejected for `static mut` in edition 2024
         #[allow(clippy::deref_addrof)]
         unsafe {
@@ -516,7 +507,7 @@ async fn main(spawner: Spawner) -> ! {
         || {
             let executor = mk_static!(Executor, Executor::new());
             executor.run(|spawner| {
-                spawner.spawn(render_task()).ok();
+                spawner.spawn(render_task().unwrap());
             });
         },
     );
@@ -533,7 +524,7 @@ async fn main(spawner: Spawner) -> ! {
     // Make LEDs static and spawn combined LED task
     let led_red: &'static mut Output<'static> = mk_static!(Output<'static>, led_red);
     let led_green: &'static mut Output<'static> = mk_static!(Output<'static>, led_green);
-    spawner.spawn(led_task(led_red, led_green)).ok();
+    spawner.spawn(led_task(led_red, led_green).unwrap());
 
     // Check sleep state to get current orientation
     let (resuming, mut orientation) = unsafe {
@@ -578,16 +569,12 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     // Persistent button monitor; acts only while monitoring is started
-    spawner
-        .spawn(button_monitor_task(mk_static!(Input<'static>, key_input)))
-        .ok();
+    spawner.spawn(button_monitor_task(mk_static!(Input<'static>, key_input)).unwrap());
     let boot_input = Input::new(
         peripherals.GPIO0,
         InputConfig::default().with_pull(Pull::Up),
     );
-    spawner
-        .spawn(boot_monitor_task(mk_static!(Input<'static>, boot_input)))
-        .ok();
+    spawner.spawn(boot_monitor_task(mk_static!(Input<'static>, boot_input)).unwrap());
 
     // ==================== Normal Boot Sequence ====================
     // Now do the heavier initialization
@@ -598,13 +585,7 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     let mut delay = Delay;
-    let cold_boot = setup_pending
-        || !matches!(
-            wake_reason,
-            esp_hal::system::SleepSource::Timer
-                | esp_hal::system::SleepSource::Ext0
-                | esp_hal::system::SleepSource::Ext1
-        );
+    let cold_boot = setup_pending || wake_reason.is_empty();
 
     // ==================== SD Card Initialization ====================
     // SD card SPI pins: CS=GPIO38, CLK=GPIO39, MISO=GPIO40, MOSI=GPIO41
@@ -757,22 +738,20 @@ async fn main(spawner: Spawner) -> ! {
     info!("EPD initialized!");
 
     // ==================== WiFi Setup (Deferred) ====================
-    // WiFi is only initialized when a sync is needed
-    let mut wifi_peripheral: Option<esp_hal::peripherals::WIFI<'static>> = Some(peripherals.WIFI);
-
-    // Kept alive so the radio stays initialized
-    let mut _esp_radio_ctrl: Option<&'static Controller<'static>> = None;
+    // WiFi is only initialized when a sync is needed, and the controller is dropped after it to
+    // power the radio down
+    let wifi_peripheral = peripherals.WIFI;
     let mut wifi_controller: Option<WifiController<'static>> = None;
     let mut wifi_connected = false;
 
     // ==================== RTC for Deep Sleep ====================
-    let mut rtc = Rtc::new(peripherals.LPWR);
+    let mut rtc = Rtc::new(peripherals.RTC_TIMER);
 
     // Framebuffer (192KB, PSRAM)
     let mut framebuffer = Framebuffer::new();
 
     // USB OTG peripheral and pins (D+, D-), taken when drive mode starts
-    let mut usb_parts = Some((peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19));
+    let mut usb_parts = Some((peripherals.USB_FS, peripherals.GPIO20, peripherals.GPIO19));
 
     // Expose the SD card to a connected computer until it is ejected, unplugged, or KEY or
     // BOOT is pressed, then reboot to read the new config. Continues only if no computer
@@ -781,12 +760,12 @@ async fn main(spawner: Spawner) -> ! {
         ($tick:expr) => {{
             if usb_parts.is_some()
                 && let Some(cache) = sd_cache.take()
-                && let Some((usb0, dp, dm)) = usb_parts.take()
+                && let Some((usb_fs, dp, dm)) = usb_parts.take()
             {
                 start_button_monitor();
                 BOOT_PRESSED.store(false, Ordering::Relaxed);
                 start_alternate();
-                let usb = Usb::new(usb0, dp, dm);
+                let usb = Usb::new_fs(usb_fs, dp, dm);
                 let exit = usb_drive::serve(
                     cache.into_card(),
                     usb,
@@ -853,7 +832,7 @@ async fn main(spawner: Spawner) -> ! {
                 Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
             }
             power_down_panel!();
-            sleep_on_setup(&mut rtc, &mut i2c, &mut delay, $retry)
+            sleep_on_setup(&mut i2c, $retry)
         }};
     }
 
@@ -897,15 +876,15 @@ async fn main(spawner: Spawner) -> ! {
         if resuming || host {
             power_down_panel!();
             if resuming {
-                sleep_until_scheduled(&mut rtc, &mut i2c, &mut delay);
+                sleep_until_scheduled(&mut rtc, &mut i2c);
             }
-            sleep_until_wake(&mut rtc, &mut i2c, &mut delay, config.refresh_secs());
+            sleep_until_wake(&mut i2c, config.refresh_secs());
         }
     }
 
     // Charger plugged, unplugged, started or finished during sleep: redraw only the battery
     // body, then sleep until the timer wake that was already scheduled
-    if matches!(wake_reason, esp_hal::system::SleepSource::Ext1) && resuming {
+    if charger_wake && resuming {
         info!("Charger changed");
         let power = read_power(&mut i2c).await;
         log_power(sd_cache.as_mut(), &rtc, wake_label, &power);
@@ -916,7 +895,7 @@ async fn main(spawner: Spawner) -> ! {
             info!("Battery refresh failed: {:?}", e);
         }
         power_down_panel!();
-        sleep_until_scheduled(&mut rtc, &mut i2c, &mut delay);
+        sleep_until_scheduled(&mut rtc, &mut i2c);
     }
 
     // Buffers for stored artwork and partial updates (PSRAM)
@@ -934,47 +913,41 @@ async fn main(spawner: Spawner) -> ! {
         Box::new([0u8; TLS_WRITE_BUF_SIZE]);
 
     // Network resources - created on first WiFi init
-    let mut tcp_client: Option<TcpClient<'static, 2, TCP_RX_SIZE, TCP_TX_SIZE>> = None;
+    let mut tcp_client: Option<TcpClient<'static, 2, TCP_TX_SIZE, TCP_RX_SIZE>> = None;
     let mut dns_socket: Option<DnsSocket<'static>> = None;
     let mut net_stack: Option<Stack<'static>> = None;
 
-    // Initialize WiFi (once) and connect, evaluating to whether it is connected
+    // Initialize WiFi and connect, evaluating to whether it is connected
     macro_rules! ensure_wifi {
         () => {{
             if !wifi_connected {
-                if wifi_controller.is_none() {
-                    info!("Initializing WiFi...");
-                    start_fast_blink();
+                info!("Initializing WiFi...");
+                start_fast_blink();
 
-                    let ctrl = esp_radio::init().unwrap();
-                    let ctrl = mk_static!(Controller<'static>, ctrl);
-
-                    let wifi = wifi_peripheral.take().unwrap();
-                    let (wifi_ctrl, ifaces) =
-                        esp_radio::wifi::new(ctrl, wifi, WifiConfig::default()).unwrap();
-                    StaDisconnected::update_handler(|event| {
-                        WIFI_REASON.store(event.reason(), Ordering::Relaxed)
-                    });
-
+                if net_stack.is_none() {
                     let (stk, runner) = embassy_net::new(
-                        ifaces.sta,
+                        Interface::station(),
                         embassy_net::Config::dhcpv4(Default::default()),
                         mk_static!(StackResources<4>, StackResources::<4>::new()),
                         rng.random() as u64,
                     );
-                    spawner.spawn(net_task(runner)).ok();
+                    spawner.spawn(net_task(runner).unwrap());
 
                     let tcp_state = alloc_tcp_state();
                     tcp_client = Some(TcpClient::new(stk, tcp_state));
                     dns_socket = Some(DnsSocket::new(stk));
                     net_stack = Some(stk);
-                    _esp_radio_ctrl = Some(ctrl);
-                    wifi_controller = Some(wifi_ctrl);
+                }
+                if wifi_controller.is_none() {
+                    // SAFETY: the controller of an earlier connection was dropped, so this is
+                    // the only user of the peripheral
+                    let wifi = unsafe { wifi_peripheral.clone_unchecked() };
+                    wifi_controller = Some(WifiController::new(wifi, Default::default()).unwrap());
                 }
 
                 let stack = net_stack.unwrap();
                 let ctrl = wifi_controller.as_mut().unwrap();
-                WIFI_REASON.store(0, Ordering::Relaxed);
+                set_wifi_reason(None);
                 WIFI_LINKED.store(false, Ordering::Relaxed);
                 WIFI_AUTH_FAILED.store(false, Ordering::Relaxed);
                 wifi_connected = with_timeout(WIFI_TIMEOUT, async {
@@ -991,7 +964,7 @@ async fn main(spawner: Spawner) -> ! {
                     info!("WiFi ready!");
                 } else {
                     info!("WiFi connection failed");
-                    wifi_disconnect(ctrl).await;
+                    wifi_stop(&mut wifi_controller).await;
                 }
             }
             wifi_connected
@@ -1124,7 +1097,7 @@ async fn main(spawner: Spawner) -> ! {
                         ConfigError::WifiFailed(
                             config.wifi_ssid.clone(),
                             WifiCause::classify(
-                                WIFI_REASON.load(Ordering::Relaxed),
+                                wifi_reason(),
                                 WIFI_LINKED.load(Ordering::Relaxed),
                                 WIFI_AUTH_FAILED.load(Ordering::Relaxed)
                             )
@@ -1447,9 +1420,7 @@ async fn main(spawner: Spawner) -> ! {
                 }
 
                 if wifi_connected {
-                    if let Some(ctrl) = wifi_controller.as_mut() {
-                        wifi_disconnect(ctrl).await;
-                    }
+                    wifi_stop(&mut wifi_controller).await;
                     wifi_connected = false;
                 }
 
@@ -1684,9 +1655,9 @@ async fn main(spawner: Spawner) -> ! {
         );
     }
 
-    if wifi_connected && let Some(ctrl) = wifi_controller.as_mut() {
+    if wifi_connected {
         info!("Disconnecting WiFi for deep sleep...");
-        wifi_disconnect(ctrl).await;
+        wifi_stop(&mut wifi_controller).await;
     }
 
     // BOOT pressed while awake: enter drive mode if a computer is connected
@@ -1697,10 +1668,11 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     unsafe {
-        NEXT_WAKE_US = rtc.time_since_boot().as_micros() as u64 + config.refresh_secs() * 1_000_000;
+        NEXT_WAKE_US =
+            rtc.time_since_power_up().as_micros() as u64 + config.refresh_secs() * 1_000_000;
     }
     power_down_panel!();
-    sleep_until_wake(&mut rtc, &mut i2c, &mut delay, config.refresh_secs());
+    sleep_until_wake(&mut i2c, config.refresh_secs());
 }
 
 /// Approximate Li-ion state of charge from resting cell voltage
@@ -1807,7 +1779,7 @@ fn log_power<S: SpiDevice, D: DelayNs>(
     let opt = |v: Option<u16>| v.map(|v| alloc::format!("{}", v)).unwrap_or_default();
     let row = alloc::format!(
         "{},{},{},{},{},{},{},{}\n",
-        rtc.time_since_boot().as_secs(),
+        rtc.time_since_power_up().as_secs(),
         wake,
         opt(power.mv),
         power.percent,
@@ -1972,46 +1944,42 @@ fn load_font<S: SpiDevice, D: DelayNs>(cache: &mut SdCache<S, D>) -> Option<Vec<
         })
 }
 
-/// KEY button (GPIO4, active low) as a deep sleep wake source
-fn key_wakeup() -> Ext0WakeupSource<esp_hal::peripherals::GPIO4<'static>> {
-    // Reclaim the pin for the RTC domain; the pull-up keeps it from floating
-    let key_pin = unsafe { esp_hal::peripherals::GPIO4::steal() };
-    key_pin.rtcio_pullup(true);
-    key_pin.rtcio_pulldown(false);
-    Ext0WakeupSource::new(key_pin, WakeupLevel::Low)
+/// Whether `pin` ended the deep sleep that this boot woke from
+fn caused_wakeup(pin: impl InputPin + 'static) -> bool {
+    Input::new(pin, InputConfig::default().with_pull(Pull::Up)).caused_wakeup()
 }
 
-/// Deep sleep on the setup screen until KEY, a USB plug, or `retry_secs` (if any), then boot
-/// like a power-on
-fn sleep_on_setup(
-    rtc: &mut Rtc,
-    i2c: &mut I2c<'_, esp_hal::Blocking>,
-    delay: &mut Delay,
-    retry_secs: Option<u64>,
-) -> ! {
+/// Deep sleep until KEY, BOOT, the AXP2101 IRQ line, or `seconds` if given
+fn deep_sleep(seconds: Option<u64>) -> ! {
+    sleep::deep_sleep(
+        [
+            sleep::key_pin(),
+            sleep::boot_pin(),
+            sleep::charger_irq_pin(),
+        ],
+        seconds,
+    )
+}
+
+/// Make the next wake sync like a power-on
+fn boot_fresh_next() {
     unsafe {
         let state = &raw mut SLEEP_STATE;
         (*state).invalidate();
         SETUP_PENDING = true;
     }
+}
+
+/// Deep sleep on the setup screen until KEY, a USB plug, or `retry_secs` (if any), then boot
+/// like a power-on
+fn sleep_on_setup(i2c: &mut I2c<'_, esp_hal::Blocking>, retry_secs: Option<u64>) -> ! {
+    boot_fresh_next();
     arm_charger_irq(i2c);
-    let ext0 = key_wakeup();
-    let (mut irq_pin, mut boot_pin) = (charger_irq_pin(), boot_button_pin());
-    let mut irq_pins: [&mut dyn esp_hal::gpio::RtcPin; 2] = [&mut irq_pin, &mut boot_pin];
-    let ext1 = Ext1WakeupSource::new(&mut irq_pins, WakeupLevel::Low);
     info!(
         "Entering deep sleep until KEY, USB, or retry in {:?} s...",
         retry_secs
     );
-    // Let serial output flush
-    delay.delay_ms(100);
-    match retry_secs {
-        Some(secs) => {
-            let timer = TimerWakeupSource::new(CoreDuration::from_secs(secs));
-            rtc.sleep_deep(&[&ext0, &ext1, &timer])
-        }
-        None => rtc.sleep_deep(&[&ext0, &ext1]),
-    }
+    deep_sleep(retry_secs)
 }
 
 /// Identifies a setup screen by its message and orientation
@@ -2022,59 +1990,23 @@ fn message_hash(message: &str, orientation: Orientation) -> u32 {
         .fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32))
 }
 
-/// AXP2101 IRQ line (GPIO21, active low), reclaimed for the RTC domain with a pull-up
-fn charger_irq_pin() -> esp_hal::peripherals::GPIO21<'static> {
-    let irq_pin = unsafe { esp_hal::peripherals::GPIO21::steal() };
-    irq_pin.rtcio_pullup(true);
-    irq_pin.rtcio_pulldown(false);
-    irq_pin
-}
-
-/// BOOT button (GPIO0, active low), reclaimed for the RTC domain with a pull-up
-fn boot_button_pin() -> esp_hal::peripherals::GPIO0<'static> {
-    let pin = unsafe { esp_hal::peripherals::GPIO0::steal() };
-    pin.rtcio_pullup(true);
-    pin.rtcio_pulldown(false);
-    pin
-}
-
 /// Sleep until the timer wake that was already scheduled (or KEY, BOOT, or a charger change)
-fn sleep_until_scheduled(
-    rtc: &mut Rtc,
-    i2c: &mut I2c<'_, esp_hal::Blocking>,
-    delay: &mut Delay,
-) -> ! {
-    let now = rtc.time_since_boot().as_micros();
+fn sleep_until_scheduled(rtc: &mut Rtc, i2c: &mut I2c<'_, esp_hal::Blocking>) -> ! {
+    let now = rtc.time_since_power_up().as_micros();
     let remaining = unsafe { NEXT_WAKE_US }.saturating_sub(now) / 1_000_000;
-    sleep_until_wake(rtc, i2c, delay, remaining.max(1))
+    sleep_until_wake(i2c, remaining.max(1))
 }
 
-/// Arm the charger wake and deep sleep for `seconds`, or until KEY or a charger change.
+/// Arm the charger wake and deep sleep for `seconds`, or until KEY, BOOT, or a charger change.
 ///
-/// Wake sources: the timer, the KEY button (GPIO4, active low), and the AXP2101 IRQ line
-/// (GPIO21, active low) for USB plug/unplug and charge start/done.
-fn sleep_until_wake(
-    rtc: &mut Rtc,
-    i2c: &mut I2c<'_, esp_hal::Blocking>,
-    delay: &mut Delay,
-    seconds: u64,
-) -> ! {
+/// The AXP2101 IRQ line signals USB plug/unplug and charge start/done.
+fn sleep_until_wake(i2c: &mut I2c<'_, esp_hal::Blocking>, seconds: u64) -> ! {
     arm_charger_irq(i2c);
-
-    let timer = TimerWakeupSource::new(CoreDuration::from_secs(seconds));
-
-    let ext0 = key_wakeup();
-    let (mut irq_pin, mut boot_pin) = (charger_irq_pin(), boot_button_pin());
-    let mut irq_pins: [&mut dyn esp_hal::gpio::RtcPin; 2] = [&mut irq_pin, &mut boot_pin];
-    let ext1 = Ext1WakeupSource::new(&mut irq_pins, WakeupLevel::Low);
-
     info!(
         "Entering deep sleep for {} seconds (KEY or a charger change wakes early)...",
         seconds
     );
-    // Let serial output flush
-    delay.delay_ms(100);
-    rtc.sleep_deep(&[&timer, &ext0, &ext1])
+    deep_sleep(Some(seconds))
 }
 
 /// Enable only the AXP2101 charger IRQs (VBUS insert/remove, charge start/done) and clear
@@ -2091,31 +2023,45 @@ fn arm_charger_irq(i2c: &mut I2c<'_, esp_hal::Blocking>) {
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+async fn net_task(mut runner: Runner<'static, Interface>) {
     runner.run().await
 }
 
-/// Connect to WiFi network
+fn wifi_reason() -> Option<DisconnectReason> {
+    critical_section::with(|cs| WIFI_REASON.borrow(cs).get())
+}
+
+fn set_wifi_reason(reason: Option<DisconnectReason>) {
+    critical_section::with(|cs| WIFI_REASON.borrow(cs).set(reason));
+}
+
+/// Station settings for the configured network; an empty password means an open network
+fn station_config(config: &Config) -> Option<StationConfig> {
+    let ssid = config.wifi_ssid.as_str().try_into().ok()?;
+    let authentication = if config.wifi_pass.is_empty() {
+        AuthenticationMethodConfig::Open
+    } else {
+        AuthenticationMethodConfig::Wpa2Personal(config.wifi_pass.as_str().try_into().ok()?)
+    };
+    Some(
+        StationConfig::default()
+            .with_ssid(ssid)
+            .with_authentication(authentication),
+    )
+}
+
 /// Connect to the configured network, retrying until it joins (true) or fails the same
 /// definite way twice (false)
 async fn wifi_connect(controller: &mut WifiController<'static>, config: &Config) -> bool {
     start_fast_blink();
-    info!("Device capabilities: {:?}", controller.capabilities());
 
-    if !matches!(controller.is_started(), Ok(true)) {
-        let client = ClientConfig::default()
-            .with_ssid(config.wifi_ssid.clone())
-            .with_password(config.wifi_pass.clone());
-        // An empty password means an open network
-        let client_config = ModeConfig::Client(if config.wifi_pass.is_empty() {
-            client.with_auth_method(AuthMethod::None)
-        } else {
-            client
-        });
-        controller.set_config(&client_config).unwrap();
-        info!("Starting WiFi...");
-        controller.start_async().await.unwrap();
-        info!("WiFi started!");
+    let Some(station) = station_config(config) else {
+        info!("WiFi SSID or password is too long");
+        return false;
+    };
+    if let Err(e) = controller.set_config(&WifiConfig::Station(station)) {
+        info!("WiFi config failed: {:?}", e);
+        return false;
     }
 
     info!("Connecting to {}...", config.wifi_ssid);
@@ -2132,13 +2078,17 @@ async fn wifi_connect(controller: &mut WifiController<'static>, config: &Config)
                 return true;
             }
             Err(e) => {
-                let reason = WIFI_REASON.load(Ordering::Relaxed);
+                let reason = match e {
+                    ConnectionError::Failed(info) => Some(info.reason),
+                    _ => None,
+                };
+                set_wifi_reason(reason);
                 let cause =
                     WifiCause::classify(reason, false, WIFI_AUTH_FAILED.load(Ordering::Relaxed));
                 if cause == WifiCause::Auth {
                     WIFI_AUTH_FAILED.store(true, Ordering::Relaxed);
                 }
-                info!("Failed to connect: {e:?} (reason {})", reason);
+                info!("Failed to connect: {e:?}");
                 // A missing network or rejected password twice in a row will not fix itself
                 if matches!(cause, WifiCause::NotFound | WifiCause::Auth) && last == Some(cause) {
                     info!("Giving up: {:?}", cause);
@@ -2151,15 +2101,14 @@ async fn wifi_connect(controller: &mut WifiController<'static>, config: &Config)
     }
 }
 
-/// Disconnect and stop WiFi to save power
-async fn wifi_disconnect(controller: &mut WifiController<'static>) {
-    if let Err(e) = controller.disconnect_async().await {
-        info!("Disconnect error (may already be disconnected): {:?}", e);
+/// Disconnect, and drop the controller to power the radio down
+async fn wifi_stop(controller: &mut Option<WifiController<'static>>) {
+    if let Some(mut controller) = controller.take() {
+        if let Err(e) = controller.disconnect_async().await {
+            info!("Disconnect error (may already be disconnected): {:?}", e);
+        }
+        info!("WiFi stopped");
     }
-    if let Err(e) = controller.stop_async().await {
-        info!("Stop error: {:?}", e);
-    }
-    info!("WiFi stopped");
 }
 
 /// Wait for network stack to get an IP address
@@ -2284,14 +2233,14 @@ fn battery_body_rect(orientation: Orientation) -> Rect {
 
 /// TCP socket buffers for both sync connections, allocated in PSRAM and kept for the
 /// program's lifetime so they don't take internal RAM from the main stack
-fn alloc_tcp_state() -> &'static TcpClientState<2, TCP_RX_SIZE, TCP_TX_SIZE> {
-    let layout = core::alloc::Layout::new::<TcpClientState<2, TCP_RX_SIZE, TCP_TX_SIZE>>();
+fn alloc_tcp_state() -> &'static TcpClientState<2, TCP_TX_SIZE, TCP_RX_SIZE> {
+    let layout = core::alloc::Layout::new::<TcpClientState<2, TCP_TX_SIZE, TCP_RX_SIZE>>();
     // SAFETY: zeroed memory is identical to `TcpClientState::new()` in embassy-net 0.8 (all
     // pool slots unused, buffers uninitialized); allocating it directly avoids building the
     // struct on the stack. The allocation is never freed.
     unsafe {
         let ptr =
-            alloc::alloc::alloc_zeroed(layout) as *mut TcpClientState<2, TCP_RX_SIZE, TCP_TX_SIZE>;
+            alloc::alloc::alloc_zeroed(layout) as *mut TcpClientState<2, TCP_TX_SIZE, TCP_RX_SIZE>;
         assert!(!ptr.is_null(), "TCP buffer allocation failed");
         &*ptr
     }

@@ -58,9 +58,12 @@ nix develop
 Install the ESP Rust toolchain using [espup](https://github.com/esp-rs/espup):
 
 ```bash
-espup install
+espup install -t esp32s3 -v 1.98.1.0
 source ~/export-esp.sh
 ```
+
+esp-hal 1.2.2 does not link with the 1.99 toolchain, so the version is pinned until a fixed
+release.
 
 ### Configuration
 

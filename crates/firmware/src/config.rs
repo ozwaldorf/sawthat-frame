@@ -14,6 +14,8 @@
 use alloc::string::{String, ToString};
 use core::fmt::Write;
 
+use esp_radio::wifi::DisconnectReason;
+
 use crate::widget::Orientation;
 
 /// Config filename on the SD card root (8.3 format)
@@ -81,20 +83,30 @@ pub enum WifiCause {
     Auth,
     /// Joined the network but got no address over DHCP
     NoIp,
-    /// Another ESP-IDF disconnect reason, or none was reported
-    Other(u8),
+    /// Another disconnect reason, or none was reported
+    Other(Option<DisconnectReason>),
 }
 
 impl WifiCause {
-    /// Classify the last ESP-IDF station disconnect reason; `linked` is whether the station
+    /// Classify the last station disconnect reason; `linked` is whether the station
     /// joined the network, and `auth_failed` whether an earlier attempt failed authentication
-    pub fn classify(reason: u8, linked: bool, auth_failed: bool) -> Self {
+    pub fn classify(reason: Option<DisconnectReason>, linked: bool, auth_failed: bool) -> Self {
+        use DisconnectReason::*;
         match reason {
             _ if linked => Self::NoIp,
-            201 | 210 | 211 => Self::NotFound,
-            2 | 15 | 202 | 204 => Self::Auth,
+            Some(
+                NoAccessPointFound
+                | NoAccessPointFoundWithCompatibleSecurity
+                | NoAccessPointFoundInAuthmodeThreshold,
+            ) => Self::NotFound,
+            Some(
+                AuthenticationExpired
+                | FourWayHandshakeTimeout
+                | AuthenticationFailed
+                | HandshakeTimeout,
+            ) => Self::Auth,
             // A wrong password reports a handshake timeout, then generic connection failures
-            205 if auth_failed => Self::Auth,
+            Some(ConnectionFailed) if auth_failed => Self::Auth,
             other => Self::Other(other),
         }
     }
@@ -117,8 +129,8 @@ impl ConfigError {
                     WifiCause::NotFound => alloc::format!("Network not found: {}", ssid),
                     WifiCause::Auth => alloc::format!("Wrong password for {}", ssid),
                     WifiCause::NoIp => alloc::format!("No IP address from {}", ssid),
-                    WifiCause::Other(0) => alloc::format!("WiFi failed: {}", ssid),
-                    WifiCause::Other(n) => alloc::format!("WiFi error {}: {}", n, ssid),
+                    WifiCause::Other(None) => alloc::format!("WiFi failed: {}", ssid),
+                    WifiCause::Other(Some(r)) => alloc::format!("WiFi error {:?}: {}", r, ssid),
                 }
             }
         }

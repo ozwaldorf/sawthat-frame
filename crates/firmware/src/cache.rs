@@ -179,13 +179,13 @@ where
     /// Initialize cache directory structure: /concerts/horiz/ and /concerts/vert/
     pub fn init(&mut self) -> Result<(), CacheError> {
         // Open volume (partition 0)
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
 
         // Open root directory
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
         // Create /concerts/ if it doesn't exist
         if root_dir.open_dir(ROOT_DIR).is_err() {
@@ -196,7 +196,7 @@ where
         }
 
         // Open concerts directory
-        let mut concerts_dir = root_dir
+        let concerts_dir = root_dir
             .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
 
@@ -224,19 +224,19 @@ where
     pub fn has_image(&mut self, path: &str, orientation: Orientation) -> bool {
         let filename = cache_filename(path, self.font_id);
 
-        let Ok(mut volume) = self.volume_mgr.open_volume(VolumeIdx(0)) else {
+        let Ok(volume) = self.volume_mgr.open_volume(VolumeIdx(0)) else {
             return false;
         };
 
-        let Ok(mut root_dir) = volume.open_root_dir() else {
+        let Ok(root_dir) = volume.open_root_dir() else {
             return false;
         };
 
-        let Ok(mut concerts_dir) = root_dir.open_dir(ROOT_DIR) else {
+        let Ok(concerts_dir) = root_dir.open_dir(ROOT_DIR) else {
             return false;
         };
 
-        let Ok(mut orient_dir) = concerts_dir.open_dir(orientation_dir(orientation)) else {
+        let Ok(orient_dir) = concerts_dir.open_dir(orientation_dir(orientation)) else {
             return false;
         };
 
@@ -256,22 +256,22 @@ where
         let filename = cache_filename(path, self.font_id);
         let orient = orientation_dir(orientation);
 
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
-        let mut concerts_dir = root_dir
+        let concerts_dir = root_dir
             .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut orient_dir = concerts_dir
+        let orient_dir = concerts_dir
             .open_dir(orient)
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut file = orient_dir
+        let file = orient_dir
             .open_file_in_dir(filename.as_str(), Mode::ReadOnly)
             .map_err(|_| CacheError::NotFound)?;
 
@@ -293,19 +293,19 @@ where
 
     /// Delete a cached image
     pub fn remove_image(&mut self, path: &str, orientation: Orientation) -> Result<(), CacheError> {
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
-        let mut concerts_dir = root_dir
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let concerts_dir = root_dir
             .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
-        let mut orient_dir = concerts_dir
+        let orient_dir = concerts_dir
             .open_dir(orientation_dir(orientation))
             .map_err(|_| CacheError::Filesystem)?;
         orient_dir
-            .delete_file_in_dir(cache_filename(path, self.font_id).as_str())
+            .delete_entry_in_dir(cache_filename(path, self.font_id).as_str())
             .map_err(|_| CacheError::NotFound)
     }
 
@@ -319,23 +319,23 @@ where
         let filename = cache_filename(path, self.font_id);
         let orient = orientation_dir(orientation);
 
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
-        let mut concerts_dir = root_dir
+        let concerts_dir = root_dir
             .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut orient_dir = concerts_dir
+        let orient_dir = concerts_dir
             .open_dir(orient)
             .map_err(|_| CacheError::Filesystem)?;
 
         // Create/truncate file
-        let mut file = orient_dir
+        let file = orient_dir
             .open_file_in_dir(filename.as_str(), Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| CacheError::Write)?;
 
@@ -354,11 +354,11 @@ where
 
     /// Load the list of items with artwork for an orientation
     pub fn load_widget_data(&mut self, orientation: Orientation) -> Option<WidgetData> {
-        let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
-        let mut root_dir = volume.open_root_dir().ok()?;
-        let mut concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
+        let volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
+        let root_dir = volume.open_root_dir().ok()?;
+        let concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
 
-        let mut file = concerts_dir
+        let file = concerts_dir
             .open_file_in_dir(items_file(orientation), Mode::ReadOnly)
             .ok()?;
 
@@ -391,18 +391,18 @@ where
         orientation: Orientation,
         items: &WidgetData,
     ) -> Result<(), CacheError> {
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
-        let mut concerts_dir = root_dir
+        let concerts_dir = root_dir
             .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut file = concerts_dir
+        let file = concerts_dir
             .open_file_in_dir(items_file(orientation), Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| CacheError::Write)?;
 
@@ -424,15 +424,15 @@ where
 
     /// Store the raw SawThat bands response
     pub fn store_bands(&mut self, json: &[u8]) -> Result<(), CacheError> {
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
-        let mut concerts_dir = root_dir
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let concerts_dir = root_dir
             .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
-        let mut file = concerts_dir
+        let file = concerts_dir
             .open_file_in_dir(BANDS_FILE, Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| CacheError::Write)?;
         file.write(json).map_err(|_| CacheError::Write)?;
@@ -442,9 +442,9 @@ where
 
     /// Load the stored SawThat bands response
     pub fn load_bands(&mut self) -> Option<alloc::vec::Vec<u8>> {
-        let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
-        let mut root_dir = volume.open_root_dir().ok()?;
-        let mut concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
+        let volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
+        let root_dir = volume.open_root_dir().ok()?;
+        let concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
         let mut file = concerts_dir
             .open_file_in_dir(BANDS_FILE, Mode::ReadOnly)
             .ok()?;
@@ -458,8 +458,8 @@ where
     /// changes every image filename, so all artwork is rendered again.
     pub fn detect_font(&mut self, names: &[&str]) {
         let found = (|| {
-            let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
-            let mut root_dir = volume.open_root_dir().ok()?;
+            let volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
+            let root_dir = volume.open_root_dir().ok()?;
             names.iter().find_map(|&name| {
                 let entry = root_dir.find_directory_entry(name).ok()?;
                 let t = entry.mtime;
@@ -490,12 +490,12 @@ where
 
     /// Create or replace a file on the SD root
     pub fn write_root_file(&mut self, name: &str, data: &[u8]) -> Result<(), CacheError> {
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
-        let mut file = root_dir
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let file = root_dir
             .open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| CacheError::Write)?;
         file.write(data).map_err(|_| CacheError::Write)
@@ -508,12 +508,12 @@ where
         header: &[u8],
         data: &[u8],
     ) -> Result<(), CacheError> {
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
-        let mut file = root_dir
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let file = root_dir
             .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
             .map_err(|_| CacheError::Write)?;
         if file.length() == 0 {
@@ -528,11 +528,11 @@ where
         name: &str,
         max: usize,
     ) -> Result<alloc::vec::Vec<u8>, CacheError> {
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
         let mut file = root_dir
             .open_file_in_dir(name, Mode::ReadOnly)
             .map_err(|_| CacheError::NotFound)?;
@@ -544,10 +544,10 @@ where
 
     /// Read the orientation file of older firmware, which stored it outside `CONFIG.TXT`
     pub fn load_legacy_orientation(&mut self) -> Option<Orientation> {
-        let mut volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
-        let mut root_dir = volume.open_root_dir().ok()?;
-        let mut concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
-        let mut file = concerts_dir
+        let volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
+        let root_dir = volume.open_root_dir().ok()?;
+        let concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
+        let file = concerts_dir
             .open_file_in_dir(ORIENT_FILE, Mode::ReadOnly)
             .ok()?;
         let mut buf = [0u8; 1];
@@ -557,14 +557,14 @@ where
 
     /// Delete the orientation file of older firmware, if present
     pub fn remove_legacy_orientation(&mut self) {
-        let Ok(mut volume) = self.volume_mgr.open_volume(VolumeIdx(0)) else {
+        let Ok(volume) = self.volume_mgr.open_volume(VolumeIdx(0)) else {
             return;
         };
-        let Ok(mut root_dir) = volume.open_root_dir() else {
+        let Ok(root_dir) = volume.open_root_dir() else {
             return;
         };
-        if let Ok(mut concerts_dir) = root_dir.open_dir(ROOT_DIR)
-            && concerts_dir.delete_file_in_dir(ORIENT_FILE).is_ok()
+        if let Ok(concerts_dir) = root_dir.open_dir(ROOT_DIR)
+            && concerts_dir.delete_entry_in_dir(ORIENT_FILE).is_ok()
         {
             info!("Removed {}", ORIENT_FILE);
         }
@@ -578,14 +578,14 @@ where
             let _ = valid_hashes.push(image_hash(item.as_str(), self.font_id));
         }
 
-        let mut volume = self
+        let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(|_| CacheError::Filesystem)?;
 
-        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
 
-        let mut concerts_dir = root_dir
+        let concerts_dir = root_dir
             .open_dir(ROOT_DIR)
             .map_err(|_| CacheError::Filesystem)?;
 
@@ -593,7 +593,7 @@ where
 
         // Clean up stale files in both orientation directories
         for orient in [HORIZ_DIR, VERT_DIR] {
-            let Ok(mut orient_dir) = concerts_dir.open_dir(orient) else {
+            let Ok(orient_dir) = concerts_dir.open_dir(orient) else {
                 continue;
             };
 
@@ -624,12 +624,13 @@ where
                             }
                         }
                     }
+                    core::ops::ControlFlow::Continue(())
                 })
                 .ok();
 
             // Delete stale files from this orientation directory
             for filename in to_delete.iter() {
-                if orient_dir.delete_file_in_dir(filename.as_str()).is_ok() {
+                if orient_dir.delete_entry_in_dir(filename.as_str()).is_ok() {
                     info!("Removed stale cache: {}/{}/{}", ROOT_DIR, orient, filename);
                     removed += 1;
                 }

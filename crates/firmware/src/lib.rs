@@ -10,6 +10,7 @@ pub mod epd;
 pub mod fat_label;
 pub mod framebuffer;
 pub mod progress;
+pub mod sleep;
 pub mod sync;
 pub mod usb_drive;
 pub mod widget;

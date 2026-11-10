@@ -39,7 +39,7 @@ fn is_boot_sector(b: &Block) -> bool {
 fn read<D: BlockDevice>(device: &D, index: u32) -> Result<Block, LabelError> {
     let mut block = Block::new();
     device
-        .read(core::slice::from_mut(&mut block), BlockIdx(index), "label")
+        .read(core::slice::from_mut(&mut block), BlockIdx(index))
         .map_err(|_| LabelError::Device)?;
     Ok(block)
 }

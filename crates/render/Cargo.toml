@@ -8,8 +8,8 @@ ab_glyph   = { version = "0.2", default-features = false, features = ["libm"] }
 libm       = "0.2"
 serde      = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
-zune-core  = { version = "0.4", default-features = false }
-zune-jpeg  = { version = "0.4", default-features = false }
+zune-core  = { version = "0.5", default-features = false }
+zune-jpeg  = { version = "0.5", default-features = false }
 
 [dev-dependencies]
-png = "0.17"
+png = "0.18"

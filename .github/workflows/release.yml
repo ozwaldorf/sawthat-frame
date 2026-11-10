@@ -17,6 +17,8 @@ jobs:
       - uses: esp-rs/xtensa-toolchain@v1.6
         with:
           default: true
+          # esp-hal 1.2.2 does not link with 1.99
+          version: 1.98.1.0
           buildtargets: esp32s3
           ldproxy: false
 
