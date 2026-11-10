@@ -85,14 +85,16 @@ jobs:
         run: |
           cp -r site _site
           cp -r docs/examples docs/CONFIG.TXT _site/
-          cp "dist/sawthat-frame-${GITHUB_REF_NAME}.bin" _site/firmware.bin
-          jq -n --arg version "$GITHUB_REF_NAME" --arg revision "${GITHUB_SHA::10}" '{
+          # Named after the version and commit, so browsers never reuse a cached older build
+          firmware="sawthat-frame-${GITHUB_REF_NAME}-${GITHUB_SHA::10}.bin"
+          cp "dist/sawthat-frame-${GITHUB_REF_NAME}.bin" "_site/$firmware"
+          jq -n --arg version "$GITHUB_REF_NAME" --arg revision "${GITHUB_SHA::10}" --arg firmware "$firmware" '{
             name: "SawThat Frame",
             version: $version,
             revision: $revision,
             new_install_prompt_erase: true,
             new_install_improv_wait_time: 0,
-            builds: [{chipFamily: "ESP32-S3", parts: [{path: "firmware.bin", offset: 0}]}]
+            builds: [{chipFamily: "ESP32-S3", parts: [{path: $firmware, offset: 0}]}]
           }' > _site/manifest.json
 
       - uses: actions/configure-pages@v5

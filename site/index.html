@@ -211,7 +211,7 @@
   </footer>
 
   <script>
-    fetch("manifest.json")
+    fetch("manifest.json", { cache: "no-cache" })
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((m) => {
         const el = document.getElementById("version");
@@ -380,7 +380,8 @@
       );
       const manifestUrl = new URL("manifest.json", location.href);
       const manifest = await step("Couldn't load the firmware manifest.", async () => {
-        const response = await fetch(manifestUrl);
+        // Revalidated, as it names the current release; the firmware file is named per build
+        const response = await fetch(manifestUrl, { cache: "no-cache" });
         if (!response.ok) throw new Error(`manifest.json: ${response.status}`);
         return response.json();
       });
