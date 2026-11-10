@@ -109,6 +109,14 @@ const DIALOG_HOLD_MS: u64 = 1000;
 /// AXP2101 PMIC I2C address and fuel gauge percentage register
 const AXP2101_ADDR: u8 = 0x34;
 const BAT_PERCENT_REG: u8 = 0xA4;
+/// AXP2101 rail enables: DC1-DC5 in bits 0-4, ALDO1-ALDO4 in bits 0-3, DLDO2 in bit 0
+const DC_ONOFF_CTRL: u8 = 0x80;
+const LDO_ONOFF_CTRL0: u8 = 0x90;
+const LDO_ONOFF_CTRL1: u8 = 0x91;
+/// ALDO3 feeds the audio codecs, ALDO4 the panel. DC1 is VCC3V3 (ESP32, SD card, LEDs) and
+/// the other rails are unconnected.
+const ALDO3: u8 = 1 << 2;
+const ALDO4: u8 = 1 << 3;
 /// Battery log on the SD root, one CSV row per power reading
 const BATTERY_LOG: &str = "BATTERY.CSV";
 /// Display busy polling interval in milliseconds (display refresh takes seconds)
@@ -671,24 +679,40 @@ async fn main(spawner: Spawner) -> ! {
     .with_sda(peripherals.GPIO47)
     .with_scl(peripherals.GPIO48);
 
-    const LDO_ONOFF_CTRL0: u8 = 0x90; // ALDO enable bits
     const LDO_VOL2_CTRL: u8 = 0x94; // ALDO3 voltage
     const LDO_VOL3_CTRL: u8 = 0x95; // ALDO4 voltage
 
-    // Try to configure PMIC - may already be set by bootloader
-    let pmic_ok = (|| -> Result<(), esp_hal::i2c::master::Error> {
-        // Set ALDO3 voltage to 3.3V: (3300-500)/100 = 28 = 0x1C
+    // ALDO3/ALDO4 at 3.3V, (3300-500)/100 = 0x1C, and only those LDOs on. The panel rail is
+    // cut during deep sleep, so this also powers it back up.
+    let mut enable_rails = || -> Result<(), esp_hal::i2c::master::Error> {
         i2c.write(AXP2101_ADDR, &[LDO_VOL2_CTRL, 0x1C])?;
-        // Set ALDO4 voltage to 3.3V
         i2c.write(AXP2101_ADDR, &[LDO_VOL3_CTRL, 0x1C])?;
-        // Enable ALDO3 and ALDO4 (bits 2 and 3) - just set all common LDOs on
-        i2c.write(AXP2101_ADDR, &[LDO_ONOFF_CTRL0, 0x0F])?;
+        i2c.write(AXP2101_ADDR, &[LDO_ONOFF_CTRL0, ALDO3 | ALDO4])?;
         Ok(())
-    })();
-
-    match pmic_ok {
+    };
+    match enable_rails()
+        .or_else(|_| enable_rails())
+        .or_else(|_| enable_rails())
+    {
         Ok(()) => info!("PMIC configured - ALDO3/ALDO4 enabled at 3.3V"),
-        Err(e) => info!("PMIC config skipped (may be pre-configured): {:?}", e),
+        Err(e) => info!("PMIC rail config failed, panel may be unpowered: {:?}", e),
+    }
+
+    // Unconnected rails off: DC2-DC5 and DLDO2
+    pmic_update(&mut i2c, DC_ONOFF_CTRL, 0x1E, 0);
+    pmic_update(&mut i2c, LDO_ONOFF_CTRL1, 0x01, 0);
+
+    // Charger: 2 A input limit, 50 mA precharge, 500 mA constant current, 25 mA termination
+    const CHARGER: [(u8, u8, u8); 4] = [
+        (0x16, 0x07, 5),
+        (0x61, 0x0F, 2),
+        (0x62, 0x1F, 0x0B),
+        (0x63, 0x0F, 1),
+    ];
+    for (reg, mask, value) in CHARGER {
+        if !pmic_update(&mut i2c, reg, mask, value) {
+            info!("PMIC charger register {:#04x} not set", reg);
+        }
     }
 
     // Small delay for power rails to stabilize
@@ -780,6 +804,14 @@ async fn main(spawner: Spawner) -> ! {
         }};
     }
 
+    // Before deep sleep: let any refresh finish, put the panel to sleep and cut its rail
+    macro_rules! power_down_panel {
+        () => {{
+            epd.sleep(&mut delay).ok();
+            panel_power_off(&mut i2c);
+        }};
+    }
+
     // Drive mode tick that puts the panel to sleep once the refresh started before it ends
     macro_rules! sleep_panel_when_idle {
         ($busy:ident) => {
@@ -820,7 +852,7 @@ async fn main(spawner: Spawner) -> ! {
             while epd.is_busy() {
                 Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
             }
-            epd.sleep(&mut delay).ok();
+            power_down_panel!();
             sleep_on_setup(&mut rtc, &mut i2c, &mut delay, $retry)
         }};
     }
@@ -863,7 +895,7 @@ async fn main(spawner: Spawner) -> ! {
             drive_mode_with_notice!();
         }
         if resuming || host {
-            epd.sleep(&mut delay).ok();
+            power_down_panel!();
             if resuming {
                 sleep_until_scheduled(&mut rtc, &mut i2c, &mut delay);
             }
@@ -883,7 +915,7 @@ async fn main(spawner: Spawner) -> ! {
         if let Err(e) = epd.partial_update(&rect, &region, &mut delay) {
             info!("Battery refresh failed: {:?}", e);
         }
-        epd.sleep(&mut delay).ok();
+        power_down_panel!();
         sleep_until_scheduled(&mut rtc, &mut i2c, &mut delay);
     }
 
@@ -1667,6 +1699,7 @@ async fn main(spawner: Spawner) -> ! {
     unsafe {
         NEXT_WAKE_US = rtc.time_since_boot().as_micros() as u64 + config.refresh_secs() * 1_000_000;
     }
+    power_down_panel!();
     sleep_until_wake(&mut rtc, &mut i2c, &mut delay, config.refresh_secs());
 }
 
@@ -1704,6 +1737,22 @@ fn pmic_read(i2c: &mut I2c<'_, esp_hal::Blocking>, reg: u8) -> Option<u8> {
         }
     }
     None
+}
+
+/// Set the `mask` bits of an AXP2101 register to `value`, keeping the others
+fn pmic_update(i2c: &mut I2c<'_, esp_hal::Blocking>, reg: u8, mask: u8, value: u8) -> bool {
+    pmic_read(i2c, reg).is_some_and(|old| {
+        i2c.write(AXP2101_ADDR, &[reg, (old & !mask) | (value & mask)])
+            .is_ok()
+    })
+}
+
+/// Cut the panel rail for deep sleep; the next boot turns it back on. Call only after the
+/// panel is put to sleep, which waits for any refresh to finish.
+fn panel_power_off(i2c: &mut I2c<'_, esp_hal::Blocking>) {
+    if !pmic_update(i2c, LDO_ONOFF_CTRL0, ALDO4, 0) {
+        info!("Panel rail not cut");
+    }
 }
 
 /// Battery level and power symbol, as shown by the battery icon, with the raw PMIC readings

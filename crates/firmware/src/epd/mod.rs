@@ -79,6 +79,8 @@ pub struct Epd7in3e<SPI, BUSY, DC, RST> {
     dc: DC,
     rst: RST,
     refresh_mode: RefreshMode,
+    /// In deep sleep, which only a hardware reset ends
+    asleep: bool,
 }
 
 impl<SPI, BUSY, DC, RST> Epd7in3e<SPI, BUSY, DC, RST>
@@ -105,6 +107,7 @@ where
             dc,
             rst,
             refresh_mode,
+            asleep: false,
         };
 
         epd.hardware_reset(delay);
@@ -115,6 +118,7 @@ where
 
     /// Hardware reset sequence
     fn hardware_reset<DELAY: DelayNs>(&mut self, delay: &mut DELAY) {
+        self.asleep = false;
         let _ = self.rst.set_high();
         delay.delay_ms(10);
         let _ = self.rst.set_low();
@@ -384,13 +388,18 @@ where
         Ok(())
     }
 
-    /// Put the display into sleep mode
+    /// Put the display into sleep mode once any refresh ends. Does nothing if already asleep.
     pub fn sleep<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<(), SPI::Error> {
+        if self.asleep {
+            return Ok(());
+        }
+        self.wait_until_idle(delay);
         self.cmd_with_data(Command::POF, &[0x00])?;
         self.wait_until_idle(delay);
 
         self.cmd_with_data(Command::DSLP, &[0xA5])?;
         delay.delay_ms(100);
+        self.asleep = true;
 
         Ok(())
     }
