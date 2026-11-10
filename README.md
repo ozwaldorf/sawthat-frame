@@ -128,6 +128,10 @@ cd crates/firmware
 cargo run --release
 ```
 
+The runner also writes the function names into the image (`crates/symtab`), so crash reports
+show a named stack trace. Flashing a `cargo build` output directly works, but crash reports then
+show addresses only.
+
 ### Button Controls
 
 The KEY button controls navigation and orientation:

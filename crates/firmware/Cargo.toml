@@ -35,11 +35,8 @@ embassy-net = { version = "=0.9.1", features = [
 embedded-io = "0.7.1"
 embedded-io-async = "0.7"
 esp-alloc = "0.11.0"
-esp-backtrace = { version = "0.20.0", features = [
-  "esp32s3",
-  "panic-handler",
-  "println",
-] }
+# Backtrace capture only; the panic handler is in `crash`
+esp-backtrace = { version = "0.20.0", default-features = false, features = ["esp32s3", "println"] }
 esp-println = { version = "0.18.0", features = ["esp32s3", "log-04"] }
 # for more networking protocol support see https://crates.io/crates/edge-net
 embassy-executor = { version = "0.10.0", features = ["log"] }
@@ -79,6 +76,9 @@ embedded-graphics-core = "0.4"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde-json-core = "0.7"
 heapless = "0.9"
+
+# Crash report QR code
+qrcodegen-no-heap = "1.8"
 
 
 # On-device artwork rendering

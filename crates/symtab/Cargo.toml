@@ -1,0 +1,8 @@
+[package]
+edition = "2024"
+name    = "sawthat-symtab"
+version = "0.1.0"
+
+[dependencies]
+object         = { version = "0.41", default-features = false, features = ["elf", "read_core", "std"] }
+rustc-demangle = "0.1"

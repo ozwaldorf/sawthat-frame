@@ -59,10 +59,10 @@ use sawthat_frame_firmware::display;
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
 use sawthat_frame_firmware::progress;
-use sawthat_frame_firmware::sleep;
 use sawthat_frame_firmware::sync::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::usb_drive;
 use sawthat_frame_firmware::widget::{Orientation, WidgetData};
+use sawthat_frame_firmware::{crash, sleep};
 use sawthat_render::Renderer;
 use sawthat_render::concerts::Concert;
 
@@ -579,6 +579,11 @@ async fn main(spawner: Spawner) -> ! {
     // ==================== Normal Boot Sequence ====================
     // Now do the heavier initialization
     info!(
+        "Firmware v{} ({})",
+        crash::FIRMWARE_VERSION,
+        crash::GIT_REVISION
+    );
+    info!(
         "Boot! Wake reason: {:?}, reset reason: {:?}",
         wake_reason,
         esp_hal::system::reset_reason()
@@ -856,6 +861,43 @@ async fn main(spawner: Spawner) -> ! {
                 }
             }
         }};
+    }
+
+    // Show the report of a crash in the previous boot, then stay off until KEY. The report is
+    // cleared only once shown, so a crash while showing it shuts down instead of looping.
+    if let Some(report) = crash::pending() {
+        let (version, trace, urls) = (report.version(), report.trace(), report.issue_urls());
+        info!(
+            "Showing crash report from {}: {}",
+            version,
+            report.message()
+        );
+        for line in &trace {
+            info!("  {}", line);
+        }
+        info!("Report link: {}", urls[0]);
+        progress::draw_crash(
+            &mut framebuffer,
+            orientation,
+            report.message(),
+            &version,
+            &trace,
+            &urls,
+        );
+        match epd.display_start(framebuffer.as_slice(), &mut delay) {
+            Ok(()) => {
+                while epd.is_busy() {
+                    Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
+                }
+            }
+            Err(e) => info!("Crash screen refresh failed: {:?}", e),
+        }
+        power_down_panel!();
+        crash::clear();
+        boot_fresh_next();
+        unsafe { SETUP_SHOWN = 0 };
+        info!("Shutting down until KEY");
+        sleep::shutdown();
     }
 
     let config = match config {

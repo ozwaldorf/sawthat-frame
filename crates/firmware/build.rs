@@ -1,7 +1,42 @@
 fn main() {
     linker_be_nice();
+    git_revision();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
+}
+
+/// Expose the git revision the firmware is built from as `GIT_REVISION`, marked `-dirty` with
+/// uncommitted changes, or `unknown` outside a git checkout
+fn git_revision() {
+    let revision = std::process::Command::new("git")
+        .args([
+            "describe",
+            "--always",
+            "--dirty",
+            "--abbrev=10",
+            "--match=NONE",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|revision| revision.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=GIT_REVISION={revision}");
+
+    // Source edits change the dirty state, and git metadata changes the commit
+    println!("cargo:rerun-if-changed=src");
+    if let Some(git_dir) = std::process::Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+    {
+        let git_dir = git_dir.trim();
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+        println!("cargo:rerun-if-changed={git_dir}/index");
+        println!("cargo:rerun-if-changed={git_dir}/refs");
+    }
 }
 
 fn linker_be_nice() {

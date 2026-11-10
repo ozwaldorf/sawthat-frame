@@ -38,6 +38,10 @@ jobs:
         working-directory: crates/firmware
         run: cargo build --release
 
+      - name: Embed crash report symbols
+        working-directory: crates/symtab
+        run: cargo run --release -- ../firmware/target/xtensa-esp32s3-none-elf/release/sawthat-frame-firmware
+
       - name: Package artifacts
         run: |
           name="sawthat-frame-${GITHUB_REF_NAME}"

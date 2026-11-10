@@ -13,7 +13,8 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use sawthat_render::palette::{BLACK, GREEN, RED, WHITE};
+use qrcodegen_no_heap::{QrCode, QrCodeEcc, Version};
+use sawthat_render::palette::{BLACK, BLUE, GREEN, RED, WHITE};
 use sawthat_render::text::{Canvas, draw_text, font, text_width};
 
 use crate::epd::{HEIGHT, Rect, WIDTH};
@@ -182,6 +183,285 @@ pub fn draw_drive_mode(framebuffer: &mut Framebuffer, orientation: Orientation) 
         None,
         &DRIVE_LINES,
     )
+}
+
+/// Crash screen margin, text sizes, and gap between the text and the QR code
+const CRASH_MARGIN: u32 = 32;
+const CRASH_FACE_SIZE: f32 = 96.0;
+const CRASH_TEXT_SIZE: f32 = 18.0;
+const CRASH_TRACE_SIZE: f32 = 14.0;
+const CRASH_RESTART_SIZE: f32 = 22.0;
+/// Crash screen title, and the note by the QR code
+const CRASH_TITLE: &str = "Uh oh! We've encountered an error";
+const CRASH_SCAN_NOTE: &str = "Scan to submit the crash report";
+/// Gap between the QR code and its notes in portrait
+const CRASH_NOTE_GAP: u32 = 16;
+/// Baseline of a line drawn with `draw_text`, as a fraction of its size below its top
+const BASELINE: f32 = 0.8;
+const CRASH_QR_GAP: u32 = 24;
+/// Most space for the QR code on the crash screen, quiet zone included
+const CRASH_QR_SIDE: u32 = 200;
+/// Quiet zone around a QR code, in modules
+const QR_BORDER: u32 = 4;
+/// Smallest module size, in pixels, that still scans from the panel
+const QR_MIN_SCALE: u32 = 2;
+
+/// Fill the screen with a blue crash report: the panic `message` (lines separated by `\n`), the
+/// `trace` lines, and a QR code linking to the first of `urls` that fits, above the firmware
+/// `version`. Lines that do not fit are dropped; the link holds the report.
+pub fn draw_crash(
+    framebuffer: &mut Framebuffer,
+    orientation: Orientation,
+    message: &str,
+    version: &str,
+    trace: &[String],
+    urls: &[String],
+) {
+    let font = font();
+    let (sw, sh) = screen_size(orientation);
+    let mut data = vec![(BLUE << 4) | BLUE; Canvas::len(sw, sh)];
+    let mut canvas = Canvas {
+        data: &mut data,
+        width: sw,
+        height: sh,
+    };
+    let firmware = format!("Firmware {version}");
+    let restart = "Press KEY to restart";
+    let width = |text: &str, size| text_width(&font, text, size) as u32;
+    // The font is monospaced, so lines wrap at a fixed character count
+    let chars = |width: u32, size| (width as f32 / text_width(&font, "M", size)) as usize;
+    let right = sw - CRASH_MARGIN;
+
+    // Landscape puts the QR code and its notes in a column right of the text, with the restart
+    // hint in the bottom right corner. Portrait puts the text across the top, the QR code in the
+    // bottom left corner, and the notes right-aligned in the bottom right corner beside it.
+    let qr = fit_qr(urls, CRASH_QR_SIDE);
+    let qr_side = qr.map_or(0, |(_, side)| side);
+    let (text_w, text_bottom) = match orientation {
+        Orientation::Horizontal => {
+            let notes = [CRASH_SCAN_NOTE, firmware.as_str()];
+            let col_w = notes
+                .iter()
+                .map(|note| width(note, CRASH_TRACE_SIZE))
+                .chain([qr_side, width(restart, CRASH_RESTART_SIZE)])
+                .max()
+                .unwrap_or(qr_side);
+            if let Some((url, side)) = qr {
+                draw_qr(Some(&mut canvas), url, right - side, CRASH_MARGIN, side);
+            }
+            let mut y = CRASH_MARGIN + qr_side + LINE_GAP;
+            for note in notes {
+                let x = right - width(note, CRASH_TRACE_SIZE);
+                draw_text(
+                    &mut canvas,
+                    &font,
+                    note,
+                    CRASH_TRACE_SIZE,
+                    (x as f32, y as f32),
+                    WHITE,
+                );
+                y += line_h(CRASH_TRACE_SIZE);
+            }
+            let (x, y) = (
+                right - width(restart, CRASH_RESTART_SIZE),
+                sh - CRASH_MARGIN - (CRASH_RESTART_SIZE * BASELINE) as u32,
+            );
+            draw_text(
+                &mut canvas,
+                &font,
+                restart,
+                CRASH_RESTART_SIZE,
+                (x as f32, y as f32),
+                WHITE,
+            );
+            (
+                right - col_w - CRASH_QR_GAP - CRASH_MARGIN,
+                sh - CRASH_MARGIN,
+            )
+        }
+        Orientation::Vertical => {
+            // The QR code and the notes keep the screen margin to what they draw: the QR code's
+            // white square, and the notes' right edge and last baseline
+            let (right, bottom) = (sw - CRASH_MARGIN, sh - CRASH_MARGIN);
+            let top = bottom - qr_side;
+            if let Some((url, side)) = qr {
+                draw_qr(Some(&mut canvas), url, CRASH_MARGIN, top, side);
+            }
+            let notes_w = right - (CRASH_MARGIN + qr_side + CRASH_NOTE_GAP);
+            // Each line as large as fits beside the QR code, wrapped only if none does
+            let fit = |text: &str, sizes: &[f32]| -> Vec<(String, f32)> {
+                match sizes.iter().find(|&&size| width(text, size) <= notes_w) {
+                    Some(&size) => vec![(String::from(text), size)],
+                    None => {
+                        let size = sizes[sizes.len() - 1];
+                        wrap(text, chars(notes_w, size))
+                            .into_iter()
+                            .map(|line| (line, size))
+                            .collect()
+                    }
+                }
+            };
+            let note_sizes = [CRASH_TRACE_SIZE, 13.0];
+            let mut lines = fit(CRASH_SCAN_NOTE, &note_sizes);
+            lines.extend(fit(&firmware, &note_sizes));
+            lines.extend(fit(
+                restart,
+                &[CRASH_RESTART_SIZE, CRASH_TEXT_SIZE, 16.0, 14.0],
+            ));
+            // Stacked up from the bottom right corner by baseline
+            let (mut baseline, mut notes_top) = (bottom, bottom);
+            for (line, size) in lines.iter().rev() {
+                notes_top = baseline - (size * BASELINE) as u32;
+                let x = right - width(line, *size);
+                draw_text(
+                    &mut canvas,
+                    &font,
+                    line,
+                    *size,
+                    (x as f32, notes_top as f32),
+                    WHITE,
+                );
+                baseline -= line_h(*size);
+            }
+            (sw - 2 * CRASH_MARGIN, top.min(notes_top) - SECTION_GAP)
+        }
+    };
+
+    let mut lines: Vec<(String, f32, u32)> = vec![(String::from(":("), CRASH_FACE_SIZE, 0)];
+    for line in wrap(CRASH_TITLE, chars(text_w, TITLE_SIZE)) {
+        lines.push((line, TITLE_SIZE, 0));
+    }
+    let mut gap = SECTION_GAP;
+    for line in message.lines() {
+        for part in wrap(line, chars(text_w, CRASH_TEXT_SIZE)) {
+            lines.push((part, CRASH_TEXT_SIZE, core::mem::take(&mut gap)));
+        }
+    }
+    if !trace.is_empty() {
+        lines.push((String::from("Stack trace:"), CRASH_TEXT_SIZE, SECTION_GAP));
+        // Lines too long for the column are cut, keeping the address and the start of the name
+        let max = chars(text_w, CRASH_TRACE_SIZE);
+        for line in trace {
+            let text = if line.chars().count() > max {
+                let kept: String = line.chars().take(max.saturating_sub(2)).collect();
+                format!("{kept}..")
+            } else {
+                line.clone()
+            };
+            lines.push((text, CRASH_TRACE_SIZE, 0));
+        }
+    }
+
+    // Lines that do not fit above the bottom are dropped
+    let mut y = CRASH_MARGIN;
+    for (text, size, gap) in &lines {
+        let top = y + gap;
+        if top + line_h(*size) > text_bottom {
+            break;
+        }
+        draw_text(
+            &mut canvas,
+            &font,
+            text,
+            *size,
+            (CRASH_MARGIN as f32, top as f32),
+            WHITE,
+        );
+        y = top + line_h(*size);
+    }
+
+    for y in 0..sh {
+        for x in 0..sw {
+            let (fx, fy) = to_framebuffer(orientation, x, y);
+            framebuffer.set_pixel_indexed(fx, fy, canvas.get(x, y));
+        }
+    }
+}
+
+/// The first of `texts` whose QR code fits a `side` square with modules large enough to scan,
+/// with the side it is drawn at
+fn fit_qr(texts: &[String], side: u32) -> Option<(&str, u32)> {
+    texts
+        .iter()
+        .find_map(|text| draw_qr(None, text, 0, 0, side).map(|drawn| (text.as_str(), drawn)))
+}
+
+/// Draw `text` as a black-on-white QR code with its quiet zone, from (x, y) and at most `side`
+/// wide, returning the side it takes; or only measure it without a canvas. Returns `None` if its
+/// modules would be too small to scan.
+fn draw_qr(canvas: Option<&mut Canvas>, text: &str, x: u32, y: u32, side: u32) -> Option<u32> {
+    let len = Version::MAX.buffer_len();
+    let (mut temp, mut out) = (vec![0u8; len], vec![0u8; len]);
+    let qr = QrCode::encode_text(
+        text,
+        &mut temp,
+        &mut out,
+        QrCodeEcc::Low,
+        Version::MIN,
+        Version::MAX,
+        None,
+        true,
+    )
+    .ok()?;
+    let modules = qr.size() as u32 + 2 * QR_BORDER;
+    let scale = side / modules;
+    if scale < QR_MIN_SCALE {
+        return None;
+    }
+    if let Some(canvas) = canvas {
+        for my in 0..modules {
+            for mx in 0..modules {
+                let dark =
+                    qr.get_module(mx as i32 - QR_BORDER as i32, my as i32 - QR_BORDER as i32);
+                let color = if dark { BLACK } else { WHITE };
+                for py in 0..scale {
+                    for px in 0..scale {
+                        canvas.set(x + mx * scale + px, y + my * scale + py, color);
+                    }
+                }
+            }
+        }
+    }
+    Some(modules * scale)
+}
+
+/// Split `text` into lines of at most `max_chars`, breaking at spaces where possible
+fn wrap(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let mut word = word;
+        loop {
+            let len = line.chars().count();
+            let sep = usize::from(len > 0);
+            if len + sep + word.chars().count() <= max_chars {
+                if sep == 1 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                break;
+            }
+            if len > 0 {
+                lines.push(core::mem::take(&mut line));
+                continue;
+            }
+            // A word longer than a line is split
+            let split = word
+                .char_indices()
+                .nth(max_chars)
+                .map_or(word.len(), |(i, _)| i);
+            lines.push(String::from(&word[..split]));
+            word = &word[split..];
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Draw a centered box with a title, an optional red line, and notes, returning its
