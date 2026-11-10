@@ -2,7 +2,7 @@
 edition      = "2024"
 name         = "sawthat-frame-firmware"
 rust-version = "1.95"
-version      = "0.3.0"
+version      = "0.3.1"
 
 [[bin]]
 name = "sawthat-frame-firmware"
