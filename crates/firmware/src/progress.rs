@@ -19,7 +19,7 @@ use sawthat_render::text::{Canvas, draw_text, font, text_width};
 
 use crate::epd::{HEIGHT, Rect, WIDTH};
 use crate::framebuffer::Framebuffer;
-use crate::widget::Orientation;
+use crate::orientation::Orientation;
 
 /// Inner padding and corner box distance from the screen corner, in screen coordinates
 const PADDING: u32 = 8;

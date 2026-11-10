@@ -1,10 +1,11 @@
-//! Rendering stored artwork into the framebuffer and item ordering.
+//! Rendering stored artwork into the framebuffer, and the concert list order.
 
 use log::info;
 use sawthat_render::{HORIZ_SIZE, PackedImage, VERT_SIZE};
 
+use crate::cache::ConcertList;
 use crate::framebuffer::Framebuffer;
-use crate::widget::{Orientation, WidgetData};
+use crate::orientation::Orientation;
 
 /// Display error types
 #[derive(Debug)]
@@ -61,9 +62,9 @@ pub fn render_stored(
     Ok(())
 }
 
-/// Shuffle widget items in-place using a simple xorshift RNG
-pub fn shuffle_items(items: &mut WidgetData, seed: u64) {
-    let len = items.len();
+/// Shuffle a concert list in place using a simple xorshift RNG
+pub fn shuffle(list: &mut ConcertList, seed: u64) {
+    let len = list.len();
     if len <= 1 {
         return;
     }
@@ -77,8 +78,6 @@ pub fn shuffle_items(items: &mut WidgetData, seed: u64) {
         state ^= state << 17;
 
         let j = (state as usize) % (i + 1);
-        items.swap(i, j);
+        list.swap(i, j);
     }
-
-    info!("Shuffled {} items", len);
 }

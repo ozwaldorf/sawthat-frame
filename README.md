@@ -199,8 +199,8 @@ If SawThat is unreachable, the last successful response stored on the SD card is
 /BATTERY.CSV          # Power reading per wake: RTC uptime, wake cause, mV, %, PMIC flags
 /concerts/
   BANDS.JSN           # Last SawThat bands response
-  HORIZ.JSN           # Items with horizontal artwork
-  VERT.JSN            # Items with vertical artwork
+  HORIZ.JSN           # Concert list: concerts with horizontal artwork
+  VERT.JSN            # Concert list: concerts with vertical artwork
   horiz/
     {hash}.IMG        # Horizontal artwork (400x480)
   vert/
@@ -226,7 +226,7 @@ stateDiagram-v2
         direction LR
         InitSD: Init SD card
         InitSD --> LoadConfig: Read CONFIG.TXT
-        LoadConfig --> LoadList: Load item list for orientation
+        LoadConfig --> LoadList: Load concert list for orientation
     }
 
     Boot --> Setup: Missing or invalid config

@@ -16,7 +16,7 @@ use core::fmt::Write;
 
 use esp_radio::wifi::DisconnectReason;
 
-use crate::widget::Orientation;
+use crate::orientation::Orientation;
 
 /// Config filename on the SD card root (8.3 format)
 pub const CONFIG_FILE: &str = "CONFIG.TXT";

@@ -9,8 +9,6 @@ use serde::Deserialize;
 pub const SAWTHAT_BANDS_URL: &str = "https://server.sawthat.band/api/bands?id=";
 /// Deezer API base
 pub const DEEZER_API: &str = "https://api.deezer.com";
-/// Maximum number of concerts to display
-pub const MAX_CONCERTS: usize = 128;
 
 #[derive(Deserialize)]
 struct Band {
@@ -88,11 +86,7 @@ pub fn parse_concerts(json: &[u8], user_id: &str) -> Result<Vec<Concert>, serde_
         .collect();
 
     concerts.sort_by(|a, b| b.0.cmp(&a.0));
-    Ok(concerts
-        .into_iter()
-        .take(MAX_CONCERTS)
-        .map(|(_, c)| c)
-        .collect())
+    Ok(concerts.into_iter().map(|(_, c)| c).collect())
 }
 
 /// Percent-encode a query parameter value

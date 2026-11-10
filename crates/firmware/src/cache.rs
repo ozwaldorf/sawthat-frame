@@ -1,10 +1,9 @@
 //! SD card-based image cache
 //!
-//! Stores pre-rendered artwork directly on the SD card's FAT filesystem.
-//! Directory structure mirrors the API paths:
+//! Stores pre-rendered artwork directly on the SD card's FAT filesystem:
 //!
 //! /concerts/
-//!   HORIZ.JSN / VERT.JSN     - JSON arrays of items with artwork per orientation
+//!   HORIZ.JSN / VERT.JSN     - concert lists: JSON arrays of the concerts with artwork
 //!   BANDS.JSN                - raw SawThat bands response
 //!   horiz/
 //!     {hash}.IMG             - horizontal artwork (see sawthat_render::pack_image)
@@ -18,9 +17,12 @@ use embedded_sdmmc::{Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManag
 use heapless::String;
 use log::info;
 
-use crate::widget::{Orientation, WidgetData};
+use crate::orientation::Orientation;
 
-/// Root directory (mirrors API path)
+/// Paths of the concerts with artwork for one orientation, in display order
+pub type ConcertList = alloc::vec::Vec<alloc::string::String>;
+
+/// Root directory
 const ROOT_DIR: &str = "concerts";
 
 /// Horizontal orientation subdirectory
@@ -29,8 +31,8 @@ const HORIZ_DIR: &str = "horiz";
 /// Vertical orientation subdirectory
 const VERT_DIR: &str = "vert";
 
-/// Ready item list filename per orientation (JSON array of item paths) - 8.3 format
-fn items_file(orientation: Orientation) -> &'static str {
+/// Concert list filename per orientation - 8.3 format
+fn list_file(orientation: Orientation) -> &'static str {
     match orientation {
         Orientation::Horizontal => "HORIZ.JSN",
         Orientation::Vertical => "VERT.JSN",
@@ -161,7 +163,7 @@ where
 
         // Get card size to verify it's working
         match sd_card.num_bytes() {
-            Ok(size) => info!("SD card size: {} MB", size / 1024 / 1024),
+            Ok(size) => info!("SD card: {} MB", size / 1024 / 1024),
             Err(_) => {
                 info!("Failed to read SD card size");
                 return Err(CacheError::SdCard);
@@ -216,7 +218,6 @@ where
             info!("Created {}/{} directory", ROOT_DIR, VERT_DIR);
         }
 
-        info!("Cache directory structure ready");
         Ok(())
     }
 
@@ -352,44 +353,24 @@ where
         Ok(())
     }
 
-    /// Load the list of items with artwork for an orientation
-    pub fn load_widget_data(&mut self, orientation: Orientation) -> Option<WidgetData> {
+    /// Load the concert list of an orientation, or `None` if it is missing or empty
+    pub fn load_concert_list(&mut self, orientation: Orientation) -> Option<ConcertList> {
         let volume = self.volume_mgr.open_volume(VolumeIdx(0)).ok()?;
         let root_dir = volume.open_root_dir().ok()?;
         let concerts_dir = root_dir.open_dir(ROOT_DIR).ok()?;
 
-        let file = concerts_dir
-            .open_file_in_dir(items_file(orientation), Mode::ReadOnly)
+        let mut file = concerts_dir
+            .open_file_in_dir(list_file(orientation), Mode::ReadOnly)
             .ok()?;
-
-        // Read file into buffer (128 items of up to 48 chars plus quoting)
-        let mut buf = alloc::vec![0u8; 8192];
-        let mut total_read = 0;
-        loop {
-            match file.read(&mut buf[total_read..]) {
-                Ok(0) => break,
-                Ok(n) => total_read += n,
-                Err(_) => return None,
-            }
-        }
-
-        // Parse JSON
-        let json_str = core::str::from_utf8(&buf[..total_read]).ok()?;
-        let data: WidgetData = serde_json_core::from_str(json_str).ok()?.0;
-
-        if data.is_empty() {
-            None
-        } else {
-            info!("Loaded {} cached widget items from JSON", data.len());
-            Some(data)
-        }
+        let list: ConcertList = serde_json::from_slice(&read_all(&mut file).ok()?).ok()?;
+        (!list.is_empty()).then_some(list)
     }
 
-    /// Store the list of items with artwork for an orientation
-    pub fn store_widget_data(
+    /// Store the concert list of an orientation
+    pub fn store_concert_list(
         &mut self,
         orientation: Orientation,
-        items: &WidgetData,
+        list: &ConcertList,
     ) -> Result<(), CacheError> {
         let volume = self
             .volume_mgr
@@ -403,22 +384,25 @@ where
             .map_err(|_| CacheError::Filesystem)?;
 
         let file = concerts_dir
-            .open_file_in_dir(items_file(orientation), Mode::ReadWriteCreateOrTruncate)
+            .open_file_in_dir(list_file(orientation), Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| CacheError::Write)?;
 
         // Write JSON array manually (simple format)
         file.write(b"[").map_err(|_| CacheError::Write)?;
-        for (i, item) in items.iter().enumerate() {
+        for (i, path) in list.iter().enumerate() {
             if i > 0 {
                 file.write(b",").map_err(|_| CacheError::Write)?;
             }
             file.write(b"\"").map_err(|_| CacheError::Write)?;
-            file.write(item.as_bytes()).map_err(|_| CacheError::Write)?;
+            file.write(path.as_bytes()).map_err(|_| CacheError::Write)?;
             file.write(b"\"").map_err(|_| CacheError::Write)?;
         }
         file.write(b"]").map_err(|_| CacheError::Write)?;
-
-        info!("Stored {} widget items to cache JSON", items.len());
+        info!(
+            "Stored the {:?} concert list ({} concerts)",
+            orientation,
+            list.len()
+        );
         Ok(())
     }
 
@@ -585,13 +569,12 @@ where
         }
     }
 
-    /// Remove cache entries not in the valid items list
-    pub fn cleanup_stale(&mut self, valid_items: &WidgetData) -> Result<u32, CacheError> {
-        // Pre-compute hashes of valid items
-        let mut valid_hashes: heapless::Vec<u32, 128> = heapless::Vec::new();
-        for item in valid_items.iter() {
-            let _ = valid_hashes.push(image_hash(item.as_str(), self.font_id));
-        }
+    /// Remove artwork of concerts not in `current`, in both orientations
+    pub fn cleanup_stale(&mut self, current: &ConcertList) -> Result<u32, CacheError> {
+        let valid_hashes: alloc::vec::Vec<u32> = current
+            .iter()
+            .map(|path| image_hash(path, self.font_id))
+            .collect();
 
         let volume = self
             .volume_mgr

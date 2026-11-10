@@ -53,16 +53,17 @@ use esp_radio::wifi::{
 use esp_rtos::embassy::Executor;
 use sawthat_frame_firmware::TimestampLogger;
 use sawthat_frame_firmware::battery;
+use sawthat_frame_firmware::cache::ConcertList;
 use sawthat_frame_firmware::cache::{CacheError, SdCache};
 use sawthat_frame_firmware::config::{self, Config, ConfigError, WifiCause};
 use sawthat_frame_firmware::display;
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
 use sawthat_frame_firmware::installer::Installer;
+use sawthat_frame_firmware::orientation::Orientation;
 use sawthat_frame_firmware::progress;
 use sawthat_frame_firmware::sync::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::usb_drive;
-use sawthat_frame_firmware::widget::{Orientation, WidgetData};
 use sawthat_frame_firmware::{crash, sleep};
 use sawthat_render::Renderer;
 use sawthat_render::concerts::Concert;
@@ -140,7 +141,7 @@ static mut SETUP_SHOWN: u32 = 0;
 struct SleepState {
     /// Magic number to validate state
     magic: u32,
-    /// Current index into widget items (next item to fetch)
+    /// Current index into the concert list (next concert to show)
     index: usize,
     /// Total number of items
     total_items: usize,
@@ -188,7 +189,7 @@ impl SleepState {
         orientation: Orientation,
         next_slot: u8,
         slot_items: [usize; 2],
-        items: &WidgetData,
+        items: &ConcertList,
     ) {
         self.magic = SLEEP_STATE_MAGIC;
         self.index = index;
@@ -212,7 +213,7 @@ impl SleepState {
         self.slot_items
     }
 
-    fn matches_data(&self, items: &WidgetData) -> bool {
+    fn matches_data(&self, items: &ConcertList) -> bool {
         items.len() == self.total_items && self.data_hash == hash_data(items)
     }
 }
@@ -481,14 +482,15 @@ async fn main(spawner: Spawner) -> ! {
 
     // PSRAM is registered first so general allocations land there, leaving internal RAM
     // for allocations that request it explicitly (WiFi buffers, RTOS task stacks)
-    esp_alloc::psram_allocator!(
+    let psram = esp_hal::psram::Psram::new(
         peripherals.PSRAM,
-        esp_hal::psram,
         esp_hal::psram::PsramConfig {
             mode: esp_hal::psram::PsramMode::OctalSpi,
             ..Default::default()
-        }
+        },
     );
+    info!("PSRAM: {} MB", psram.raw_parts().1 / 1024 / 1024);
+    esp_alloc::psram_allocator!(&psram);
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 36 * 1024);
 
@@ -595,7 +597,6 @@ async fn main(spawner: Spawner) -> ! {
 
     // ==================== SD Card Initialization ====================
     // SD card SPI pins: CS=GPIO38, CLK=GPIO39, MISO=GPIO40, MOSI=GPIO41
-    info!("Initializing SD card...");
 
     let sd_spi = Spi::new(
         peripherals.SPI2,
@@ -662,7 +663,6 @@ async fn main(spawner: Spawner) -> ! {
     // ==================== Power Management (AXP2101) ====================
     // SawThat Frame uses AXP2101 PMIC to control display power
     // I2C: SDA=GPIO47, SCL=GPIO48, Address=0x34
-    info!("Initializing AXP2101 PMIC...");
 
     let mut i2c = I2c::new(
         peripherals.I2C0,
@@ -715,8 +715,6 @@ async fn main(spawner: Spawner) -> ! {
     // PhotoPainter GPIO pins for 7.3" e-paper display (SPI3)
     // DC=GPIO8, CS=GPIO9, SCK=GPIO10, MOSI=GPIO11, RST=GPIO12, BUSY=GPIO13
 
-    info!("Initializing e-paper display (fast mode)...");
-
     let spi = Spi::new(
         peripherals.SPI3,
         SpiConfig::default()
@@ -747,7 +745,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut epd = Epd7in3e::new(spi_device, busy, dc, rst, &mut delay, RefreshMode::Fast)
         .expect("EPD init failed");
-    info!("EPD initialized!");
+    info!("E-paper display ready (fast mode)");
 
     // ==================== WiFi Setup (Deferred) ====================
     // WiFi is only initialized when a sync is needed, and the controller is dropped after it to
@@ -970,7 +968,6 @@ async fn main(spawner: Spawner) -> ! {
     macro_rules! ensure_wifi {
         () => {{
             if !wifi_connected {
-                info!("Initializing WiFi...");
                 start_fast_blink();
 
                 if net_stack.is_none() {
@@ -1009,9 +1006,7 @@ async fn main(spawner: Spawner) -> ! {
                 .await
                 .unwrap_or(false);
 
-                if wifi_connected {
-                    info!("WiFi ready!");
-                } else {
+                if !wifi_connected {
                     info!("WiFi connection failed");
                     wifi_stop(&mut wifi_controller).await;
                 }
@@ -1020,14 +1015,12 @@ async fn main(spawner: Spawner) -> ! {
         }};
     }
 
-    // ==================== Item List ====================
-    let mut items: Box<WidgetData> = Box::new(
-        sd_cache
-            .as_mut()
-            .and_then(|c| c.load_widget_data(orientation))
-            .unwrap_or_default(),
-    );
-    info!("{} stored items for {:?}", items.len(), orientation);
+    // ==================== Concert List ====================
+    let mut items: ConcertList = sd_cache
+        .as_mut()
+        .and_then(|c| c.load_concert_list(orientation))
+        .unwrap_or_default();
+    info!("{} concerts in the {:?} list", items.len(), orientation);
 
     // Test builds: delete some artwork so the power-on sync has work to do
     if let Some(n) = option_env!("SAWTHAT_INVALIDATE").and_then(|n| n.parse::<usize>().ok())
@@ -1060,7 +1053,7 @@ async fn main(spawner: Spawner) -> ! {
         };
 
         // Shuffle items (same seed = same order)
-        display::shuffle_items(&mut items, shuffle_seed);
+        display::shuffle(&mut items, shuffle_seed);
 
         // Check if data matches (after shuffling, so items are in the same order)
         let (data_matches, saved_orientation) = if resuming {
@@ -1123,7 +1116,7 @@ async fn main(spawner: Spawner) -> ! {
             ($battery:expr) => {{
                 let per_screen = screen_items(orientation);
                 let mut shown = false;
-                let mut synced: Option<Box<WidgetData>> = None;
+                let mut synced: Option<ConcertList> = None;
 
                 // Compose the next cached screen now; it is shown once the work is known
                 let cached: Vec<&str> = (0..per_screen.min(items.len()))
@@ -1433,18 +1426,14 @@ async fn main(spawner: Spawner) -> ! {
                             info!("Sync stopped to rotate");
                         }
 
-                        let mut ready: Box<WidgetData> = Box::new(heapless::Vec::new());
-                        let mut valid: Box<WidgetData> = Box::new(heapless::Vec::new());
+                        let mut ready = ConcertList::new();
+                        let mut valid = ConcertList::new();
                         for (concert, &is_ready) in concerts.iter().zip(&ready_flags) {
-                            let mut path = heapless::String::new();
-                            if path.push_str(&concert.path).is_ok() {
-                                if is_ready {
-                                    let _ = ready.push(path.clone());
-                                }
-                                let _ = valid.push(path);
+                            if is_ready {
+                                ready.push(concert.path.clone());
                             }
+                            valid.push(concert.path.clone());
                         }
-                        info!("{} {:?} items ready", ready.len(), orientation);
 
                         // Keep artwork for every current concert in both orientations
                         match cache.cleanup_stale(&valid) {
@@ -1452,19 +1441,19 @@ async fn main(spawner: Spawner) -> ! {
                             Ok(_) => {}
                             Err(e) => info!("Cleanup failed: {:?}", e),
                         }
-                        if let Err(e) = cache.store_widget_data(orientation, &ready) {
-                            info!("Failed to store item list: {:?}", e);
+                        if let Err(e) = cache.store_concert_list(orientation, &ready) {
+                            info!("Failed to store the concert list: {:?}", e);
                         }
                         // The cleanup may have removed artwork the other orientation's list
                         // still names (a concert or the user changed); keep only current items
                         let other = orientation.toggle();
-                        if let Some(mut list) = cache.load_widget_data(other) {
+                        if let Some(mut list) = cache.load_concert_list(other) {
                             let len = list.len();
                             list.retain(|item| valid.contains(item));
                             if list.len() != len
-                                && let Err(e) = cache.store_widget_data(other, &list)
+                                && let Err(e) = cache.store_concert_list(other, &list)
                             {
-                                info!("Failed to prune {:?} item list: {:?}", other, e);
+                                info!("Failed to prune the {:?} concert list: {:?}", other, e);
                             }
                         }
 
@@ -1515,11 +1504,11 @@ async fn main(spawner: Spawner) -> ! {
                 }
 
                 if let Some(mut fresh) = synced {
-                    display::shuffle_items(&mut fresh, shuffle_seed);
-                    if *fresh != *items {
-                        info!("Item list changed ({} items), reshuffling", fresh.len());
+                    display::shuffle(&mut fresh, shuffle_seed);
+                    if fresh != items {
+                        info!("Concert list changed ({} concerts), reshuffling", fresh.len());
                         shuffle_seed = (rng.random() as u64) << 32 | rng.random() as u64;
-                        display::shuffle_items(&mut fresh, shuffle_seed);
+                        display::shuffle(&mut fresh, shuffle_seed);
                         items = fresh;
                         index = 0;
                         slot_items = [0, 0];
@@ -1537,7 +1526,7 @@ async fn main(spawner: Spawner) -> ! {
         loop {
             // After showing every item, sync before starting over
             if !items.is_empty() && index >= items.len() {
-                info!("All items shown");
+                info!("All concerts shown");
                 index = 0;
                 need_sync = true;
             }
@@ -1565,9 +1554,8 @@ async fn main(spawner: Spawner) -> ! {
                 let item_idx = index % items.len();
                 let item_path = items[item_idx].as_str();
                 info!(
-                    "Partial update: slot={}, item={} of {}",
-                    next_slot,
-                    item_idx,
+                    "Partial refresh: concert {} of {}",
+                    item_idx + 1,
                     items.len()
                 );
 
@@ -1585,7 +1573,7 @@ async fn main(spawner: Spawner) -> ! {
                     failures += 1;
                     index += 1;
                     if failures >= items.len() {
-                        info!("No displayable items");
+                        info!("No concerts with artwork");
                         break;
                     }
                     continue;
@@ -1595,7 +1583,6 @@ async fn main(spawner: Spawner) -> ! {
                 framebuffer.extract_half(next_slot, &mut *half_buffer);
                 let x_offset = if next_slot == 0 { 0 } else { 400 };
                 let rect = Rect::new(x_offset, 0, 400, 480);
-                info!("Partial refresh: x={}, w={}, h={}", x_offset, 400, 480);
 
                 let started = epd
                     .partial_update_start(&rect, &*half_buffer, &mut delay)
@@ -1634,7 +1621,7 @@ async fn main(spawner: Spawner) -> ! {
                     failures += 1;
                     index += 1;
                     if failures >= items.len() {
-                        info!("No displayable items");
+                        info!("No concerts with artwork");
                         break;
                     }
                     continue;
@@ -1683,11 +1670,11 @@ async fn main(spawner: Spawner) -> ! {
                     }
 
                     // Each orientation has its own artwork; sync if none is cached
-                    *items = sd_cache
+                    items = sd_cache
                         .as_mut()
-                        .and_then(|c| c.load_widget_data(orientation))
+                        .and_then(|c| c.load_concert_list(orientation))
                         .unwrap_or_default();
-                    display::shuffle_items(&mut items, shuffle_seed);
+                    display::shuffle(&mut items, shuffle_seed);
                     need_sync = items.is_empty();
                     index = 0;
                     use_partial = false;
@@ -1700,7 +1687,7 @@ async fn main(spawner: Spawner) -> ! {
                     );
                 }
                 BUTTON_NEXT => {
-                    info!("Button tap during update, next item (index={})", index);
+                    info!("Button tap during update, next concert (index={})", index);
                 }
                 _ => {
                     info!("No button press, entering deep sleep");
@@ -1821,7 +1808,7 @@ struct Power {
 /// a check when plugged in and full, a USB icon when connected to a computer, and a bolt
 /// when charging from anything else
 async fn read_power(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Power {
-    let (mv, vbus, charging, full) = log_charger_status(i2c);
+    let (mv, vbus, charging, full, stage) = read_charger(i2c);
     let gauge = pmic_read(i2c, BAT_PERCENT_REG);
     let percent = mv.map(battery_percent_from_mv).or(gauge).unwrap_or(50);
     let symbol = if vbus && full {
@@ -1833,7 +1820,13 @@ async fn read_power(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Power {
     } else {
         battery::PowerSymbol::None
     };
-    info!("Power: {}%, {:?}", percent, symbol);
+    info!(
+        "Power: {}% ({} mV), {}, {:?}",
+        percent,
+        mv.unwrap_or(0),
+        stage,
+        symbol
+    );
     Power {
         percent,
         symbol,
@@ -1889,46 +1882,31 @@ async fn usb_host_connected() -> bool {
     false
 }
 
-/// Log AXP2101 charger state, returning battery voltage in mV, whether USB power is present,
-/// whether the battery is charging, and whether charging is done
-fn log_charger_status(i2c: &mut I2c<'_, esp_hal::Blocking>) -> (Option<u16>, bool, bool, bool) {
+/// AXP2101 charger state: battery voltage in mV, whether USB power is present, whether the
+/// battery is charging, whether charging is done, and the charge stage
+fn read_charger(
+    i2c: &mut I2c<'_, esp_hal::Blocking>,
+) -> (Option<u16>, bool, bool, bool, &'static str) {
     const STATUS1: u8 = 0x00;
     const STATUS2: u8 = 0x01;
     const ADC_ENABLE: u8 = 0x30;
     const VBAT_H: u8 = 0x34;
     const VBAT_L: u8 = 0x35;
 
-    let mut vbus = false;
-    if let Some(s1) = pmic_read(i2c, STATUS1) {
-        vbus = s1 & 0x20 != 0;
-        info!(
-            "PMIC status1={:#04x}: vbus_good={} battery_present={}",
-            s1,
-            s1 & 0x20 != 0,
-            s1 & 0x08 != 0
-        );
-    }
+    let vbus = pmic_read(i2c, STATUS1).is_some_and(|s1| s1 & 0x20 != 0);
 
-    let (mut charging, mut full) = (false, false);
+    let (mut charging, mut full, mut stage) = (false, false, "charger unknown");
     if let Some(s2) = pmic_read(i2c, STATUS2) {
         charging = (s2 >> 5) & 0x03 == 1;
         full = s2 & 0x07 == 4;
-        let direction = match (s2 >> 5) & 0x03 {
-            0 => "standby",
-            1 => "charging",
-            2 => "discharging",
-            _ => "unknown",
+        stage = match s2 & 0x07 {
+            0 => "trickle charging",
+            1 => "pre-charging",
+            2 => "charging (constant current)",
+            3 => "charging (constant voltage)",
+            4 => "charged",
+            _ => "not charging",
         };
-        let stage = match s2 & 0x07 {
-            0 => "trickle",
-            1 => "pre-charge",
-            2 => "constant-current",
-            3 => "constant-voltage",
-            4 => "done",
-            5 => "not charging",
-            _ => "unknown",
-        };
-        info!("PMIC status2={:#04x}: {} ({})", s2, direction, stage);
     }
 
     // Battery voltage ADC channel must be enabled to read VBAT
@@ -1940,13 +1918,12 @@ fn log_charger_status(i2c: &mut I2c<'_, esp_hal::Blocking>) -> (Option<u16>, boo
     let mv = pmic_read(i2c, VBAT_H)
         .zip(pmic_read(i2c, VBAT_L))
         .map(|(h, l)| ((h as u16 & 0x3F) << 8) | l as u16);
-    info!("PMIC vbat={:?}mV", mv);
     // A zero reading means the ADC has not sampled yet
-    (mv.filter(|&mv| mv > 0), vbus, charging, full)
+    (mv.filter(|&mv| mv > 0), vbus, charging, full, stage)
 }
 
-/// Compute a single hash for all widget data
-fn hash_data(items: &WidgetData) -> u32 {
+/// Hash of a concert list, to notice when it changes
+fn hash_data(items: &ConcertList) -> u32 {
     let mut hash: u32 = 5381;
     for item in items.iter() {
         for byte in item.as_bytes() {
@@ -2271,7 +2248,6 @@ async fn wifi_stop(controller: &mut Option<WifiController<'static>>) {
 
 /// Wait for network stack to get an IP address
 async fn wait_for_ip(stack: Stack<'static>) {
-    info!("Waiting for link...");
     loop {
         if stack.is_link_up() {
             break;
@@ -2279,12 +2255,10 @@ async fn wait_for_ip(stack: Stack<'static>) {
         // 1500ms polling is sufficient - link up is not time-critical
         Timer::after(Duration::from_millis(1500)).await;
     }
-    info!("Link up!");
 
-    info!("Waiting for IP...");
     loop {
         if let Some(config) = stack.config_v4() {
-            info!("Got IP: {}", config.address);
+            info!("Got IP {}", config.address);
             break;
         }
         // 1500ms polling is sufficient - DHCP takes seconds anyway
@@ -2319,7 +2293,13 @@ fn draw_stored<S: SpiDevice, D: DelayNs>(
 ) -> bool {
     match cache.read_image(path, orientation, buf) {
         Ok(len) => match display::render_stored(&buf[..len], framebuffer, slot, orientation) {
-            Ok(()) => true,
+            Ok(()) => {
+                match orientation {
+                    Orientation::Horizontal => info!("Showing {} in slot {}", path, slot),
+                    Orientation::Vertical => info!("Showing {}", path),
+                }
+                true
+            }
             Err(e) => {
                 info!("Bad stored image {}: {:?}", path, e);
                 false

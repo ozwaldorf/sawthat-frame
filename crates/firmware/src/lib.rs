@@ -11,12 +11,12 @@ pub mod epd;
 pub mod fat_label;
 pub mod framebuffer;
 pub mod installer;
+pub mod orientation;
 pub mod progress;
 pub mod sleep;
 pub mod symbols;
 pub mod sync;
 pub mod usb_drive;
-pub mod widget;
 
 /// Timestamped logger for the `log` crate - adds timestamps to all log messages
 pub struct TimestampLogger;
@@ -33,9 +33,16 @@ impl TimestampLogger {
 
 static LOGGER: TimestampLogger = TimestampLogger;
 
+/// Libraries whose info logs repeat what the firmware logs itself: the PSRAM chip details, and
+/// network link and address changes
+const QUIET_TARGETS: [&str; 2] = ["esp_hal::psram", "embassy_net"];
+
 impl log::Log for TimestampLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+            || !QUIET_TARGETS
+                .iter()
+                .any(|target| metadata.target().starts_with(target))
     }
 
     fn log(&self, record: &log::Record) {

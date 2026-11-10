@@ -36,7 +36,7 @@ const STAGE_TIMEOUT: Duration = Duration::from_secs(8);
 const ATTEMPTS: usize = 3;
 
 /// Response size limits
-const MAX_JSON: usize = 512 * 1024;
+const MAX_JSON: usize = 1024 * 1024;
 const MAX_IMAGE: usize = 2 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -125,7 +125,6 @@ pub async fn fetch_bands<T: TcpConnect, D: Dns>(
     user_id: &str,
 ) -> Result<Vec<u8>, SyncError> {
     let url = format!("{}{}", concerts::SAWTHAT_BANDS_URL, user_id);
-    info!("Fetching concerts from {}", url);
     net.get(&url, MAX_JSON).await
 }
 
@@ -136,7 +135,6 @@ pub async fn resolve_user_id<T: TcpConnect, D: Dns>(
     name: &str,
 ) -> Result<String, SyncError> {
     let url = format!("https://{name}.sawthat.band/");
-    info!("Looking up the SawThat user ID of {}", name);
     let page = net.get(&url, MAX_JSON).await?;
     const MARKER: &[u8] = b"/Avatar/";
     page.windows(MARKER.len())
