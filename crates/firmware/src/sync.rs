@@ -21,6 +21,8 @@ use reqwless::response::Response;
 use sawthat_render::concerts::{self, Album, Concert};
 use sawthat_render::{ConcertInfo, Renderer, cover_size, decode_jpeg, primary_color};
 
+use crate::config;
+
 /// TLS buffer sizes
 pub const TLS_READ_BUF_SIZE: usize = 16640;
 pub const TLS_WRITE_BUF_SIZE: usize = 4096;
@@ -45,6 +47,8 @@ pub enum SyncError {
     TooLarge,
     Image,
     NoImage,
+    /// The SawThat profile page has no user ID
+    NoUserId,
 }
 
 /// Run one request stage, failing if it makes no progress within `STAGE_TIMEOUT`
@@ -123,6 +127,25 @@ pub async fn fetch_bands<T: TcpConnect, D: Dns>(
     let url = format!("{}{}", concerts::SAWTHAT_BANDS_URL, user_id);
     info!("Fetching concerts from {}", url);
     net.get(&url, MAX_JSON).await
+}
+
+/// Look up the user ID of SawThat user `name` from the avatar URL on their profile page
+/// (`.../Avatar/<user id>/...`)
+pub async fn resolve_user_id<T: TcpConnect, D: Dns>(
+    net: &mut Net<'_, T, D>,
+    name: &str,
+) -> Result<String, SyncError> {
+    let url = format!("https://{name}.sawthat.band/");
+    info!("Looking up the SawThat user ID of {}", name);
+    let page = net.get(&url, MAX_JSON).await?;
+    const MARKER: &[u8] = b"/Avatar/";
+    page.windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .and_then(|at| page.get(at + MARKER.len()..at + MARKER.len() + 36))
+        .and_then(|id| core::str::from_utf8(id).ok())
+        .filter(|id| config::is_uuid(id))
+        .map(String::from)
+        .ok_or(SyncError::NoUserId)
 }
 
 /// Parse a SawThat bands response into concerts of `user_id`, most recent first

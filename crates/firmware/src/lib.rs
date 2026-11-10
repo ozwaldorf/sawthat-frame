@@ -10,6 +10,7 @@ pub mod display;
 pub mod epd;
 pub mod fat_label;
 pub mod framebuffer;
+pub mod installer;
 pub mod progress;
 pub mod sleep;
 pub mod symbols;

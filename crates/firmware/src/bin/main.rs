@@ -58,6 +58,7 @@ use sawthat_frame_firmware::config::{self, Config, ConfigError, WifiCause};
 use sawthat_frame_firmware::display;
 use sawthat_frame_firmware::epd::{Epd7in3e, Rect, RefreshMode, WIDTH};
 use sawthat_frame_firmware::framebuffer::Framebuffer;
+use sawthat_frame_firmware::installer::Installer;
 use sawthat_frame_firmware::progress;
 use sawthat_frame_firmware::sync::{self, TLS_READ_BUF_SIZE, TLS_WRITE_BUF_SIZE};
 use sawthat_frame_firmware::usb_drive;
@@ -91,7 +92,7 @@ const IMAGE_BUF_SIZE: usize = 480 * 800 / 2 + sawthat_render::IMAGE_HEADER;
 const HALF_BUFFER_SIZE: usize = 400 * 480 / 2;
 
 /// Concert text font files on the SD root, in order of preference
-const FONT_FILES: [&str; 2] = ["FONT.TTF", "FONT.OTF"];
+const FONT_FILES: [&str; 2] = sawthat_frame_firmware::installer::FONT_NAMES;
 /// Largest accepted font file on the SD card
 const MAX_FONT: usize = 4 * 1024 * 1024;
 /// Button hold threshold in milliseconds
@@ -610,11 +611,14 @@ async fn main(spawner: Spawner) -> ! {
     let sd_cs = Output::new(peripherals.GPIO38, Level::High, OutputConfig::default());
     let sd_spi_device = ExclusiveDevice::new_no_delay(sd_spi, sd_cs).unwrap();
 
+    let mut installer = Installer::new(peripherals.FLASH);
     let mut sd_cache = match SdCache::new(sd_spi_device, delay.clone()) {
         Ok(mut cache) => {
             if let Err(e) = cache.init() {
                 info!("SD cache init error: {:?}", e);
             }
+            // Before identifying the font, so a new one renders the artwork again
+            apply_installer_font(&mut cache, &mut installer);
             cache.detect_font(&FONT_FILES);
             Some(cache)
         }
@@ -626,7 +630,10 @@ async fn main(spawner: Spawner) -> ! {
 
     let config = match sd_cache.as_mut() {
         None => Err(ConfigError::NoSdCard),
-        Some(cache) => load_config(cache),
+        Some(cache) => {
+            apply_installer_settings(cache, &mut installer);
+            load_config(cache)
+        }
     };
 
     // Orientation: a hold during boot toggled it; otherwise CONFIG.TXT sets it, taking over the
@@ -900,7 +907,7 @@ async fn main(spawner: Spawner) -> ! {
         sleep::shutdown();
     }
 
-    let config = match config {
+    let mut config = match config {
         Ok(config) => config,
         Err(e) => enter_setup!(e, None),
     };
@@ -1146,6 +1153,35 @@ async fn main(spawner: Spawner) -> ! {
                         ),
                         Some(config.refresh_secs())
                     );
+                }
+                // A username in place of the user ID: look the ID up once and store it
+                if sd_cache.is_some() && wifi_connected && !config::is_uuid(&config.user_id) {
+                    let mut net = sync::Net {
+                        tcp: tcp_client.as_ref().unwrap(),
+                        dns: dns_socket.as_ref().unwrap(),
+                        tls_read: &mut *tls_read_buf,
+                        tls_write: &mut *tls_write_buf,
+                        cover_tls_read: &mut *cover_tls_read_buf,
+                        cover_tls_write: &mut *cover_tls_write_buf,
+                    };
+                    match sync::resolve_user_id(&mut net, &config.user_id).await {
+                        Ok(id) => {
+                            info!("SawThat user {} has ID {}", config.user_id, id);
+                            if let Some(cache) = sd_cache.as_mut() {
+                                store_config_value(cache, config::USER_ID_KEY, &id);
+                            }
+                            config.user_id = id;
+                        }
+                        // The page loaded but names no user
+                        Err(e @ (sync::SyncError::NoUserId | sync::SyncError::Http(_))) => {
+                            info!("SawThat user lookup failed: {:?}", e);
+                            enter_setup!(
+                                ConfigError::UserNotFound(config.user_id.clone()),
+                                Some(config.refresh_secs())
+                            );
+                        }
+                        Err(e) => info!("SawThat user lookup failed, retrying next sync: {:?}", e),
+                    }
                 }
                 if let Some(cache) = sd_cache.as_mut()
                     && wifi_connected
@@ -1921,17 +1957,31 @@ fn hash_data(items: &WidgetData) -> u32 {
     hash
 }
 
+/// Set `key` to `value` in `CONFIG.TXT`, keeping the rest of the file
+fn write_config_value<S: SpiDevice, D: DelayNs>(
+    cache: &mut SdCache<S, D>,
+    key: &str,
+    value: &str,
+) -> Result<(), CacheError> {
+    let data = cache.read_root_file(config::CONFIG_FILE, config::MAX_CONFIG)?;
+    let text = core::str::from_utf8(&data).map_err(|_| CacheError::Read)?;
+    let text = config::set_value(text, key, value);
+    cache.write_root_file(config::CONFIG_FILE, text.as_bytes())
+}
+
+/// Set `key` to `value` in `CONFIG.TXT`, logging a failure
+fn store_config_value<S: SpiDevice, D: DelayNs>(cache: &mut SdCache<S, D>, key: &str, value: &str) {
+    match write_config_value(cache, key, value) {
+        Ok(()) => info!("Stored {} in {}", key, config::CONFIG_FILE),
+        Err(e) => info!("Failed to store {}: {:?}", key, e),
+    }
+}
+
 /// Set the orientation in `CONFIG.TXT`, keeping the rest of the file, and drop the orientation
 /// file of older firmware once it is stored there
 fn save_orientation<S: SpiDevice, D: DelayNs>(cache: &mut SdCache<S, D>, orientation: Orientation) {
-    let mut write = || -> Result<(), CacheError> {
-        let data = cache.read_root_file(config::CONFIG_FILE, config::MAX_CONFIG)?;
-        let text = core::str::from_utf8(&data).map_err(|_| CacheError::Read)?;
-        let value = config::orientation_value(orientation);
-        let text = config::set_value(text, config::ORIENTATION_KEY, value);
-        cache.write_root_file(config::CONFIG_FILE, text.as_bytes())
-    };
-    match write() {
+    let value = config::orientation_value(orientation);
+    match write_config_value(cache, config::ORIENTATION_KEY, value) {
         Ok(()) => {
             info!(
                 "Stored orientation {:?} in {}",
@@ -1941,6 +1991,72 @@ fn save_orientation<S: SpiDevice, D: DelayNs>(cache: &mut SdCache<S, D>, orienta
             cache.remove_legacy_orientation();
         }
         Err(e) => info!("Failed to store orientation: {:?}", e),
+    }
+}
+
+/// Apply the web installer's settings to `CONFIG.TXT`, starting from the template when the card has
+/// none, then erase them. They stay in flash for the next boot if the card cannot be written.
+fn apply_installer_settings<S: SpiDevice, D: DelayNs>(
+    cache: &mut SdCache<S, D>,
+    installer: &mut Installer,
+) {
+    let Some(settings) = installer.settings() else {
+        return;
+    };
+    let base = match cache.read_root_file(config::CONFIG_FILE, config::MAX_CONFIG) {
+        Ok(data) => alloc::string::String::from_utf8(data)
+            .unwrap_or_else(|_| alloc::string::String::from(config::TEMPLATE)),
+        Err(CacheError::NotFound) => alloc::string::String::from(config::TEMPLATE),
+        Err(e) => {
+            info!(
+                "Installer settings not applied, {} unreadable: {:?}",
+                config::CONFIG_FILE,
+                e
+            );
+            return;
+        }
+    };
+    let text = settings.iter().fold(base, |text, (key, value)| {
+        config::set_value(&text, key, value)
+    });
+    match cache.write_root_file(config::CONFIG_FILE, text.as_bytes()) {
+        Ok(()) => {
+            info!(
+                "Applied {} installer settings to {}",
+                settings.len(),
+                config::CONFIG_FILE
+            );
+            installer.clear_settings();
+        }
+        Err(e) => info!("Installer settings not applied: {:?}", e),
+    }
+}
+
+/// Copy the web installer's font to the SD root, replacing any other font file, then erase it.
+/// It stays in flash for the next boot if the card cannot be written.
+fn apply_installer_font<S: SpiDevice, D: DelayNs>(
+    cache: &mut SdCache<S, D>,
+    installer: &mut Installer,
+) {
+    let Some((name, font)) = installer.font() else {
+        return;
+    };
+    let write = |cache: &mut SdCache<S, D>| -> Result<(), CacheError> {
+        for other in FONT_FILES.iter().filter(|&&other| other != name) {
+            cache.remove_root_file(other)?;
+        }
+        cache.write_root_file(name, &font)
+    };
+    match write(cache) {
+        Ok(()) => {
+            info!(
+                "Stored the installer font as {} ({} bytes)",
+                name,
+                font.len()
+            );
+            installer.clear_font(font.len());
+        }
+        Err(e) => info!("Installer font not stored: {:?}", e),
     }
 }
 

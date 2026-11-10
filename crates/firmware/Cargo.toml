@@ -87,6 +87,9 @@ sawthat-render = { path = "../render" }
 # SD card storage for caching
 embedded-sdmmc = "0.10"
 
+# Settings flashed by the web installer
+esp-storage = { version = "0.10", features = ["esp32s3"] }
+
 # USB drive mode for setup: exposes the SD card over USB OTG
 embassy-usb = { version = "0.6", default-features = false }
 

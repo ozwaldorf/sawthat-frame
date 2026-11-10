@@ -7,7 +7,7 @@
 //! |-------------------|----------|------------------------------------------------------|
 //! | `WIFI_SSID`       | yes      | WiFi network name                                    |
 //! | `WIFI_PASS`       | no       | WiFi password; empty or missing for an open network  |
-//! | `SAWTHAT_USER_ID` | yes      | SawThat user whose concerts are shown                |
+//! | `SAWTHAT_USER_ID` | yes      | SawThat user ID, or a username to look it up from    |
 //! | `REFRESH_MINUTES` | no       | Minutes between artwork changes (default 15)         |
 //! | `ORIENTATION`     | no       | `horizontal` or `vertical`; holding KEY rewrites it   |
 
@@ -23,6 +23,9 @@ pub const CONFIG_FILE: &str = "CONFIG.TXT";
 
 /// Template written to the SD root when there is no config
 pub const TEMPLATE: &str = include_str!("../../../docs/CONFIG.TXT");
+
+/// Key of the SawThat user ID, rewritten with the ID looked up for a username
+pub const USER_ID_KEY: &str = "SAWTHAT_USER_ID";
 
 /// Key of the screen orientation, rewritten when KEY is held
 pub const ORIENTATION_KEY: &str = "ORIENTATION";
@@ -72,6 +75,8 @@ pub enum ConfigError {
     BadLine(usize),
     /// Could not connect to the configured WiFi network (SSID and cause)
     WifiFailed(String, WifiCause),
+    /// No SawThat user ID could be found for the configured username
+    UserNotFound(String),
 }
 
 /// Why a WiFi connection failed
@@ -123,6 +128,7 @@ impl ConfigError {
             Self::MissingKey(key) => alloc::format!("{} is not set", key),
             Self::Invalid(key) => alloc::format!("{} is invalid", key),
             Self::BadLine(line) => alloc::format!("Line {} is not a known KEY=VALUE", line),
+            Self::UserNotFound(name) => alloc::format!("SawThat user not found: {}", name),
             Self::WifiFailed(ssid, cause) => {
                 let ssid: String = ssid.chars().take(20).collect();
                 match cause {
@@ -182,12 +188,11 @@ pub fn parse(data: &[u8]) -> Result<Config, ConfigError> {
     }
 
     let user_id = required(user_id, "SAWTHAT_USER_ID")?;
-    if !user_id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        return Err(ConfigError::Invalid("SAWTHAT_USER_ID"));
-    }
+    let user_id = if is_uuid(&user_id) {
+        user_id
+    } else {
+        profile_name(&user_id).ok_or(ConfigError::Invalid("SAWTHAT_USER_ID"))?
+    };
 
     let refresh_minutes = match refresh.filter(|v| !v.is_empty()) {
         None => DEFAULT_REFRESH_MINUTES,
@@ -214,6 +219,31 @@ pub fn parse(data: &[u8]) -> Result<Config, ConfigError> {
         refresh_minutes,
         orientation,
     })
+}
+
+/// Whether `value` is a UUID, the form of a SawThat user ID
+pub fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// SawThat username from `ossian`, `ossian.sawthat.band` or `https://ossian.sawthat.band/`
+fn profile_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    let host = value.split_once("://").map_or(value, |(_, rest)| rest);
+    let host = host.split('/').next()?;
+    let name = host
+        .strip_suffix(".sawthat.band")
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    valid.then_some(name)
 }
 
 /// Config value for an orientation

@@ -501,6 +501,21 @@ where
         file.write(data).map_err(|_| CacheError::Write)
     }
 
+    /// Delete a file on the SD root, if present
+    pub fn remove_root_file(&mut self, name: &str) -> Result<(), CacheError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| CacheError::Filesystem)?;
+        let root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        if !root_dir.directory_entry_exists(name) {
+            return Ok(());
+        }
+        root_dir
+            .delete_entry_in_dir(name)
+            .map_err(|_| CacheError::Write)
+    }
+
     /// Append to a file on the SD root, writing `header` first when it is new or empty
     pub fn append_root_file(
         &mut self,
