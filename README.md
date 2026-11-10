@@ -188,6 +188,7 @@ If SawThat is unreachable, the last successful response stored on the SD card is
 ```
 /CONFIG.TXT           # Runtime configuration, written by the user
 /FONT.TTF             # Optional concert text font (or FONT.OTF)
+/BATTERY.CSV          # Power reading per wake: RTC uptime, wake cause, mV, %, PMIC flags
 /concerts/
   BANDS.JSN           # Last SawThat bands response
   HORIZ.JSN           # Items with horizontal artwork

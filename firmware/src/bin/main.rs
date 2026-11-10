@@ -109,6 +109,8 @@ const DIALOG_HOLD_MS: u64 = 1000;
 /// AXP2101 PMIC I2C address and fuel gauge percentage register
 const AXP2101_ADDR: u8 = 0x34;
 const BAT_PERCENT_REG: u8 = 0xA4;
+/// Battery log on the SD root, one CSV row per power reading
+const BATTERY_LOG: &str = "BATTERY.CSV";
 /// Display busy polling interval in milliseconds (display refresh takes seconds)
 const DISPLAY_BUSY_POLL_MS: u64 = 200;
 /// Magic number to validate RTC memory state
@@ -469,6 +471,13 @@ async fn main(spawner: Spawner) -> ! {
             .bits()
             & BOOT_RTC_PIN_MASK
             != 0;
+    let wake_label = match wake_reason {
+        esp_hal::system::SleepSource::Timer => "timer",
+        esp_hal::system::SleepSource::Ext0 => "button",
+        esp_hal::system::SleepSource::Ext1 if boot_wake => "boot",
+        esp_hal::system::SleepSource::Ext1 => "charger",
+        _ => "reset",
+    };
 
     // PSRAM is registered first so general allocations land there, leaving internal RAM
     // for allocations that request it explicitly (WiFi buffers, RTOS task stacks)
@@ -867,6 +876,7 @@ async fn main(spawner: Spawner) -> ! {
     if matches!(wake_reason, esp_hal::system::SleepSource::Ext1) && resuming {
         info!("Charger changed");
         let power = read_power(&mut i2c).await;
+        log_power(sd_cache.as_mut(), &rtc, wake_label, &power);
         draw_battery_icon(&mut framebuffer, orientation, power);
         let rect = battery_body_rect(orientation);
         let region = framebuffer.extract_rect(&rect);
@@ -1455,6 +1465,7 @@ async fn main(spawner: Spawner) -> ! {
             epd.wake_up(&mut delay).expect("Failed to wake display");
 
             let power = read_power(&mut i2c).await;
+            log_power(sd_cache.as_mut(), &rtc, wake_label, &power);
 
             let display_started = if need_sync {
                 need_sync = false;
@@ -1695,11 +1706,16 @@ fn pmic_read(i2c: &mut I2c<'_, esp_hal::Blocking>, reg: u8) -> Option<u8> {
     None
 }
 
-/// Battery level and power symbol, as shown by the battery icon
+/// Battery level and power symbol, as shown by the battery icon, with the raw PMIC readings
 #[derive(Clone, Copy)]
 struct Power {
     percent: u8,
     symbol: battery::PowerSymbol,
+    mv: Option<u16>,
+    gauge: Option<u8>,
+    vbus: bool,
+    charging: bool,
+    full: bool,
 }
 
 /// Read battery level (from cell voltage, falling back to the fuel gauge) and power source:
@@ -1707,10 +1723,8 @@ struct Power {
 /// when charging from anything else
 async fn read_power(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Power {
     let (mv, vbus, charging, full) = log_charger_status(i2c);
-    let percent = match mv {
-        Some(mv) => battery_percent_from_mv(mv),
-        None => pmic_read(i2c, BAT_PERCENT_REG).unwrap_or(50),
-    };
+    let gauge = pmic_read(i2c, BAT_PERCENT_REG);
+    let percent = mv.map(battery_percent_from_mv).or(gauge).unwrap_or(50);
     let symbol = if vbus && full {
         battery::PowerSymbol::Full
     } else if vbus && usb_host_connected().await {
@@ -1721,7 +1735,42 @@ async fn read_power(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Power {
         battery::PowerSymbol::None
     };
     info!("Power: {}%, {:?}", percent, symbol);
-    Power { percent, symbol }
+    Power {
+        percent,
+        symbol,
+        mv,
+        gauge,
+        vbus,
+        charging,
+        full,
+    }
+}
+
+/// Append a power reading to `BATTERY_LOG`, stamped with the RTC time, which keeps counting
+/// through deep sleep and restarts on power loss or reset
+fn log_power<S: SpiDevice, D: DelayNs>(
+    cache: Option<&mut SdCache<S, D>>,
+    rtc: &Rtc,
+    wake: &str,
+    power: &Power,
+) {
+    let Some(cache) = cache else { return };
+    let opt = |v: Option<u16>| v.map(|v| alloc::format!("{}", v)).unwrap_or_default();
+    let row = alloc::format!(
+        "{},{},{},{},{},{},{},{}\n",
+        rtc.time_since_boot().as_secs(),
+        wake,
+        opt(power.mv),
+        power.percent,
+        opt(power.gauge.map(u16::from)),
+        power.vbus as u8,
+        power.charging as u8,
+        power.full as u8,
+    );
+    let header = b"uptime_s,wake,mv,percent,gauge,vbus,charging,full\n";
+    if let Err(e) = cache.append_root_file(BATTERY_LOG, header, row.as_bytes()) {
+        info!("Battery log write failed: {:?}", e);
+    }
 }
 
 /// Whether a computer is on the USB port: a host sends a start-of-frame packet every

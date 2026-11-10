@@ -501,6 +501,27 @@ where
         file.write(data).map_err(|_| CacheError::Write)
     }
 
+    /// Append to a file on the SD root, writing `header` first when it is new or empty
+    pub fn append_root_file(
+        &mut self,
+        name: &str,
+        header: &[u8],
+        data: &[u8],
+    ) -> Result<(), CacheError> {
+        let mut volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(|_| CacheError::Filesystem)?;
+        let mut root_dir = volume.open_root_dir().map_err(|_| CacheError::Filesystem)?;
+        let mut file = root_dir
+            .open_file_in_dir(name, Mode::ReadWriteCreateOrAppend)
+            .map_err(|_| CacheError::Write)?;
+        if file.length() == 0 {
+            file.write(header).map_err(|_| CacheError::Write)?;
+        }
+        file.write(data).map_err(|_| CacheError::Write)
+    }
+
     /// Read a file on the SD root, up to `max` bytes
     pub fn read_root_file(
         &mut self,
