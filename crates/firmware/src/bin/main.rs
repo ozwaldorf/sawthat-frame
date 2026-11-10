@@ -2373,7 +2373,7 @@ fn battery_body_rect(orientation: Orientation) -> Rect {
 /// program's lifetime so they don't take internal RAM from the main stack
 fn alloc_tcp_state() -> &'static TcpClientState<2, TCP_TX_SIZE, TCP_RX_SIZE> {
     let layout = core::alloc::Layout::new::<TcpClientState<2, TCP_TX_SIZE, TCP_RX_SIZE>>();
-    // SAFETY: zeroed memory is identical to `TcpClientState::new()` in embassy-net 0.8 (all
+    // SAFETY: zeroed memory is identical to `TcpClientState::new()` in embassy-net 0.9 (all
     // pool slots unused, buffers uninitialized); allocating it directly avoids building the
     // struct on the stack. The allocation is never freed.
     unsafe {
