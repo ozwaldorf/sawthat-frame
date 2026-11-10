@@ -20,7 +20,7 @@ use crate::widget::Orientation;
 pub const CONFIG_FILE: &str = "CONFIG.TXT";
 
 /// Template written to the SD root when there is no config
-pub const TEMPLATE: &str = include_str!("../../docs/CONFIG.TXT");
+pub const TEMPLATE: &str = include_str!("../../../docs/CONFIG.TXT");
 
 /// Key of the screen orientation, rewritten when KEY is held
 pub const ORIENTATION_KEY: &str = "ORIENTATION";

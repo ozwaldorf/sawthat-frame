@@ -121,7 +121,7 @@ pressing RESET.
 Flash the firmware to the device and connect to the serial console:
 
 ```bash
-cd firmware
+cd crates/firmware
 cargo run --release
 ```
 
@@ -298,14 +298,14 @@ The `render` crate (`no_std`) transforms source images for the 6-color display:
 The same pipeline can be run on a host to preview output:
 
 ```bash
-cd render
+cd crates/render
 cargo run --release --example render -- cover.jpg "Band" 27-07-2012 "Venue" out
 ```
 
 ## Maintenance
 
-- `embassy-net` is pinned to `=0.8.0` in `firmware/Cargo.toml`. `alloc_tcp_state` in
-  `firmware/src/bin/main.rs` allocates the TCP socket buffers in PSRAM as zeroed memory, which
+- `embassy-net` is pinned to `=0.8.0` in `crates/firmware/Cargo.toml`. `alloc_tcp_state` in
+  `crates/firmware/src/bin/main.rs` allocates the TCP socket buffers in PSRAM as zeroed memory, which
   relies on an all-zero `TcpClientState` matching `TcpClientState::new()`. Check that against the
   new version's source before upgrading.
 - The main core needs more than 75KB of stack. Keep large buffers out of internal RAM (`.bss`), or
