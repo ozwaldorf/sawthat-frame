@@ -84,7 +84,7 @@ jobs:
       - name: Assemble site
         run: |
           cp -r site _site
-          cp -r docs/examples docs/CONFIG.TXT _site/
+          cp -r docs/examples docs/photos docs/CONFIG.TXT _site/
           # Named after the version and commit, so browsers never reuse a cached older build
           firmware="sawthat-frame-${GITHUB_REF_NAME}-${GITHUB_SHA::10}.bin"
           cp "dist/sawthat-frame-${GITHUB_REF_NAME}.bin" "_site/$firmware"

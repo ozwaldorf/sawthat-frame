@@ -9,8 +9,8 @@ Runs on the [Waveshare ESP32-S3-PhotoPainter](https://www.waveshare.com/esp32-s3
 
 ## Examples
 
-<img height="300" alt="Frame in landscape" src="https://github.com/user-attachments/assets/1339362c-3e16-41e8-9678-fdbbde66b622" />
-<img height="300" alt="Frame in portrait" src="https://github.com/user-attachments/assets/48a749e5-eb84-4dd3-bde5-b50005cf1192" />
+<img height="300" alt="Frame in landscape" src="docs/photos/frame_horiz.webp" />
+<img height="300" alt="Frame in portrait" src="docs/photos/frame_vert.webp" />
 
 <table>
   <tr>
