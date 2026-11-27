@@ -17,7 +17,7 @@ use log::info;
 
 use embassy_executor::Spawner;
 use embassy_net::{
-    Runner, Stack, StackResources,
+    ConfigV4, Ipv4Address, Runner, Stack, StackResources,
     dns::DnsSocket,
     tcp::client::{TcpClient, TcpClientState},
 };
@@ -2427,6 +2427,9 @@ async fn wifi_stop(controller: &mut Option<WifiController<'static>>) {
     }
 }
 
+/// Resolvers used when the DHCP lease offers none
+const FALLBACK_DNS: [Ipv4Address; 2] = [Ipv4Address::new(1, 1, 1, 1), Ipv4Address::new(8, 8, 8, 8)];
+
 /// Wait for network stack to get an IP address
 async fn wait_for_ip(stack: Stack<'static>) {
     loop {
@@ -2438,8 +2441,14 @@ async fn wait_for_ip(stack: Stack<'static>) {
     }
 
     loop {
-        if let Some(config) = stack.config_v4() {
-            info!("Got IP {}", config.address);
+        if let Some(mut config) = stack.config_v4() {
+            info!("Got IP {} (DNS {:?})", config.address, config.dns_servers);
+            // A lease without DNS servers fails every lookup, so pin public resolvers
+            if config.dns_servers.is_empty() {
+                info!("No DNS servers in lease, using {:?}", FALLBACK_DNS);
+                config.dns_servers.extend(FALLBACK_DNS);
+                stack.set_config_v4(ConfigV4::Static(config));
+            }
             break;
         }
         // 1500ms polling is sufficient - DHCP takes seconds anyway
