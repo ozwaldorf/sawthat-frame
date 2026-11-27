@@ -73,7 +73,7 @@ config. The serial console is unavailable while the drive is shown.
 | Tap KEY | Next item |
 | Hold KEY | Toggle orientation |
 | Tap BOOT | Toggle USB drive mode (connected to a computer) |
-| Hold BOOT | Check for a firmware update and install it |
+| Hold BOOT | Check for a firmware update and install it, then sync concerts |
 
 Do not hold BOOT while the frame powers on: that enters ESP32 download mode.
 
@@ -94,9 +94,9 @@ issue, then turns off until KEY is pressed.
 ## Sync
 
 A sync fetches concerts and renders missing artwork for the current orientation. It runs on
-power-on, after every item has been shown once, and on switching to an orientation with no
-artwork. Other wakes only read from the SD card. If SawThat is unreachable, the last response is
-used.
+power-on, on a BOOT hold, after every item has been shown once, and on switching to an
+orientation with no artwork. Other wakes only read from the SD card. If SawThat is unreachable,
+the last response is used.
 
 ```
 /CONFIG.TXT           # Configuration

@@ -231,7 +231,7 @@ static BUTTON_STATE: AtomicU8 = AtomicU8::new(BUTTON_CANCELLED);
 
 /// Set by a BOOT tap while awake; enters or leaves USB drive mode when a computer is connected
 static BOOT_PRESSED: AtomicBool = AtomicBool::new(false);
-/// Set by a BOOT hold while awake; checks for and installs a firmware update
+/// Set by a BOOT hold while awake; checks for a firmware update, then syncs concerts
 static BOOT_HELD: AtomicBool = AtomicBool::new(false);
 
 /// Last station disconnect reason, and whether the station joined the network
@@ -1101,9 +1101,10 @@ async fn main(spawner: Spawner) -> ! {
         }};
     }
 
-    // Check for a firmware update and install it if it is newer, restarting into it
+    // Check for a firmware update and install it if it is newer, restarting into it. WiFi
+    // stays connected afterwards if `$keep_wifi`.
     macro_rules! update_firmware {
-        () => {{
+        ($keep_wifi:expr) => {{
             info!("Checking for a firmware update");
             if ensure_wifi!() {
                 let mut net = sync::Net {
@@ -1154,21 +1155,19 @@ async fn main(spawner: Spawner) -> ! {
                         }
                     }
                 }
-                wifi_stop(&mut wifi_controller).await;
-                wifi_connected = false;
+                if !$keep_wifi {
+                    wifi_stop(&mut wifi_controller).await;
+                    wifi_connected = false;
+                }
             }
             stop_blink();
         }};
     }
 
-    // BOOT held during sleep: update, then sleep until the timer wake that was already scheduled
+    // BOOT held during sleep: update, then sync below
     if update_requested {
         info!("Woken by a BOOT hold");
-        update_firmware!();
-        if resuming {
-            power_down_panel!();
-            sleep_until_scheduled(&mut rtc, &mut i2c);
-        }
+        update_firmware!(true);
     }
 
     // ==================== Concert List ====================
@@ -1221,8 +1220,8 @@ async fn main(spawner: Spawner) -> ! {
             (false, Orientation::Horizontal)
         };
 
-        // Sync on power-on, and whenever there is nothing to show
-        let mut need_sync = cold_boot || items.is_empty();
+        // Sync on power-on, on a BOOT hold, and whenever there is nothing to show
+        let mut need_sync = cold_boot || update_requested || items.is_empty();
 
         let can_partial = data_matches
             && !need_sync
@@ -1864,6 +1863,14 @@ async fn main(spawner: Spawner) -> ! {
                     info!("Button tap during update, next concert (index={})", index);
                 }
                 _ => {
+                    // BOOT held while awake: update, then sync
+                    if BOOT_HELD.swap(false, Ordering::Relaxed) {
+                        info!("BOOT held");
+                        epd.wake_up(&mut delay).ok();
+                        update_firmware!(true);
+                        need_sync = true;
+                        continue;
+                    }
                     info!("No button press, entering deep sleep");
                     break;
                 }
@@ -1894,11 +1901,11 @@ async fn main(spawner: Spawner) -> ! {
         );
     }
 
-    // BOOT held while awake: check for and install a firmware update
+    // BOOT held when the loop ended without a screen: only update
     if BOOT_HELD.swap(false, Ordering::Relaxed) {
         info!("BOOT held");
         epd.wake_up(&mut delay).ok();
-        update_firmware!();
+        update_firmware!(false);
     }
 
     if wifi_connected {
