@@ -233,6 +233,10 @@ static BUTTON_STATE: AtomicU8 = AtomicU8::new(BUTTON_CANCELLED);
 static BOOT_PRESSED: AtomicBool = AtomicBool::new(false);
 /// Set by a BOOT hold while awake; checks for a firmware update, then syncs concerts
 static BOOT_HELD: AtomicBool = AtomicBool::new(false);
+/// Set from a BOOT press until it is recorded as a tap or hold
+static BOOT_DOWN: AtomicBool = AtomicBool::new(false);
+/// Set from an accepted KEY press until it is recorded as a tap or hold
+static KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Last station disconnect reason, and whether the station joined the network
 static WIFI_REASON: critical_section::Mutex<Cell<Option<DisconnectReason>>> =
@@ -416,6 +420,25 @@ fn start_button_monitor() {
     BUTTON_STATE.store(BUTTON_POLLING, Ordering::Relaxed);
 }
 
+/// Start monitoring for KEY presses, keeping a press that is already queued
+fn arm_button_monitor() {
+    BUTTON_STATE
+        .compare_exchange(
+            BUTTON_CANCELLED,
+            BUTTON_POLLING,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
+        .ok();
+}
+
+/// Wait for a press in progress to be recorded as a tap or hold
+async fn settle_presses() {
+    while KEY_DOWN.load(Ordering::Relaxed) || BOOT_DOWN.load(Ordering::Relaxed) {
+        Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
+    }
+}
+
 /// Whether a tap or hold is waiting to be handled
 fn button_pending() -> bool {
     matches!(
@@ -429,6 +452,7 @@ fn button_pending() -> bool {
 async fn boot_monitor_task(boot: &'static mut Input<'static>) {
     loop {
         boot.wait_for_falling_edge().await;
+        BOOT_DOWN.store(true, Ordering::Relaxed);
         let held = with_timeout(
             Duration::from_millis(HOLD_THRESHOLD_MS as u64),
             boot.wait_for_high(),
@@ -442,6 +466,7 @@ async fn boot_monitor_task(boot: &'static mut Input<'static>) {
             BOOT_PRESSED.store(true, Ordering::Relaxed);
             flash_green(1);
         }
+        BOOT_DOWN.store(false, Ordering::Relaxed);
         boot.wait_for_high().await;
         Timer::after(Duration::from_millis(BUTTON_POLL_MS)).await;
     }
@@ -464,6 +489,7 @@ async fn button_monitor_task(key_input: &'static mut Input<'static>) {
             continue;
         }
 
+        KEY_DOWN.store(true, Ordering::Relaxed);
         let held = with_timeout(
             Duration::from_millis(HOLD_THRESHOLD_MS as u64),
             key_input.wait_for_high(),
@@ -489,6 +515,7 @@ async fn button_monitor_task(key_input: &'static mut Input<'static>) {
         if accepted {
             flash_green(if held { 3 } else { 1 });
         }
+        KEY_DOWN.store(false, Ordering::Relaxed);
     }
 }
 
@@ -886,6 +913,7 @@ async fn main(spawner: Spawner) -> ! {
             let shown = message_hash(&message, orientation);
             let mut panel_busy = false;
             if !(setup_pending && unsafe { SETUP_SHOWN } == shown) {
+                arm_button_monitor();
                 framebuffer.clear(sawthat_frame_firmware::epd::Color::White);
                 progress::draw_setup(&mut framebuffer, orientation, &message);
                 match epd.display_start(framebuffer.as_slice(), &mut delay) {
@@ -904,7 +932,9 @@ async fn main(spawner: Spawner) -> ! {
                 Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
             }
             power_down_panel!();
-            sleep_on_setup(&mut i2c, $retry)
+            // KEY pressed during the refresh retries right away
+            settle_presses().await;
+            sleep_on_setup(&mut i2c, if button_pending() { Some(1) } else { $retry })
         }};
     }
 
@@ -943,6 +973,7 @@ async fn main(spawner: Spawner) -> ! {
             info!("  {}", line);
         }
         info!("Report link: {}", urls[0]);
+        start_button_monitor();
         progress::draw_crash(
             &mut framebuffer,
             orientation,
@@ -963,6 +994,11 @@ async fn main(spawner: Spawner) -> ! {
         crash::clear();
         boot_fresh_next();
         unsafe { SETUP_SHOWN = 0 };
+        // KEY pressed during the refresh turns the frame back on right away
+        settle_presses().await;
+        if button_pending() {
+            sleep::deep_sleep([sleep::key_pin()], Some(1));
+        }
         info!("Shutting down until KEY");
         sleep::shutdown();
     }
@@ -991,8 +1027,26 @@ async fn main(spawner: Spawner) -> ! {
         }
     }
 
+    // Stop the KEY monitor and apply a queued hold to the orientation. Evaluates to whether a
+    // tap or hold was queued.
+    macro_rules! take_key_press {
+        () => {{
+            settle_presses().await;
+            let state = BUTTON_STATE.swap(BUTTON_CANCELLED, Ordering::Relaxed);
+            if state == BUTTON_FLIP {
+                orientation = orientation.toggle();
+                if let Some(cache) = sd_cache.as_mut() {
+                    save_orientation(cache, orientation);
+                }
+                info!("KEY held, orientation: {:?}", orientation);
+            }
+            matches!(state, BUTTON_NEXT | BUTTON_FLIP)
+        }};
+    }
+
     // Charger plugged, unplugged, started or finished during sleep: redraw only the battery
-    // body, then sleep until the timer wake that was already scheduled
+    // body, then sleep until the timer wake that was already scheduled. A press during the
+    // redraw is handled after it: KEY continues to the next screen, BOOT as when awake.
     if charger_wake && resuming {
         info!("Charger changed");
         let power = read_power(&mut i2c).await;
@@ -1000,11 +1054,23 @@ async fn main(spawner: Spawner) -> ! {
         draw_battery_icon(&mut framebuffer, orientation, power);
         let rect = battery_body_rect(orientation);
         let region = framebuffer.extract_rect(&rect);
-        if let Err(e) = epd.partial_update(&rect, &region, &mut delay) {
+        start_button_monitor();
+        if let Err(e) = epd.partial_update_start(&rect, &region, &mut delay) {
             info!("Battery refresh failed: {:?}", e);
         }
-        power_down_panel!();
-        sleep_until_scheduled(&mut rtc, &mut i2c);
+        while epd.is_busy() {
+            Timer::after(Duration::from_millis(DISPLAY_BUSY_POLL_MS)).await;
+        }
+        let key_pressed = take_key_press!();
+        update_requested = BOOT_HELD.swap(false, Ordering::Relaxed);
+        if !update_requested && !key_pressed {
+            if BOOT_PRESSED.swap(false, Ordering::Relaxed) && usb_host_connected().await {
+                info!("BOOT pressed with a computer connected");
+                drive_mode_with_notice!();
+            }
+            power_down_panel!();
+            sleep_until_scheduled(&mut rtc, &mut i2c);
+        }
     }
 
     // Buffers for stored artwork and partial updates (PSRAM)
@@ -1164,10 +1230,13 @@ async fn main(spawner: Spawner) -> ! {
         }};
     }
 
-    // BOOT held during sleep: update, then sync below
+    // BOOT held during sleep or the charger redraw: update, then sync below. KEY held
+    // meanwhile rotates; a tap needs nothing, as the sync shows the next screen.
     if update_requested {
-        info!("Woken by a BOOT hold");
+        info!("BOOT held");
+        start_button_monitor();
         update_firmware!(true);
+        take_key_press!();
     }
 
     // ==================== Concert List ====================
@@ -1472,7 +1541,7 @@ async fn main(spawner: Spawner) -> ! {
                                 shown = true;
                                 from_items = true;
                                 advance_full!();
-                                start_button_monitor();
+                                arm_button_monitor();
                                 if let Some(p) = progress.as_mut() {
                                     p.confirm();
                                 }
@@ -1669,7 +1738,7 @@ async fn main(spawner: Spawner) -> ! {
                 {
                     shown = true;
                     advance_full!();
-                    start_button_monitor();
+                    arm_button_monitor();
                 }
 
                 if let Some(mut fresh) = synced {
@@ -1692,6 +1761,8 @@ async fn main(spawner: Spawner) -> ! {
             }};
         }
 
+        // Presses made while a screen is fetched or composed wait for its refresh
+        arm_button_monitor();
         loop {
             // After showing every item, sync before starting over
             if !items.is_empty() && index >= items.len() {
@@ -1761,7 +1832,7 @@ async fn main(spawner: Spawner) -> ! {
                     slot_items[next_slot as usize] = item_idx;
                     next_slot = (next_slot + 1) % 2;
                     index += 1;
-                    start_button_monitor();
+                    arm_button_monitor();
                 }
                 started
             } else {
@@ -1803,7 +1874,7 @@ async fn main(spawner: Spawner) -> ! {
                     .is_ok();
                 if started {
                     advance_full!();
-                    start_button_monitor();
+                    arm_button_monitor();
                 }
                 started
             };
@@ -1829,6 +1900,16 @@ async fn main(spawner: Spawner) -> ! {
 
             info!("Putting display to sleep...");
             epd.sleep(&mut delay).expect("Failed to sleep display");
+
+            // BOOT held while awake: update, then sync. KEY presses stay queued meanwhile.
+            settle_presses().await;
+            if BOOT_HELD.swap(false, Ordering::Relaxed) {
+                info!("BOOT held");
+                epd.wake_up(&mut delay).ok();
+                update_firmware!(true);
+                need_sync = true;
+                settle_presses().await;
+            }
 
             // Check button state and stop monitoring
             let button_state = BUTTON_STATE.swap(BUTTON_CANCELLED, Ordering::Relaxed);
@@ -1862,19 +1943,13 @@ async fn main(spawner: Spawner) -> ! {
                 BUTTON_NEXT => {
                     info!("Button tap during update, next concert (index={})", index);
                 }
+                _ if need_sync => info!("Syncing after the update check"),
                 _ => {
-                    // BOOT held while awake: update, then sync
-                    if BOOT_HELD.swap(false, Ordering::Relaxed) {
-                        info!("BOOT held");
-                        epd.wake_up(&mut delay).ok();
-                        update_firmware!(true);
-                        need_sync = true;
-                        continue;
-                    }
                     info!("No button press, entering deep sleep");
                     break;
                 }
             }
+            arm_button_monitor();
         }
 
         // Save state for next wake (index already advanced in the loop)
