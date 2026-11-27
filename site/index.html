@@ -143,7 +143,7 @@
                     <input id="setting-pass" class="masked" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>
                   </label>
                   <label class="field wide">
-                    <span>SawThat User ID <small>or your username</small></span>
+                    <span>SawThat Username <small>the name in <em>name</em>.sawthat.band, or your user ID</small></span>
                     <input id="setting-user" autocomplete="off" spellcheck="false">
                   </label>
                   <label class="field wide">
@@ -314,7 +314,7 @@
       pass.setCustomValidity(
         length && (length < 8 || length > 63) ? "WiFi passwords are 8 to 63 characters." : "",
       );
-      user.setCustomValidity(user.value.trim() ? "" : "Enter your SawThat user ID.");
+      user.setCustomValidity(user.value.trim() ? "" : "Enter your SawThat username.");
       return [ssid, pass, user].every((field) => field.reportValidity());
     }
 

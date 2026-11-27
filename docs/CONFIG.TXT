@@ -5,7 +5,7 @@
 WIFI_SSID=
 WIFI_PASS=
 
-# SawThat user whose concerts are shown
+# SawThat username (the name in name.sawthat.band) or user ID whose concerts are shown
 SAWTHAT_USER_ID=
 
 # Minutes between artwork changes (1-1440)

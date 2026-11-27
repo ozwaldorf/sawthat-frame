@@ -50,7 +50,7 @@ and edit the generated template over [USB](#usb-drive-mode).
 |-----|---------|---------|
 | `WIFI_SSID` | required | WiFi network |
 | `WIFI_PASS` | open network | WiFi password |
-| `SAWTHAT_USER_ID` | required | SawThat user ID, username or profile URL |
+| `SAWTHAT_USER_ID` | required | SawThat username (the name in `name.sawthat.band`), user ID or profile URL |
 | `REFRESH_MINUTES` | 15 | Minutes between artwork changes (1-1440) |
 | `ORIENTATION` | horizontal | `horizontal` or `vertical` |
 
